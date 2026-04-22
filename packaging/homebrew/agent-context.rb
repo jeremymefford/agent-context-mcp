@@ -3,7 +3,7 @@ class AgentContext < Formula
   homepage "https://github.com/NZBMan/claude-context-rust-http-mcp"
   url "https://github.com/NZBMan/claude-context-rust-http-mcp/releases/download/v0.1.0/agent-context-darwin-arm64.tar.gz"
   sha256 "CHANGE_ME"
-  license "Apache-2.0"
+  license "GPL-3.0-only"
 
   def install
     bin.install "agent-context"
