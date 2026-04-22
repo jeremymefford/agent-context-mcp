@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            artifact_name: agent-context-darwin-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact_name: agent-context-darwin-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/agent-context dist/agent-context
+          tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz agent-context
+          shasum -a 256 dist/${{ matrix.artifact_name }}.tar.gz > dist/${{ matrix.artifact_name }}.tar.gz.sha256
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.artifact_name }}.tar.gz
+            dist/${{ matrix.artifact_name }}.tar.gz.sha256

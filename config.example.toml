@@ -1,0 +1,33 @@
+snapshot_path = "~/Library/Application Support/agent-context/state/snapshot.json"
+index_root = "~/Library/Application Support/agent-context/index-v1"
+default_group = "workspace"
+
+[embedding]
+provider = "voyage"
+model = "voyage-code-3"
+
+[embedding.voyage]
+api_key_env = "VOYAGE_API_KEY"
+# key_file = "~/Library/Application Support/agent-context/voyage_key"
+
+[embedding.openai]
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+
+[embedding.ollama]
+base_url = "http://127.0.0.1:11434"
+
+[milvus]
+address = "127.0.0.1:19530"
+# token_env = "MILVUS_TOKEN"
+
+[freshness]
+# audit_interval_secs = 900
+max_parallel_searches = 4
+
+[[groups]]
+id = "workspace"
+label = "Workspace"
+repos = [
+  "/absolute/path/to/repo",
+]
