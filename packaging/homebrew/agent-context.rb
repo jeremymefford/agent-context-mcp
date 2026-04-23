@@ -37,7 +37,7 @@ class AgentContext < Formula
       Provider notes:
 
         - Voyage: prefer embedding.voyage.key_file in config
-        - OpenAI: set OPENAI_API_KEY with launchctl setenv before starting the service
+        - OpenAI: prefer embedding.openai.key_file in config
         - Ollama: no key required, but the Ollama server must be running
 
       Preferred local setup:

@@ -100,6 +100,7 @@ api_key_env = "VOYAGE_API_KEY"
         .to_string(),
         "openai" => r#"[embedding.openai]
 api_key_env = "OPENAI_API_KEY"
+# key_file = "~/Library/Application Support/agent-context/openai_key"
 base_url = "https://api.openai.com/v1"
 "#
         .to_string(),

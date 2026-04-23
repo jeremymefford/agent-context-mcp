@@ -175,17 +175,17 @@ chmod 600 ~/Library/Application\ Support/agent-context/voyage_key
 
 Recommended Homebrew service setup:
 
-```bash
-launchctl setenv OPENAI_API_KEY 'YOUR_OPENAI_KEY'
-export OPENAI_API_KEY='YOUR_OPENAI_KEY'
-```
-
-If you use a custom OpenAI-compatible endpoint, keep that in config:
-
 ```toml
 [embedding.openai]
 api_key_env = "OPENAI_API_KEY"
+key_file = "~/Library/Application Support/agent-context/openai_key"
 base_url = "https://api.openai.com/v1"
+```
+
+```bash
+mkdir -p ~/Library/Application\ Support/agent-context
+printf '%s\n' 'YOUR_OPENAI_KEY' > ~/Library/Application\ Support/agent-context/openai_key
+chmod 600 ~/Library/Application\ Support/agent-context/openai_key
 ```
 
 </details>

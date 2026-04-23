@@ -128,7 +128,10 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
         ),
         Some(status) => print_warning(
             "brew service",
-            format!("{} status={} file={}", status.name, status.status, status.file),
+            format!(
+                "{} status={} file={}",
+                status.name, status.status, status.file
+            ),
         ),
         None => print_warning(
             "brew service",
@@ -171,7 +174,9 @@ fn homebrew_service_status() -> Result<Option<BrewServiceEntry>> {
     }
     let services: Vec<BrewServiceEntry> =
         serde_json::from_slice(&output.stdout).context("parsing brew services JSON")?;
-    Ok(services.into_iter().find(|entry| entry.name == "agent-context"))
+    Ok(services
+        .into_iter()
+        .find(|entry| entry.name == "agent-context"))
 }
 
 async fn health_endpoint(listen: &str) -> Result<()> {

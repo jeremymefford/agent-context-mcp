@@ -57,6 +57,7 @@ pub struct VoyageProviderConfig {
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiProviderConfig {
     pub api_key_env: String,
+    pub key_file: Option<PathBuf>,
     pub base_url: String,
 }
 
@@ -203,6 +204,8 @@ struct RawVoyageProviderConfig {
 struct RawOpenAiProviderConfig {
     #[serde(default)]
     api_key_env: Option<String>,
+    #[serde(default)]
+    key_file: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
 }
@@ -486,7 +489,11 @@ impl EmbeddingConfig {
                 )
                 .map(Some),
             EmbeddingProvider::OpenAi => self
-                .read_env_or_file(&self.openai.api_key_env, None, "OpenAI")
+                .read_env_or_file(
+                    &self.openai.api_key_env,
+                    self.openai.key_file.as_deref(),
+                    "OpenAI",
+                )
                 .map(Some),
             EmbeddingProvider::Ollama => Ok(None),
         }
@@ -583,6 +590,13 @@ fn build_embedding_config(raw: &RawConfig, config_dir: &Path) -> Result<Embeddin
             .and_then(|value| value.openai.as_ref())
             .and_then(|value| value.api_key_env.clone())
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+        key_file: raw
+            .embedding
+            .as_ref()
+            .and_then(|value| value.openai.as_ref())
+            .and_then(|value| value.key_file.as_deref())
+            .map(|path| expand_path_from(path, config_dir))
+            .transpose()?,
         base_url: raw
             .embedding
             .as_ref()
@@ -849,6 +863,8 @@ mod tests {
     #[test]
     fn parses_openai_provider_block() {
         let dir = temp_dir("openai");
+        let keys_dir = dir.join("keys");
+        fs::create_dir_all(&keys_dir).unwrap();
         let config_path = write_config(
             &dir,
             r#"
@@ -858,6 +874,7 @@ mod tests {
 
                 [embedding.openai]
                 api_key_env = "OPENAI_SECRET"
+                key_file = "./keys/openai_key"
                 base_url = "https://example.com/v1"
 
                 [milvus]
@@ -873,6 +890,10 @@ mod tests {
         assert_eq!(config.embedding.provider, EmbeddingProvider::OpenAi);
         assert_eq!(config.embedding.model, "text-embedding-3-large");
         assert_eq!(config.embedding.openai.api_key_env, "OPENAI_SECRET");
+        assert_eq!(
+            config.embedding.openai.key_file,
+            Some(dir.join("keys/openai_key"))
+        );
         assert_eq!(config.embedding.openai.base_url, "https://example.com/v1");
     }
 
