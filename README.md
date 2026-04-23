@@ -11,6 +11,17 @@
 
 `agent-context` makes your agents smarter and faster. It helps them find the right code paths earlier, make more accurate changes in large codebases, move through tasks with fewer dead ends, and reduce token usage along the way.
 
+## How This Differs From MemPalace
+
+[MemPalace](https://github.com/MemPalace/mempalace) is a persistent memory system for agents. It is designed around long-term recall: conversations, mined knowledge, knowledge graphs, and agent diaries.
+
+`agent-context` is narrower. It is a code-search system for coding agents:
+
+- MemPalace helps an agent remember.
+- `agent-context` helps an agent navigate and retrieve the right code.
+
+They are complementary more than competitive. If you want long-term agent memory, MemPalace is solving that problem. If you want more accurate semantic, lexical, and symbol search over real codebases, that is what `agent-context` is built for.
+
 ## Features
 
 `agent-context` is easiest to understand as a set of agent-facing capabilities:
