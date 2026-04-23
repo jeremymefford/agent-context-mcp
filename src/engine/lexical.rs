@@ -385,6 +385,13 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
+    pub fn chunk_count(&self, repo: &Path) -> Result<u64> {
+        let Some(handle) = self.open_existing_chunk_index(repo)? else {
+            return Ok(0);
+        };
+        Ok(handle.reader.searcher().num_docs())
+    }
+
     fn open_or_create_chunk_index(&self, repo: &Path) -> Result<Arc<CachedIndex>> {
         self.open_cached_index(repo, CachedIndexKind::Chunk, true)?
             .ok_or_else(|| anyhow!("chunk index unexpectedly missing after create"))

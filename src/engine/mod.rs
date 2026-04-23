@@ -419,6 +419,22 @@ impl IndexCompletionStatus {
     }
 }
 
+fn index_status_for_coverage(
+    processing_status: IndexCompletionStatus,
+    coverage: IndexCoverage,
+    current_file_count: usize,
+) -> String {
+    if coverage.indexed_files == 0 && coverage.total_chunks == 0 {
+        "empty".to_string()
+    } else if processing_status == IndexCompletionStatus::LimitReached
+        || coverage.indexed_files < current_file_count as u64
+    {
+        IndexCompletionStatus::LimitReached.as_str().to_string()
+    } else {
+        IndexCompletionStatus::Completed.as_str().to_string()
+    }
+}
+
 impl SearchMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -473,6 +489,12 @@ struct ProcessFilesResult {
     processed_files: u64,
     total_chunks: u64,
     status: IndexCompletionStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexCoverage {
+    indexed_files: u64,
+    total_chunks: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1461,7 +1483,13 @@ impl Engine {
                     modified: 0,
                     removed: 0,
                 };
-                Ok::<(ProcessFilesResult, RepoChangeSummary), anyhow::Error>((processing, changes))
+                let coverage = IndexCoverage {
+                    indexed_files: processing.processed_files,
+                    total_chunks: processing.total_chunks,
+                };
+                Ok::<(ProcessFilesResult, RepoChangeSummary, IndexCoverage), anyhow::Error>((
+                    processing, changes, coverage,
+                ))
             } else {
                 let symbol_collection_ready = if symbol_collection_exists {
                     true
@@ -1559,6 +1587,16 @@ impl Engine {
                     }
                 }
                 save_merkle_snapshot(&merkle_path, &persisted_hashes).await?;
+                let repo_path = repo.to_path_buf();
+                let local_index = self.inner.local_index.clone();
+                let total_chunks = run_low_priority_blocking("count_repo_chunks", move || {
+                    local_index.chunk_count(&repo_path)
+                })
+                .await?;
+                let coverage = IndexCoverage {
+                    indexed_files: persisted_hashes.len() as u64,
+                    total_chunks,
+                };
                 let changes = RepoChangeSummary {
                     added: diff
                         .added
@@ -1572,20 +1610,16 @@ impl Engine {
                         .count() as u64,
                     removed: diff.removed.len() as u64,
                 };
-                Ok((processing, changes))
+                Ok((processing, changes, coverage))
             }
         }
         .await;
 
         match outcome {
-            Ok((processing, changes)) => {
+            Ok((processing, changes, coverage)) => {
                 let fingerprint = fingerprint_repo(repo).ok();
                 let index_status =
-                    if processing.processed_files == 0 && processing.total_chunks == 0 {
-                        "empty".to_string()
-                    } else {
-                        processing.status.as_str().to_string()
-                    };
+                    index_status_for_coverage(processing.status, coverage, current_files.len());
                 self.inner
                     .snapshot
                     .update(|snapshot| {
@@ -1594,8 +1628,8 @@ impl Engine {
                             .entry(repo_key.clone())
                             .or_insert_with(|| SnapshotEntry::indexing(0.0));
                         *entry = SnapshotEntry::indexed_with_status(
-                            Some(processing.processed_files),
-                            Some(processing.total_chunks),
+                            Some(coverage.indexed_files),
+                            Some(coverage.total_chunks),
                             index_status.clone(),
                         );
                         if let Some(fingerprint) = &fingerprint {
@@ -1606,8 +1640,8 @@ impl Engine {
 
                 Ok(RepoIndexResult {
                     repo: repo_key,
-                    indexed_files: Some(processing.processed_files),
-                    total_chunks: Some(processing.total_chunks),
+                    indexed_files: Some(coverage.indexed_files),
+                    total_chunks: Some(coverage.total_chunks),
                     index_status: Some(index_status),
                     full_reindex,
                     changes,
@@ -3529,9 +3563,10 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets,
-        SearchMode, SearchRequest, build_chunk_context_snippet, build_root_hash, chunk_id,
-        classify_query, collection_name, diff_files, hash_text_like_file, plan_search,
+        CONTENT_HASH_ALGORITHM, IndexCompletionStatus, IndexCoverage,
+        LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode, SearchRequest,
+        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query, collection_name,
+        diff_files, hash_text_like_file, index_status_for_coverage, plan_search,
         run_low_priority_blocking, scan_repo,
     };
     use crate::config::SearchConfig;
@@ -3710,6 +3745,34 @@ mod tests {
         assert!(constrained.lexical_weight > unconstrained.lexical_weight);
         assert!(constrained.dense_weight < unconstrained.dense_weight);
         assert!(constrained.symbol_lexical_share > unconstrained.symbol_lexical_share);
+    }
+
+    #[test]
+    fn index_status_uses_total_coverage_not_last_incremental_delta() {
+        let coverage = IndexCoverage {
+            indexed_files: 561,
+            total_chunks: 16_448,
+        };
+
+        assert_eq!(
+            index_status_for_coverage(IndexCompletionStatus::Completed, coverage, 561),
+            "completed"
+        );
+        assert_eq!(
+            index_status_for_coverage(IndexCompletionStatus::Completed, coverage, 600),
+            "limit_reached"
+        );
+        assert_eq!(
+            index_status_for_coverage(
+                IndexCompletionStatus::Completed,
+                IndexCoverage {
+                    indexed_files: 0,
+                    total_chunks: 0,
+                },
+                0,
+            ),
+            "empty"
+        );
     }
 
     #[test]
