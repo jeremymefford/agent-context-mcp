@@ -32,7 +32,13 @@ class AgentContext < Formula
 
         1. a running Milvus instance
         2. a config file at ~/Library/Application Support/agent-context/config.toml
-        3. an embedding provider configured via env vars or Ollama
+        3. an embedding provider configured for the Homebrew service
+
+      Provider notes:
+
+        - Voyage: prefer embedding.voyage.key_file in config
+        - OpenAI: set OPENAI_API_KEY with launchctl setenv before starting the service
+        - Ollama: no key required, but the Ollama server must be running
 
       Preferred local setup:
 

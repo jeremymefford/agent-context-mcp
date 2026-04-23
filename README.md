@@ -1,169 +1,281 @@
 # agent-context
 
-`agent-context` is a Rust-native MCP server for code intelligence across one or more local repositories.
+`agent-context` is a Rust-native MCP server that gives coding agents indexed code search across one or more local repositories.
 
-It combines:
+> [!IMPORTANT]
+> This project is heavily inspired by [claude-context](https://github.com/zilliztech/claude-context).
+> The core idea comes directly from that project: give coding agents an indexed code-search surface instead of making them repeatedly rediscover a codebase through shell search.
+> `agent-context` takes that approach and focuses it on a Rust-native local server, a shared HTTP MCP facade, multi-codebase search, and lower steady-state resource usage.
 
-- Milvus for dense semantic retrieval
-- a local Tantivy index for lexical and path-aware search
-- a local SQLite symbol store for definitions and outlines
-- a single shared HTTP MCP endpoint for editors and agents
+## Overview
 
-The result is one local service that agents can use for:
+`agent-context` makes your agents smarter and faster. It helps them find the right code paths earlier, make more accurate changes in large codebases, move through tasks with fewer dead ends, and reduce token usage along the way.
 
-- semantic and hybrid code search
-- exact symbol and definition lookup
-- indexed file outlines
-- multi-repo search across named groups
+## Features
 
-## Why it exists
+`agent-context` is easiest to understand as a set of agent-facing capabilities:
 
-Most local code-search setups are either:
+- **Semantic search** for natural-language queries like `find the GraphQL schema builder`.
+- **Symbol search** for exact definitions like `build_schema`, `KeyStore`, or `SessionManager`.
+- **File outlines** so an agent can inspect structure without scanning entire files.
+- **Hybrid ranking** so exact identifiers, paths, and semantic matches work in one search flow.
+- **Multi-repo scopes** so one MCP server can search a named workspace instead of a single repo.
+- **Shared local MCP endpoint** so Codex, Claude, Copilot, and other MCP clients can use the same index.
+- **Higher search accuracy in large codebases** where agents often miss the existing implementation path, fail to find the right symbol or file, and start inventing parallel solutions that should not exist.
+- **Fewer tokens used per task** because agents can retrieve the right files, symbols, and snippets earlier instead of spending turns probing, re-searching, and reading the wrong parts of the tree.
+- **Lower steady-state resource usage** than heavier multi-process setups, while still keeping semantic, lexical, and symbol search available.
+- **Explicit local control** over indexing, refreshes, providers, and service lifecycle.
 
-- thin wrappers around shell tools
-- editor-specific features that do not generalize to MCP clients
-- Node-based MCP servers with their own background process churn
+The storage and indexing details matter, but they are implementation details. The product surface is simple: agents get a better way to search code.
 
-`agent-context` keeps the MCP layer native, keeps indexing under explicit local control, and exposes a tool surface that works the same way from Codex, Claude, VS Code/Copilot, or the CLI.
+That accuracy point matters. In larger repositories, the failure mode is usually not that an agent finds nothing. It is that the agent finds one plausible path, misses the real one, and then starts editing or building around an incomplete mental model of the codebase. Better semantic, lexical, and symbol search reduces that drift and makes it much more likely that the agent works on the code that already exists instead of creating a second, parallel path.
 
-## Scope
+## How It Works
 
-V1 is intentionally opinionated:
+### High-level architecture
 
-- macOS-first
-- Milvus required
-- embedding providers: Voyage, OpenAI, and Ollama
-- Homebrew install plus `brew services` is the preferred local service model
-- MCP is the primary product interface
+```mermaid
+flowchart LR
+    A["Codex / Claude / Copilot"] --> B
 
-This is aimed at power users who are comfortable running Docker and setting API keys in their shell environment.
+    subgraph Server["agent-context process"]
+        direction TB
+        B["HTTP MCP facade"]
+        C["Hybrid search layer"]
+        B --> C
+    end
 
-## Agent-assisted install
+    subgraph Indexes["Search indexes"]
+        direction TB
+        D["semantic search"]
+        E["lexical search"]
+        F["symbol database"]
+    end
 
-Assume an agent is performing setup on behalf of a user.
+    subgraph Ingest["Indexing path"]
+        direction LR
+        H["Local repositories"] --> G["Indexer"]
+    end
 
-Required inputs the agent should confirm or infer before running commands:
+    C --> Indexes
+    G --> Indexes
+```
 
-- the absolute repo paths to index
-- the embedding provider: `voyage`, `openai`, or `ollama`
-- the provider credential source:
-  - `VOYAGE_API_KEY`
-  - `OPENAI_API_KEY`
-  - or a running Ollama server
+### Search request flow
 
-The recommended install order is:
+```mermaid
+flowchart TD
+    A["Agent calls search_code"] --> B["Query planner"]
+    B --> C["Semantic retrieval"]
+    B --> D["Lexical retrieval"]
+    B --> E["Symbol-aware boosts"]
+    C --> F["Result fusion"]
+    D --> F
+    E --> F
+    F --> G["Snippet + metadata assembly"]
+    G --> H["MCP response"]
+```
 
-1. Install the Homebrew tap and formula.
-2. Start Milvus.
-3. Run `agent-context init`.
-4. Export or validate provider credentials.
-5. Run `agent-context doctor`.
-6. Start the MCP server with `brew services`.
-7. Print and apply client MCP config.
-8. Run `refresh-all` or `reindex-all`.
-9. Install post-commit hooks for repos that should auto-refresh on commit.
+## Quick Start
 
-An agent should verify each step before moving on.
+This project assumes an agent can help with setup. The install path below is designed to be followed directly by an agent or a human.
 
-## Quickstart
+### Prerequisites
 
-1. Install the binary and verify it is on `PATH`.
+- macOS
+- Docker Desktop or another local Docker runtime
+- Homebrew
+- one embedding provider:
+  - Voyage
+  - OpenAI
+  - Ollama
 
-   - Preferred:
+### 1. Install the tap and binary
 
-   ```bash
-   brew tap jeremymefford/agent-context-mcp
-   brew install agent-context
-   ```
+```bash
+brew install jeremymefford/agent-context-mcp/agent-context
+agent-context --help
+```
 
-   - Release assets: GitHub Releases
-   - Fallback: `cargo install --path .`
+### 2. Start Milvus
 
-   Verify:
+```bash
+docker compose -f docker/milvus-compose.yml up -d
+```
 
-   ```bash
-   agent-context --help
-   ```
+### 3. Create a starter config
 
-2. Start Milvus.
+```bash
+agent-context init --provider voyage --repo /absolute/path/to/repo
+```
 
-   ```bash
-   docker compose -f docker/milvus-compose.yml up -d
-   ```
+The canonical config path for the Homebrew install is:
 
-3. Write a starter config.
+```text
+~/Library/Application Support/agent-context/config.toml
+```
 
-   ```bash
-   agent-context init --provider voyage --repo /absolute/path/to/repo
-   ```
+Verify it exists:
 
-   Verify the config was written:
+```bash
+ls -l ~/Library/Application\ Support/agent-context/config.toml
+```
 
-   ```bash
-   ls -l ~/Library/Application\ Support/agent-context/config.toml
-   ```
+### 4. Set up an embedding provider
 
-4. Export credentials if needed.
+`agent-context` needs an embedding provider for semantic indexing and semantic search. Choose one of these:
 
-   ```bash
-   export VOYAGE_API_KEY=...
-   # or
-   export OPENAI_API_KEY=...
-   ```
+> [!WARNING]
+> If you choose a hosted provider, `agent-context` will send codebase content to that provider to generate embeddings. That means **Voyage** and **OpenAI** will receive text derived from the repositories you index. If that is not acceptable for your environment, use **Ollama** instead.
 
-5. Validate the local setup.
+<details>
+<summary>Voyage</summary>
 
-   ```bash
-   agent-context doctor
-   ```
+- Best fit if you want a hosted provider that is strong on code and retrieval tasks.
+- Start here:
+  - docs: [Voyage API key and installation](https://docs.voyageai.com/docs/api-key-and-installation)
+  - dashboard: [Voyage dashboard](https://dash.voyageai.com/)
+- What to do:
+  - create a Voyage account
+  - open the API keys section in the dashboard
+  - create a secret key
+  - store the key where the Homebrew service can read it
+- Good default:
+  - keep the README example config and use Voyage if you want the simplest hosted setup for code search
 
-   Do not proceed until `doctor` reports no blocking issues.
+Recommended Homebrew service setup:
 
-   ```bash
-   brew services start agent-context
-   ```
+```toml
+[embedding.voyage]
+api_key_env = "VOYAGE_API_KEY"
+key_file = "~/Library/Application Support/agent-context/voyage_key"
+```
 
-   Verify:
+```bash
+mkdir -p ~/Library/Application\ Support/agent-context
+printf '%s\n' 'YOUR_VOYAGE_KEY' > ~/Library/Application\ Support/agent-context/voyage_key
+chmod 600 ~/Library/Application\ Support/agent-context/voyage_key
+```
 
-   ```bash
-   brew services list | grep agent-context
-   ```
+</details>
 
-   Health:
+<details>
+<summary>OpenAI</summary>
 
-   ```bash
-   curl http://127.0.0.1:8765/health
-   ```
+- Best fit if you already use the OpenAI API and want hosted embeddings without adding another provider account.
+- Start here:
+  - embeddings guide: [OpenAI embeddings guide](https://platform.openai.com/docs/guides/embeddings)
+  - API keys: [OpenAI API keys](https://platform.openai.com/settings/organization/api-keys)
+- What to do:
+  - create or use an OpenAI API account
+  - create an API key
+  - make that key visible to the Homebrew service
+- Good default:
+  - use one of the current `text-embedding-3` models and keep it stable once you start indexing
 
-   Manual fallback:
+Recommended Homebrew service setup:
 
-   ```bash
-   agent-context serve --listen 127.0.0.1:8765
-   ```
+```bash
+launchctl setenv OPENAI_API_KEY 'YOUR_OPENAI_KEY'
+export OPENAI_API_KEY='YOUR_OPENAI_KEY'
+```
 
-7. Connect an MCP client.
+If you use a custom OpenAI-compatible endpoint, keep that in config:
 
-   ```bash
-   agent-context print-mcp-config --client codex
-   ```
+```toml
+[embedding.openai]
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+```
 
-8. Index your repos.
+</details>
 
-   ```bash
-   agent-context refresh-all
-   # or for a clean rebuild
-   agent-context reindex-all
-   ```
+<details>
+<summary>Ollama</summary>
 
-   Verify with:
+- Best fit if you want a fully local provider instead of a hosted API.
+- Start here:
+  - embeddings docs: [Ollama embeddings](https://docs.ollama.com/capabilities/embeddings)
+  - install Ollama: [ollama.com/download](https://ollama.com/download)
+  - model library: [Ollama library](https://ollama.com/library)
+- What to do:
+  - install Ollama
+  - start the Ollama server
+  - pull an embedding model locally before continuing
+- Recommended models:
+  - `embeddinggemma`
+    - good default if you want the simplest current Ollama recommendation
+    - model page: [embeddinggemma](https://ollama.com/library/embeddinggemma)
+  - `qwen3-embedding`
+    - good option if you want a newer general-purpose embedding model from the current Ollama recommendations
+    - model page: [qwen3-embedding](https://ollama.com/library/qwen3-embedding)
+  - `all-minilm`
+    - good option if you want a smaller, lighter local model
+    - model page: [all-minilm](https://ollama.com/library/all-minilm)
+- Example:
 
-   ```bash
-   agent-context search workspace "health check"
-   ```
+```bash
+ollama pull embeddinggemma
+curl http://localhost:11434/api/embed -d '{"model":"embeddinggemma","input":"hello world"}'
+```
 
-## MCP tool surface
+</details>
 
-The MCP server is the main integration surface.
+If you have never used an embedding provider before:
+
+- choose **Voyage** if you want the easiest hosted path
+- choose **OpenAI** if you already use OpenAI API keys elsewhere
+- choose **Ollama** if you want everything local and are comfortable running one more local service
+
+Your `agent-context init --provider ...` choice should match the provider you actually plan to use.
+
+### 5. Validate the setup
+
+```bash
+agent-context doctor
+```
+
+Do not continue until `doctor` reports no blocking issues.
+
+### 6. Start the local service
+
+`brew services` is the preferred service layer.
+
+```bash
+brew services start agent-context
+brew services list | grep agent-context
+curl http://127.0.0.1:8765/health
+```
+
+### 7. Print MCP config for your client
+
+```bash
+agent-context print-mcp-config --client codex
+```
+
+Supported values:
+
+- `codex`
+- `claude`
+- `copilot`
+
+### 8. Index your repos
+
+```bash
+agent-context refresh-all
+# or for a clean rebuild
+agent-context reindex-all
+```
+
+### 9. Install post-commit hooks
+
+```bash
+agent-context install-hook /absolute/path/to/repo
+```
+
+## What Agents Get
+
+The MCP server is the main product surface.
 
 Current tools:
 
@@ -176,14 +288,24 @@ Current tools:
 - `clear_index`
 - `get_indexing_status`
 
-Preferred agent routing:
+Preferred routing:
 
-- `list_scopes` first in unfamiliar workspaces
-- `search_symbols` first for exact definition lookup
-- `get_file_outline` once the target file is known
-- `search_code` for broader semantic or hybrid discovery
+- use `list_scopes` first in an unfamiliar workspace
+- use `search_symbols` first for exact definition lookup
+- use `get_file_outline` once the target file is known
+- use `search_code` for broader semantic or hybrid discovery
 
-## CLI commands
+## Example Agent Workflow
+
+Typical flow for a code-assistant task:
+
+1. `list_scopes`
+2. `search_symbols` for an exact symbol if one is known
+3. `search_code` for broader behavior or semantic discovery
+4. `get_file_outline` on the chosen file
+5. read and edit the exact files that the search results identified
+
+## CLI Commands
 
 Setup and repair:
 
@@ -199,9 +321,9 @@ Indexing and serving:
 - `agent-context reindex-all`
 - `agent-context search <scope-or-absolute-repo> "<query>"`
 - `agent-context list-tools`
-- `agent-context serve --listen 127.0.0.1:8765`
+- `agent-context serve --listen 127.0.0.1:8765 --config ~/Library/Application\ Support/agent-context/config.toml`
 
-## Config model
+## Configuration
 
 The canonical config shape is:
 
@@ -216,11 +338,9 @@ model = "voyage-code-3"
 
 [embedding.voyage]
 api_key_env = "VOYAGE_API_KEY"
-# key_file = "~/Library/Application Support/agent-context/voyage_key"
 
 [milvus]
 address = "127.0.0.1:19530"
-# token_env = "MILVUS_TOKEN"
 
 [freshness]
 # audit_interval_secs = 900
@@ -240,59 +360,25 @@ repos = [
 ]
 ```
 
-See the full template in [config.example.toml](/Users/jeremy/.local/share/agent-context/config.example.toml).
+See the full template in [config.example.toml](config.example.toml).
 
-## Documentation
+## Under The Hood
 
-- [macOS quickstart](/Users/jeremy/.local/share/agent-context/docs/quickstart-macos.md)
-- [Embedding providers](/Users/jeremy/.local/share/agent-context/docs/providers.md)
-- [Milvus bootstrap](/Users/jeremy/.local/share/agent-context/docs/milvus.md)
-- [MCP client setup](/Users/jeremy/.local/share/agent-context/docs/mcp-clients.md)
-- [Troubleshooting](/Users/jeremy/.local/share/agent-context/docs/troubleshooting.md)
+This is the technical part that sits below the feature surface:
 
-## Release and packaging
+- **Rust MCP server** with a shared local HTTP bridge
+- **Milvus** for dense semantic retrieval
+- **Tantivy** for lexical, path-aware, and exact-token retrieval
+- **SQLite** for symbol metadata and file outlines
+- **Hybrid search planner** that routes and fuses dense, lexical, and symbol signals
+- **Bounded warm-reader cache** and global search budgets to keep latency and memory under control
 
-This repo includes:
+## Agent Notes
 
-- GitHub Actions CI
-- GitHub Actions release packaging for:
-  - `darwin-arm64`
-  - `darwin-x86_64`
-- a Homebrew formula template
-- a checked-in Milvus Docker Compose bootstrap
+If an agent is performing installation or recovery:
 
-See:
-
-- [.github/workflows/ci.yml](/Users/jeremy/.local/share/agent-context/.github/workflows/ci.yml)
-- [.github/workflows/release.yml](/Users/jeremy/.local/share/agent-context/.github/workflows/release.yml)
-- [packaging/homebrew/agent-context.rb](/Users/jeremy/.local/share/agent-context/packaging/homebrew/agent-context.rb)
-
-## Limitations
-
-- macOS-first only in this release plan
-- Milvus is required
-- initial indexing depends on an embedding provider
-- provider/model changes require `reindex-all`
-- indexed search can lag uncommitted filesystem changes until you refresh
-
-## Development
-
-Common local checks:
-
-```bash
-cargo fmt
-cargo test
-cargo clippy --all-targets --all-features --locked -- -D warnings
-```
-
-If you are changing index formats or provider behavior, treat that as a rebuild boundary and update the docs and release notes accordingly.
-
-## Agent notes
-
-If you are an agent performing installation:
-
-- prefer explicit absolute paths over relative ones
+- prefer absolute repo paths
 - run `doctor` before and after service installation
 - use `print-mcp-config` instead of hand-writing client snippets
-- assume provider/model changes require `reindex-all`
+- assume provider or model changes require `reindex-all`
 - prefer `install-hook` over manual hook editing
