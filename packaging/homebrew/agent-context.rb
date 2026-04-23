@@ -13,7 +13,7 @@ class AgentContext < Formula
   service do
     run [opt_bin/"agent-context", "serve", "--listen", "127.0.0.1:8765"]
     keep_alive true
-    working_dir var/"agent-context"
+    working_dir var
     log_path var/"log/agent-context.log"
     error_log_path var/"log/agent-context.err.log"
   end
