@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -102,10 +103,11 @@ jobs:
             exit 0
           fi
 
-          git clone "https://$TAP_TOKEN@github.com/jeremymefford/homebrew-agent-context-mcp.git" tap
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/jeremymefford/homebrew-agent-context-mcp.git" tap
           mkdir -p tap/Formula
           cp release-artifacts/homebrew/agent-context.rb tap/Formula/agent-context.rb
           cd tap
+          git remote set-url origin "https://x-access-token:$TAP_TOKEN@github.com/jeremymefford/homebrew-agent-context-mcp.git"
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
 
