@@ -487,7 +487,6 @@ impl SearchPlan {
 struct ProcessFilesResult {
     indexed_paths: HashSet<String>,
     processed_files: u64,
-    total_chunks: u64,
     status: IndexCompletionStatus,
 }
 
@@ -1483,9 +1482,16 @@ impl Engine {
                     modified: 0,
                     removed: 0,
                 };
+                let repo_path = repo.to_path_buf();
+                let local_index = self.inner.local_index.clone();
+                let chunk_coverage =
+                    run_low_priority_blocking("count_repo_chunk_coverage", move || {
+                        local_index.chunk_coverage(&repo_path)
+                    })
+                    .await?;
                 let coverage = IndexCoverage {
-                    indexed_files: processing.processed_files,
-                    total_chunks: processing.total_chunks,
+                    indexed_files: chunk_coverage.indexed_files,
+                    total_chunks: chunk_coverage.total_chunks,
                 };
                 Ok::<(ProcessFilesResult, RepoChangeSummary, IndexCoverage), anyhow::Error>((
                     processing, changes, coverage,
@@ -1589,13 +1595,14 @@ impl Engine {
                 save_merkle_snapshot(&merkle_path, &persisted_hashes).await?;
                 let repo_path = repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
-                let total_chunks = run_low_priority_blocking("count_repo_chunks", move || {
-                    local_index.chunk_count(&repo_path)
-                })
-                .await?;
+                let chunk_coverage =
+                    run_low_priority_blocking("count_repo_chunk_coverage", move || {
+                        local_index.chunk_coverage(&repo_path)
+                    })
+                    .await?;
                 let coverage = IndexCoverage {
-                    indexed_files: persisted_hashes.len() as u64,
-                    total_chunks,
+                    indexed_files: chunk_coverage.indexed_files,
+                    total_chunks: chunk_coverage.total_chunks,
                 };
                 let changes = RepoChangeSummary {
                     added: diff
@@ -2236,7 +2243,6 @@ impl Engine {
         Ok(ProcessFilesResult {
             indexed_paths,
             processed_files,
-            total_chunks,
             status,
         })
     }

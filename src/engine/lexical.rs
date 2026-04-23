@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tantivy::collector::{DocSetCollector, TopDocs};
@@ -83,6 +83,12 @@ pub struct ChunkSearchHit {
     pub indexed_at: String,
     pub file_hash: String,
     pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkIndexCoverage {
+    pub indexed_files: u64,
+    pub total_chunks: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -385,11 +391,34 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
-    pub fn chunk_count(&self, repo: &Path) -> Result<u64> {
+    pub fn chunk_coverage(&self, repo: &Path) -> Result<ChunkIndexCoverage> {
         let Some(handle) = self.open_existing_chunk_index(repo)? else {
-            return Ok(0);
+            return Ok(ChunkIndexCoverage::default());
         };
-        Ok(handle.reader.searcher().num_docs())
+        let schema = ChunkSchema::from_index(&handle.index)?;
+        let searcher = handle.reader.searcher();
+        let mut files = BTreeSet::new();
+        for segment in searcher.segment_readers() {
+            let store = segment
+                .get_store_reader(1)
+                .context("opening chunk store reader")?;
+            for doc_id in 0..segment.max_doc() {
+                if segment.is_deleted(doc_id) {
+                    continue;
+                }
+                let document: TantivyDocument = store.get(doc_id).context("loading chunk doc")?;
+                if let Some(path) = document
+                    .get_first(schema.relative_path_raw)
+                    .and_then(|value| value.as_str())
+                {
+                    files.insert(path.to_string());
+                }
+            }
+        }
+        Ok(ChunkIndexCoverage {
+            indexed_files: files.len() as u64,
+            total_chunks: searcher.num_docs(),
+        })
     }
 
     fn open_or_create_chunk_index(&self, repo: &Path) -> Result<Arc<CachedIndex>> {
