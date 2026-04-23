@@ -6,7 +6,13 @@
 http://127.0.0.1:8765/mcp
 ```
 
-If the service is launchd-managed, verify health first:
+If the service is Homebrew-managed, verify health first:
+
+```bash
+brew services list | grep agent-context
+```
+
+Then:
 
 ```bash
 curl http://127.0.0.1:8765/health

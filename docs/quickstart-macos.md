@@ -12,9 +12,16 @@ Before starting, the agent should know:
 
 Use one of:
 
-- a GitHub release asset
 - a Homebrew tap formula
+- a GitHub release asset
 - `cargo install --path .`
+
+Preferred:
+
+```bash
+brew tap jeremymefford/agent-context-mcp
+brew install agent-context
+```
 
 Verify:
 
@@ -76,22 +83,32 @@ Do not proceed until `doctor` succeeds.
 
 ## 6. Start the MCP server
 
-Foreground:
+Preferred:
 
 ```bash
-agent-context serve --listen 127.0.0.1:8765
+brew services start agent-context
 ```
 
-launchd:
+Verify service registration:
 
 ```bash
-agent-context install-launchd
+brew services list | grep agent-context
 ```
 
 Verify service health:
 
 ```bash
 curl http://127.0.0.1:8765/health
+```
+
+Manual fallbacks:
+
+```bash
+agent-context serve --listen 127.0.0.1:8765
+```
+
+```bash
+agent-context install-launchd
 ```
 
 ## 7. Connect your MCP client

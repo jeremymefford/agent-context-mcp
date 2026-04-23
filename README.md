@@ -33,7 +33,7 @@ V1 is intentionally opinionated:
 - macOS-first
 - Milvus required
 - embedding providers: Voyage, OpenAI, and Ollama
-- launchd is the first-class service model
+- Homebrew install plus `brew services` is the preferred local service model
 - MCP is the primary product interface
 
 This is aimed at power users who are comfortable running Docker and setting API keys in their shell environment.
@@ -54,12 +54,12 @@ Required inputs the agent should confirm or infer before running commands:
 
 The recommended install order is:
 
-1. Install the binary.
+1. Install the Homebrew tap and formula.
 2. Start Milvus.
 3. Run `agent-context init`.
 4. Export or validate provider credentials.
 5. Run `agent-context doctor`.
-6. Start the MCP server with `serve` or `install-launchd`.
+6. Start the MCP server with `brew services`.
 7. Print and apply client MCP config.
 8. Run `refresh-all` or `reindex-all`.
 9. Install post-commit hooks for repos that should auto-refresh on commit.
@@ -70,8 +70,14 @@ An agent should verify each step before moving on.
 
 1. Install the binary and verify it is on `PATH`.
 
-   - Preferred: GitHub Releases
-   - Homebrew tap: see [`packaging/homebrew/agent-context.rb`](/Users/jeremy/.local/share/agent-context/packaging/homebrew/agent-context.rb)
+   - Preferred:
+
+   ```bash
+   brew tap jeremymefford/agent-context-mcp
+   brew install agent-context
+   ```
+
+   - Release assets: GitHub Releases
    - Fallback: `cargo install --path .`
 
    Verify:
@@ -114,24 +120,28 @@ An agent should verify each step before moving on.
 
    Do not proceed until `doctor` reports no blocking issues.
 
-6. Start the shared MCP server.
-
-   Foreground:
-
    ```bash
-   agent-context serve --listen 127.0.0.1:8765
-   ```
-
-   launchd:
-
-   ```bash
-   agent-context install-launchd
+   brew services start agent-context
    ```
 
    Verify:
 
    ```bash
+   brew services list | grep agent-context
+   ```
+
+   Health:
+
+   ```bash
    curl http://127.0.0.1:8765/health
+   ```
+
+   Manual fallback:
+
+   ```bash
+   agent-context serve --listen 127.0.0.1:8765
+   # or
+   agent-context install-launchd
    ```
 
 7. Connect an MCP client.
