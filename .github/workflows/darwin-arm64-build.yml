@@ -1,0 +1,40 @@
+name: Darwin ARM64 Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-darwin-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/agent-context dist/agent-context
+          tar -C dist -czf dist/agent-context-darwin-arm64.tar.gz agent-context
+          shasum -a 256 dist/agent-context-darwin-arm64.tar.gz > dist/agent-context-darwin-arm64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-context-darwin-arm64
+          path: |
+            dist/agent-context-darwin-arm64.tar.gz
+            dist/agent-context-darwin-arm64.tar.gz.sha256

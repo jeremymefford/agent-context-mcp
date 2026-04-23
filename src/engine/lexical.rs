@@ -1,12 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::query::{QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, Value as _,
 };
-use tantivy::{Index, ReloadPolicy, Term, doc};
+use tantivy::{Index, IndexReader, ReloadPolicy, Term, doc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,14 +104,45 @@ pub struct SymbolSearchHit {
 #[derive(Clone)]
 pub struct LocalIndexStore {
     root: PathBuf,
+    max_warm_repos: usize,
+    cache: Arc<Mutex<RepoCacheState>>,
+}
+
+#[derive(Default)]
+struct RepoCacheState {
+    access_tick: u64,
+    repos: HashMap<PathBuf, RepoIndexCache>,
+}
+
+#[derive(Default)]
+struct RepoIndexCache {
+    chunk: Option<Arc<CachedIndex>>,
+    symbol: Option<Arc<CachedIndex>>,
+    last_access_tick: u64,
+}
+
+struct CachedIndex {
+    index: Index,
+    reader: IndexReader,
+}
+
+#[derive(Clone, Copy)]
+enum CachedIndexKind {
+    Chunk,
+    Symbol,
 }
 
 impl LocalIndexStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(root: PathBuf, max_warm_repos: usize) -> Self {
+        Self {
+            root,
+            max_warm_repos,
+            cache: Arc::new(Mutex::new(RepoCacheState::default())),
+        }
     }
 
     pub fn clear_repo(&self, repo: &Path) -> Result<()> {
+        self.remove_cached_repo(repo)?;
         let repo_root = self.repo_root(repo);
         if repo_root.exists() {
             std::fs::remove_dir_all(&repo_root)
@@ -122,9 +155,10 @@ impl LocalIndexStore {
         if relative_paths.is_empty() {
             return Ok(());
         }
-        if let Some(index) = self.open_existing_chunk_index(repo)? {
-            let schema = ChunkSchema::from_index(&index)?;
-            let mut writer = index
+        if let Some(handle) = self.open_existing_chunk_index(repo)? {
+            let schema = ChunkSchema::from_index(&handle.index)?;
+            let mut writer = handle
+                .index
                 .writer::<TantivyDocument>(32_000_000)
                 .context("opening chunk index writer")?;
             for relative_path in relative_paths {
@@ -134,10 +168,15 @@ impl LocalIndexStore {
                 ));
             }
             writer.commit().context("committing chunk deletes")?;
+            handle
+                .reader
+                .reload()
+                .context("reloading chunk reader after delete")?;
         }
-        if let Some(index) = self.open_existing_symbol_index(repo)? {
-            let schema = SymbolSchema::from_index(&index)?;
-            let mut writer = index
+        if let Some(handle) = self.open_existing_symbol_index(repo)? {
+            let schema = SymbolSchema::from_index(&handle.index)?;
+            let mut writer = handle
+                .index
                 .writer::<TantivyDocument>(16_000_000)
                 .context("opening symbol index writer")?;
             for relative_path in relative_paths {
@@ -147,6 +186,10 @@ impl LocalIndexStore {
                 ));
             }
             writer.commit().context("committing symbol deletes")?;
+            handle
+                .reader
+                .reload()
+                .context("reloading symbol reader after delete")?;
         }
         Ok(())
     }
@@ -155,9 +198,10 @@ impl LocalIndexStore {
         if documents.is_empty() {
             return Ok(());
         }
-        let index = self.open_or_create_chunk_index(repo)?;
-        let schema = ChunkSchema::from_index(&index)?;
-        let mut writer = index
+        let handle = self.open_or_create_chunk_index(repo)?;
+        let schema = ChunkSchema::from_index(&handle.index)?;
+        let mut writer = handle
+            .index
             .writer::<TantivyDocument>(64_000_000)
             .context("opening chunk index writer")?;
         for document in documents {
@@ -180,6 +224,10 @@ impl LocalIndexStore {
                 .context("adding chunk document to Tantivy")?;
         }
         writer.commit().context("committing chunk documents")?;
+        handle
+            .reader
+            .reload()
+            .context("reloading chunk reader after commit")?;
         Ok(())
     }
 
@@ -189,9 +237,10 @@ impl LocalIndexStore {
         relative_path: &str,
         documents: &[SymbolIndexDoc],
     ) -> Result<()> {
-        let index = self.open_or_create_symbol_index(repo)?;
-        let schema = SymbolSchema::from_index(&index)?;
-        let mut writer = index
+        let handle = self.open_or_create_symbol_index(repo)?;
+        let schema = SymbolSchema::from_index(&handle.index)?;
+        let mut writer = handle
+            .index
             .writer::<TantivyDocument>(16_000_000)
             .context("opening symbol index writer")?;
         writer.delete_term(Term::from_field_text(
@@ -219,6 +268,10 @@ impl LocalIndexStore {
                 .context("adding symbol document to Tantivy")?;
         }
         writer.commit().context("committing symbol documents")?;
+        handle
+            .reader
+            .reload()
+            .context("reloading symbol reader after commit")?;
         Ok(())
     }
 
@@ -227,18 +280,12 @@ impl LocalIndexStore {
         repo: &Path,
         request: &ChunkSearchRequest,
     ) -> Result<Vec<ChunkSearchHit>> {
-        let Some(index) = self.open_existing_chunk_index(repo)? else {
+        let Some(handle) = self.open_existing_chunk_index(repo)? else {
             return Ok(Vec::new());
         };
-        let schema = ChunkSchema::from_index(&index)?;
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("opening chunk index reader")?;
-        reader.reload().context("reloading chunk reader")?;
-        let searcher = reader.searcher();
-        let query = build_chunk_query(&index, &schema, request)?;
+        let schema = ChunkSchema::from_index(&handle.index)?;
+        let searcher = handle.reader.searcher();
+        let query = build_chunk_query(&handle.index, &schema, request)?;
         let fetch_limit = (request.limit.max(5) * 12).min(256);
         let docs = searcher
             .search(&query, &TopDocs::with_limit(fetch_limit))
@@ -273,18 +320,12 @@ impl LocalIndexStore {
         repo: &Path,
         request: &SymbolSearchRequest,
     ) -> Result<Vec<SymbolSearchHit>> {
-        let Some(index) = self.open_existing_symbol_index(repo)? else {
+        let Some(handle) = self.open_existing_symbol_index(repo)? else {
             return Ok(Vec::new());
         };
-        let schema = SymbolSchema::from_index(&index)?;
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("opening symbol index reader")?;
-        reader.reload().context("reloading symbol reader")?;
-        let searcher = reader.searcher();
-        let query = build_symbol_query(&index, &schema, request)?;
+        let schema = SymbolSchema::from_index(&handle.index)?;
+        let searcher = handle.reader.searcher();
+        let query = build_symbol_query(&handle.index, &schema, request)?;
         let fetch_limit = (request.limit.max(5) * 10).min(256);
         let docs = searcher
             .search(&query, &TopDocs::with_limit(fetch_limit))
@@ -314,61 +355,12 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
-    pub fn chunk_for_file_line(
-        &self,
-        repo: &Path,
-        relative_path: &str,
-        line: u64,
-    ) -> Result<Option<ChunkSearchHit>> {
-        let Some(index) = self.open_existing_chunk_index(repo)? else {
-            return Ok(None);
-        };
-        let schema = ChunkSchema::from_index(&index)?;
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("opening chunk index reader")?;
-        reader.reload().context("reloading chunk reader")?;
-        let searcher = reader.searcher();
-        let query = TermQuery::new(
-            Term::from_field_text(schema.relative_path_raw, relative_path),
-            IndexRecordOption::Basic,
-        );
-        let docs = searcher
-            .search(&query, &DocSetCollector)
-            .context("searching chunk by file")?;
-
-        let mut best: Option<ChunkSearchHit> = None;
-        for address in docs {
-            let document: TantivyDocument = searcher.doc(address).context("loading chunk doc")?;
-            let hit = chunk_hit_from_document(&schema, &document, 0.0)?;
-            if hit.start_line <= line && hit.end_line >= line {
-                return Ok(Some(hit));
-            }
-            let replace = best.as_ref().is_none_or(|current| {
-                distance_to_line(hit.start_line, hit.end_line, line)
-                    < distance_to_line(current.start_line, current.end_line, line)
-            });
-            if replace {
-                best = Some(hit);
-            }
-        }
-        Ok(best)
-    }
-
     pub fn chunks_for_file(&self, repo: &Path, relative_path: &str) -> Result<Vec<ChunkSearchHit>> {
-        let Some(index) = self.open_existing_chunk_index(repo)? else {
+        let Some(handle) = self.open_existing_chunk_index(repo)? else {
             return Ok(Vec::new());
         };
-        let schema = ChunkSchema::from_index(&index)?;
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("opening chunk index reader")?;
-        reader.reload().context("reloading chunk reader")?;
-        let searcher = reader.searcher();
+        let schema = ChunkSchema::from_index(&handle.index)?;
+        let searcher = handle.reader.searcher();
         let query = TermQuery::new(
             Term::from_field_text(schema.relative_path_raw, relative_path),
             IndexRecordOption::Basic,
@@ -393,48 +385,125 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
-    fn open_or_create_chunk_index(&self, repo: &Path) -> Result<Index> {
-        let path = self.chunk_index_dir(repo);
-        if path.exists() {
-            return Index::open_in_dir(&path)
-                .with_context(|| format!("opening chunk index {}", path.display()));
-        }
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("creating chunk index dir {}", path.display()))?;
-        Index::create_in_dir(&path, chunk_schema())
-            .with_context(|| format!("creating chunk index {}", path.display()))
+    fn open_or_create_chunk_index(&self, repo: &Path) -> Result<Arc<CachedIndex>> {
+        self.open_cached_index(repo, CachedIndexKind::Chunk, true)?
+            .ok_or_else(|| anyhow!("chunk index unexpectedly missing after create"))
     }
 
-    fn open_or_create_symbol_index(&self, repo: &Path) -> Result<Index> {
-        let path = self.symbol_index_dir(repo);
-        if path.exists() {
-            return Index::open_in_dir(&path)
-                .with_context(|| format!("opening symbol index {}", path.display()));
-        }
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("creating symbol index dir {}", path.display()))?;
-        Index::create_in_dir(&path, symbol_schema())
-            .with_context(|| format!("creating symbol index {}", path.display()))
+    fn open_or_create_symbol_index(&self, repo: &Path) -> Result<Arc<CachedIndex>> {
+        self.open_cached_index(repo, CachedIndexKind::Symbol, true)?
+            .ok_or_else(|| anyhow!("symbol index unexpectedly missing after create"))
     }
 
-    fn open_existing_chunk_index(&self, repo: &Path) -> Result<Option<Index>> {
-        let path = self.chunk_index_dir(repo);
+    fn open_existing_chunk_index(&self, repo: &Path) -> Result<Option<Arc<CachedIndex>>> {
+        self.open_cached_index(repo, CachedIndexKind::Chunk, false)
+    }
+
+    fn open_existing_symbol_index(&self, repo: &Path) -> Result<Option<Arc<CachedIndex>>> {
+        self.open_cached_index(repo, CachedIndexKind::Symbol, false)
+    }
+
+    fn open_cached_index(
+        &self,
+        repo: &Path,
+        kind: CachedIndexKind,
+        create: bool,
+    ) -> Result<Option<Arc<CachedIndex>>> {
+        let repo_root = self.repo_root(repo);
+        if let Some(existing) = self.cached_index(&repo_root, kind)? {
+            return Ok(Some(existing));
+        }
+
+        let path = match kind {
+            CachedIndexKind::Chunk => self.chunk_index_dir(repo),
+            CachedIndexKind::Symbol => self.symbol_index_dir(repo),
+        };
         if !path.exists() {
-            return Ok(None);
+            if !create {
+                return Ok(None);
+            }
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating lexical index dir {}", path.display()))?;
         }
-        Ok(Some(Index::open_in_dir(&path).with_context(|| {
-            format!("opening chunk index {}", path.display())
-        })?))
+
+        let index = if path
+            .read_dir()
+            .with_context(|| format!("reading lexical index dir {}", path.display()))?
+            .next()
+            .is_none()
+        {
+            let schema = match kind {
+                CachedIndexKind::Chunk => chunk_schema(),
+                CachedIndexKind::Symbol => symbol_schema(),
+            };
+            Index::create_in_dir(&path, schema)
+                .with_context(|| format!("creating Tantivy index {}", path.display()))?
+        } else {
+            Index::open_in_dir(&path)
+                .with_context(|| format!("opening Tantivy index {}", path.display()))?
+        };
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .with_context(|| format!("opening Tantivy reader {}", path.display()))?;
+        let cached = Arc::new(CachedIndex { index, reader });
+        Ok(Some(self.insert_cached_index(repo_root, kind, cached)?))
     }
 
-    fn open_existing_symbol_index(&self, repo: &Path) -> Result<Option<Index>> {
-        let path = self.symbol_index_dir(repo);
-        if !path.exists() {
+    fn cached_index(
+        &self,
+        repo_root: &Path,
+        kind: CachedIndexKind,
+    ) -> Result<Option<Arc<CachedIndex>>> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
+        let mut cache = cache;
+        let tick = next_access_tick(&mut cache);
+        let Some(repo_cache) = cache.repos.get_mut(repo_root) else {
             return Ok(None);
+        };
+        repo_cache.last_access_tick = tick;
+        Ok(match kind {
+            CachedIndexKind::Chunk => repo_cache.chunk.clone(),
+            CachedIndexKind::Symbol => repo_cache.symbol.clone(),
+        })
+    }
+
+    fn insert_cached_index(
+        &self,
+        repo_root: PathBuf,
+        kind: CachedIndexKind,
+        cached: Arc<CachedIndex>,
+    ) -> Result<Arc<CachedIndex>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
+        let tick = next_access_tick(&mut cache);
+        let repo_cache = cache.repos.entry(repo_root.clone()).or_default();
+        repo_cache.last_access_tick = tick;
+        let slot = match kind {
+            CachedIndexKind::Chunk => &mut repo_cache.chunk,
+            CachedIndexKind::Symbol => &mut repo_cache.symbol,
+        };
+        if let Some(existing) = slot {
+            return Ok(existing.clone());
         }
-        Ok(Some(Index::open_in_dir(&path).with_context(|| {
-            format!("opening symbol index {}", path.display())
-        })?))
+        *slot = Some(cached.clone());
+        evict_lru_repos(&mut cache, self.max_warm_repos, Some(&repo_root));
+        Ok(cached)
+    }
+
+    fn remove_cached_repo(&self, repo: &Path) -> Result<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
+        cache.repos.remove(&self.repo_root(repo));
+        Ok(())
     }
 
     fn repo_root(&self, repo: &Path) -> PathBuf {
@@ -448,6 +517,50 @@ impl LocalIndexStore {
 
     fn symbol_index_dir(&self, repo: &Path) -> PathBuf {
         self.repo_root(repo).join("symbols")
+    }
+
+    #[cfg(test)]
+    fn cached_repo_count(&self) -> Result<usize> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
+        Ok(cache.repos.len())
+    }
+
+    #[cfg(test)]
+    fn cached_repo_roots(&self) -> Result<Vec<PathBuf>> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
+        Ok(cache.repos.keys().cloned().collect())
+    }
+}
+
+fn next_access_tick(state: &mut RepoCacheState) -> u64 {
+    state.access_tick = state.access_tick.saturating_add(1);
+    state.access_tick
+}
+
+fn evict_lru_repos(state: &mut RepoCacheState, max_warm_repos: usize, preserve: Option<&Path>) {
+    if max_warm_repos == 0 {
+        state.repos.clear();
+        return;
+    }
+
+    while state.repos.len() > max_warm_repos {
+        let Some((repo_root, _)) = state
+            .repos
+            .iter()
+            .filter(|(_, cache)| cache.chunk.is_some() || cache.symbol.is_some())
+            .filter(|(repo_root, _)| preserve.is_none_or(|value| *repo_root != value))
+            .min_by_key(|(_, cache)| cache.last_access_tick)
+            .map(|(repo_root, cache)| (repo_root.clone(), cache.last_access_tick))
+        else {
+            break;
+        };
+        state.repos.remove(&repo_root);
     }
 }
 
@@ -838,16 +951,6 @@ fn normalize_relative_path(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_string()
 }
 
-fn distance_to_line(start_line: u64, end_line: u64, line: u64) -> u64 {
-    if start_line <= line && end_line >= line {
-        0
-    } else if end_line < line {
-        line - end_line
-    } else {
-        start_line - line
-    }
-}
-
 fn field(schema: &Schema, name: &str) -> Result<Field> {
     schema
         .get_field(name)
@@ -883,6 +986,7 @@ mod tests {
         ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor, SymbolIndexDoc,
         SymbolSearchRequest,
     };
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -896,7 +1000,7 @@ mod tests {
     #[test]
     fn chunk_search_prioritizes_exact_path_like_hits() {
         let root = temp_path("chunks");
-        let store = LocalIndexStore::new(root.clone());
+        let store = LocalIndexStore::new(root.clone(), 4);
         let repo = std::path::Path::new("/tmp/example");
         store
             .index_chunks(
@@ -955,7 +1059,7 @@ mod tests {
     #[test]
     fn symbol_search_finds_exact_name() {
         let root = temp_path("symbols");
-        let store = LocalIndexStore::new(root.clone());
+        let store = LocalIndexStore::new(root.clone(), 4);
         let repo = std::path::Path::new("/tmp/example");
         store
             .replace_symbol_docs(
@@ -998,7 +1102,7 @@ mod tests {
     #[test]
     fn file_chunk_lookups_are_not_capped_by_top_docs_limit() {
         let root = temp_path("many-chunks");
-        let store = LocalIndexStore::new(root.clone());
+        let store = LocalIndexStore::new(root.clone(), 4);
         let repo = std::path::Path::new("/tmp/example");
         let docs = (0..96)
             .map(|index| ChunkIndexDoc {
@@ -1019,12 +1123,133 @@ mod tests {
         let all_chunks = store.chunks_for_file(repo, "src/generated.rs").unwrap();
         assert_eq!(all_chunks.len(), docs.len());
 
-        let tail_line = docs.last().unwrap().start_line;
-        let tail_chunk = store
-            .chunk_for_file_line(repo, "src/generated.rs", tail_line)
-            .unwrap()
-            .expect("tail chunk should be found");
-        assert_eq!(tail_chunk.start_line, tail_line);
+        assert_eq!(
+            all_chunks.last().map(|chunk| chunk.start_line),
+            docs.last().map(|chunk| chunk.start_line)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warm_repo_cache_evicts_least_recently_used_repo() {
+        let root = temp_path("lru-eviction");
+        let store = LocalIndexStore::new(root.clone(), 2);
+        let repo_a = Path::new("/tmp/repo-a");
+        let repo_b = Path::new("/tmp/repo-b");
+        let repo_c = Path::new("/tmp/repo-c");
+
+        for (repo, symbol) in [(repo_a, "alpha"), (repo_b, "beta"), (repo_c, "gamma")] {
+            store
+                .index_chunks(
+                    repo,
+                    &[ChunkIndexDoc {
+                        id: format!("chunk-{symbol}"),
+                        relative_path: "src/lib.rs".to_string(),
+                        basename: "lib.rs".to_string(),
+                        extension: ".rs".to_string(),
+                        language: "rust".to_string(),
+                        content: format!("fn {symbol}() {{}}"),
+                        start_line: 1,
+                        end_line: 3,
+                        indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                        file_hash: format!("hash-{symbol}"),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let _ = store
+            .search_chunks(
+                repo_a,
+                &ChunkSearchRequest {
+                    query: "alpha".to_string(),
+                    limit: 1,
+                    flavor: QueryFlavor::Identifier,
+                    path_prefix: None,
+                    language: None,
+                    file: None,
+                    extension_filter: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store
+            .index_chunks(
+                repo_c,
+                &[ChunkIndexDoc {
+                    id: "chunk-delta".to_string(),
+                    relative_path: "src/other.rs".to_string(),
+                    basename: "other.rs".to_string(),
+                    extension: ".rs".to_string(),
+                    language: "rust".to_string(),
+                    content: "fn delta() {}".to_string(),
+                    start_line: 4,
+                    end_line: 6,
+                    indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                    file_hash: "hash-delta".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let cached_roots = store.cached_repo_roots().unwrap();
+        assert_eq!(store.cached_repo_count().unwrap(), 2);
+        assert!(cached_roots.contains(&store.repo_root(repo_a)));
+        assert!(cached_roots.contains(&store.repo_root(repo_c)));
+        assert!(!cached_roots.contains(&store.repo_root(repo_b)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_reader_handles_remain_valid_after_eviction() {
+        let root = temp_path("lru-active-handle");
+        let store = LocalIndexStore::new(root.clone(), 1);
+        let repo_a = Path::new("/tmp/repo-active-a");
+        let repo_b = Path::new("/tmp/repo-active-b");
+
+        for (repo, symbol) in [(repo_a, "alpha"), (repo_b, "beta")] {
+            store
+                .index_chunks(
+                    repo,
+                    &[ChunkIndexDoc {
+                        id: format!("chunk-{symbol}"),
+                        relative_path: "src/lib.rs".to_string(),
+                        basename: "lib.rs".to_string(),
+                        extension: ".rs".to_string(),
+                        language: "rust".to_string(),
+                        content: format!("fn {symbol}() {{}}"),
+                        start_line: 1,
+                        end_line: 3,
+                        indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                        file_hash: format!("hash-{symbol}"),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let handle = store.open_existing_chunk_index(repo_a).unwrap().unwrap();
+        store
+            .index_chunks(
+                repo_b,
+                &[ChunkIndexDoc {
+                    id: "chunk-gamma".to_string(),
+                    relative_path: "src/other.rs".to_string(),
+                    basename: "other.rs".to_string(),
+                    extension: ".rs".to_string(),
+                    language: "rust".to_string(),
+                    content: "fn gamma() {}".to_string(),
+                    start_line: 4,
+                    end_line: 6,
+                    indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                    file_hash: "hash-gamma".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let searcher = handle.reader.searcher();
+        assert_eq!(searcher.num_docs(), 1);
+        assert_eq!(store.cached_repo_count().unwrap(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

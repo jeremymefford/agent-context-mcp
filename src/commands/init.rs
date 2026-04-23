@@ -132,7 +132,14 @@ address = "127.0.0.1:19530"
 # token_env = "MILVUS_TOKEN"
 
 [freshness]
-max_parallel_searches = 4
+# audit_interval_secs = 600
+
+[search]
+max_concurrent_requests = 2
+max_concurrent_repo_searches = 4
+max_concurrent_lexical_tasks = 2
+max_concurrent_dense_tasks = 2
+max_warm_repos = 4
 
 [[groups]]
 id = "{}"

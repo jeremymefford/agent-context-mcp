@@ -71,7 +71,7 @@ An agent should verify each step before moving on.
 1. Install the binary and verify it is on `PATH`.
 
    - Preferred: GitHub Releases
-   - Homebrew tap: see [`packaging/homebrew/agent-context.rb`](/Users/jeremy/.local/share/cc-indexer-rs/packaging/homebrew/agent-context.rb)
+   - Homebrew tap: see [`packaging/homebrew/agent-context.rb`](/Users/jeremy/.local/share/agent-context/packaging/homebrew/agent-context.rb)
    - Fallback: `cargo install --path .`
 
    Verify:
@@ -218,7 +218,14 @@ address = "127.0.0.1:19530"
 # token_env = "MILVUS_TOKEN"
 
 [freshness]
-max_parallel_searches = 4
+# audit_interval_secs = 900
+
+[search]
+max_concurrent_requests = 2
+max_concurrent_repo_searches = 4
+max_concurrent_lexical_tasks = 2
+max_concurrent_dense_tasks = 2
+max_warm_repos = 4
 
 [[groups]]
 id = "workspace"
@@ -228,15 +235,15 @@ repos = [
 ]
 ```
 
-See the full template in [config.example.toml](/Users/jeremy/.local/share/cc-indexer-rs/config.example.toml).
+See the full template in [config.example.toml](/Users/jeremy/.local/share/agent-context/config.example.toml).
 
 ## Documentation
 
-- [macOS quickstart](/Users/jeremy/.local/share/cc-indexer-rs/docs/quickstart-macos.md)
-- [Embedding providers](/Users/jeremy/.local/share/cc-indexer-rs/docs/providers.md)
-- [Milvus bootstrap](/Users/jeremy/.local/share/cc-indexer-rs/docs/milvus.md)
-- [MCP client setup](/Users/jeremy/.local/share/cc-indexer-rs/docs/mcp-clients.md)
-- [Troubleshooting](/Users/jeremy/.local/share/cc-indexer-rs/docs/troubleshooting.md)
+- [macOS quickstart](/Users/jeremy/.local/share/agent-context/docs/quickstart-macos.md)
+- [Embedding providers](/Users/jeremy/.local/share/agent-context/docs/providers.md)
+- [Milvus bootstrap](/Users/jeremy/.local/share/agent-context/docs/milvus.md)
+- [MCP client setup](/Users/jeremy/.local/share/agent-context/docs/mcp-clients.md)
+- [Troubleshooting](/Users/jeremy/.local/share/agent-context/docs/troubleshooting.md)
 
 ## Release and packaging
 
@@ -251,9 +258,9 @@ This repo includes:
 
 See:
 
-- [.github/workflows/ci.yml](/Users/jeremy/.local/share/cc-indexer-rs/.github/workflows/ci.yml)
-- [.github/workflows/release.yml](/Users/jeremy/.local/share/cc-indexer-rs/.github/workflows/release.yml)
-- [packaging/homebrew/agent-context.rb](/Users/jeremy/.local/share/cc-indexer-rs/packaging/homebrew/agent-context.rb)
+- [.github/workflows/ci.yml](/Users/jeremy/.local/share/agent-context/.github/workflows/ci.yml)
+- [.github/workflows/release.yml](/Users/jeremy/.local/share/agent-context/.github/workflows/release.yml)
+- [packaging/homebrew/agent-context.rb](/Users/jeremy/.local/share/agent-context/packaging/homebrew/agent-context.rb)
 
 ## Limitations
 

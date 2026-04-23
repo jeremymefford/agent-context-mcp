@@ -60,6 +60,19 @@ pub async fn run(config: &Config, label: Option<&str>, listen: Option<&str>) -> 
         }
     }
 
+    print_check(
+        "search budgets",
+        true,
+        format!(
+            "requests={} repoSearches={} lexical={} dense={} warmRepos={}",
+            config.search.max_concurrent_requests,
+            config.search.max_concurrent_repo_searches,
+            config.search.max_concurrent_lexical_tasks,
+            config.search.max_concurrent_dense_tasks,
+            config.search.max_warm_repos
+        ),
+    );
+
     let engine = match Engine::new(config).await {
         Ok(engine) => engine,
         Err(error) => {

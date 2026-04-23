@@ -19,6 +19,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xxhash_rust::xxh3::Xxh3;
 
 use self::embedding::EmbeddingClient;
@@ -27,8 +28,8 @@ use self::freshness::{
     merkle_snapshot_path,
 };
 use self::lexical::{
-    ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor, SymbolIndexDoc,
-    SymbolSearchRequest,
+    ChunkIndexDoc, ChunkSearchHit as LexicalChunkSearchHit, ChunkSearchRequest, LocalIndexStore,
+    QueryFlavor, SymbolIndexDoc, SymbolSearchRequest,
 };
 use self::milvus::{MilvusClient, SearchDocument, VectorDocument};
 use self::splitter::{
@@ -61,6 +62,15 @@ struct EngineInner {
     embedding: EmbeddingClient,
     local_index: LocalIndexStore,
     symbol_store: SymbolStore,
+    search_budgets: SearchBudgets,
+}
+
+#[derive(Clone)]
+struct SearchBudgets {
+    requests: Arc<Semaphore>,
+    repo_searches: Arc<Semaphore>,
+    lexical_tasks: Arc<Semaphore>,
+    dense_tasks: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -518,6 +528,49 @@ impl ProgressTracker {
     }
 }
 
+impl SearchBudgets {
+    fn new(config: &crate::config::SearchConfig) -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            repo_searches: Arc::new(Semaphore::new(config.max_concurrent_repo_searches)),
+            lexical_tasks: Arc::new(Semaphore::new(config.max_concurrent_lexical_tasks)),
+            dense_tasks: Arc::new(Semaphore::new(config.max_concurrent_dense_tasks)),
+        }
+    }
+
+    async fn acquire_request(&self) -> Result<OwnedSemaphorePermit> {
+        self.requests
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquiring global search request budget")
+    }
+
+    async fn acquire_repo_search(&self) -> Result<OwnedSemaphorePermit> {
+        self.repo_searches
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquiring global repo search budget")
+    }
+
+    async fn acquire_lexical(&self) -> Result<OwnedSemaphorePermit> {
+        self.lexical_tasks
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquiring global lexical search budget")
+    }
+
+    async fn acquire_dense(&self) -> Result<OwnedSemaphorePermit> {
+        self.dense_tasks
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquiring global dense search budget")
+    }
+}
+
 impl Engine {
     pub async fn new(config: &Config) -> Result<Self> {
         let embedding = EmbeddingClient::new(&config.embedding).await?;
@@ -528,8 +581,12 @@ impl Engine {
                 snapshot: SnapshotStore::new(config.snapshot_path.clone()),
                 milvus,
                 embedding,
-                local_index: LocalIndexStore::new(config.search_index_dir()),
+                local_index: LocalIndexStore::new(
+                    config.search_index_dir(),
+                    config.search.max_warm_repos,
+                ),
                 symbol_store: SymbolStore::new(config.symbol_db_path()),
+                search_budgets: SearchBudgets::new(&config.search),
             }),
         })
     }
@@ -673,14 +730,72 @@ impl Engine {
         })
     }
 
+    async fn acquire_request_budget(&self) -> Result<OwnedSemaphorePermit> {
+        self.inner.search_budgets.acquire_request().await
+    }
+
+    async fn acquire_repo_search_budget(&self) -> Result<OwnedSemaphorePermit> {
+        self.inner.search_budgets.acquire_repo_search().await
+    }
+
+    async fn acquire_lexical_budget(&self) -> Result<OwnedSemaphorePermit> {
+        self.inner.search_budgets.acquire_lexical().await
+    }
+
+    async fn acquire_dense_budget(&self) -> Result<OwnedSemaphorePermit> {
+        self.inner.search_budgets.acquire_dense().await
+    }
+
+    async fn run_search_lexical_blocking<T, F>(&self, label: &'static str, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let _permit = self.acquire_lexical_budget().await?;
+        run_low_priority_blocking(label, work).await
+    }
+
+    async fn has_collection_on_search_path(&self, collection_name: &str) -> Result<bool> {
+        let _permit = self.acquire_dense_budget().await?;
+        self.inner.milvus.has_collection(collection_name).await
+    }
+
+    async fn search_symbol_collection_presence(
+        &self,
+        repos: &[PathBuf],
+    ) -> Result<HashMap<String, bool>> {
+        let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
+        let repo_checks = repos.to_vec();
+        let mut stream = futures::stream::iter(repo_checks.into_iter().map(|repo| {
+            let engine = self.clone();
+            async move {
+                let _repo_permit = engine.acquire_repo_search_budget().await?;
+                let exists = engine
+                    .has_collection_on_search_path(&symbol_collection_name(&repo))
+                    .await?;
+                Ok::<_, anyhow::Error>((repo.display().to_string(), exists))
+            }
+        }))
+        .buffer_unordered(parallelism);
+
+        let mut presence = HashMap::new();
+        while let Some(item) = stream.next().await {
+            let (repo_key, exists) = item?;
+            presence.insert(repo_key, exists);
+        }
+        Ok(presence)
+    }
+
     pub async fn search_scope(
         &self,
         scope: ResolvedScope,
         request: SearchRequest,
     ) -> Result<SearchResponse> {
         self.ensure_index_identity(false).await?;
+        let _request_permit = self.acquire_request_budget().await?;
         let plan = plan_search(&request);
         let query_vector = if plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0 {
+            let _dense_permit = self.acquire_dense_budget().await?;
             Some(Arc::new(
                 self.inner.embedding.embed_query(&request.query).await?,
             ))
@@ -688,7 +803,7 @@ impl Engine {
             None
         };
         let per_repo_limit = (request.limit.max(5) * 4).min(64);
-        let parallelism = self.inner.config.freshness.max_parallel_searches.max(1);
+        let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
         let filter_expression = build_extension_filter(&request.extension_filter);
         let snapshot = self.inner.snapshot.read().await?;
 
@@ -700,6 +815,18 @@ impl Engine {
             let filter_expression = filter_expression.clone();
             let entry = snapshot.codebases.get(&repo.display().to_string()).cloned();
             async move {
+                let repo_label = repo.display().to_string();
+                let _repo_permit = match engine.acquire_repo_search_budget().await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        return RepoSearchOutcome {
+                            repo: repo_label,
+                            stale: false,
+                            hits: Vec::new(),
+                            error: Some(error.to_string()),
+                        };
+                    }
+                };
                 let stale = engine
                     .repo_is_stale(&repo, entry.as_ref())
                     .await
@@ -716,13 +843,13 @@ impl Engine {
                     .await
                 {
                     Ok(hits) => RepoSearchOutcome {
-                        repo: repo.display().to_string(),
+                        repo: repo_label,
                         stale,
                         hits,
                         error: None,
                     },
                     Err(error) => RepoSearchOutcome {
-                        repo: repo.display().to_string(),
+                        repo: repo_label,
                         stale,
                         hits: Vec::new(),
                         error: Some(error.to_string()),
@@ -778,33 +905,19 @@ impl Engine {
         request: SymbolSearchScopeRequest,
     ) -> Result<SymbolSearchResponse> {
         self.ensure_index_identity(false).await?;
+        let _request_permit = self.acquire_request_budget().await?;
         let flavor = classify_query(&request.query);
         let (lexical_share, semantic_share) = symbol_query_shares(flavor);
-        let parallelism = self.inner.config.freshness.max_parallel_searches.max(1);
+        let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
         let scope_repos = scope.repos;
         let symbol_collection_presence = if semantic_share > 0.0 {
-            let repo_checks = scope_repos.clone();
-            let mut stream = futures::stream::iter(repo_checks.into_iter().map(|repo| {
-                let milvus = self.inner.milvus.clone();
-                async move {
-                    let exists = milvus
-                        .has_collection(&symbol_collection_name(&repo))
-                        .await
-                        .unwrap_or(false);
-                    (repo.display().to_string(), exists)
-                }
-            }))
-            .buffer_unordered(parallelism);
-            let mut presence = HashMap::new();
-            while let Some((repo_key, exists)) = stream.next().await {
-                presence.insert(repo_key, exists);
-            }
-            presence
+            self.search_symbol_collection_presence(&scope_repos).await?
         } else {
             HashMap::new()
         };
         let any_symbol_collections = symbol_collection_presence.values().any(|exists| *exists);
         let query_vector = if semantic_share > 0.0 && any_symbol_collections {
+            let _dense_permit = self.acquire_dense_budget().await?;
             Some(Arc::new(
                 self.inner.embedding.embed_query(&request.query).await?,
             ))
@@ -824,6 +937,7 @@ impl Engine {
                 .copied()
                 .unwrap_or(false);
             async move {
+                let _repo_permit = engine.acquire_repo_search_budget().await?;
                 let stale = engine
                     .repo_is_stale(&repo, entry.as_ref())
                     .await
@@ -1050,16 +1164,17 @@ impl Engine {
         let target_line = hit.start_line;
         let fallback = build_snippet(query, &hit.content, 900);
         let local_index = self.inner.local_index.clone();
-        let context = run_low_priority_blocking("search_hit_context", move || {
-            let chunks = local_index.chunks_for_file(&repo_path, &relative_path)?;
-            Ok(build_chunk_context_snippet(
-                &chunks,
-                target_line,
-                neighbor_chunks,
-                1400,
-            ))
-        })
-        .await;
+        let context = self
+            .run_search_lexical_blocking("search_hit_context", move || {
+                let chunks = local_index.chunks_for_file(&repo_path, &relative_path)?;
+                Ok(build_chunk_context_snippet(
+                    &chunks,
+                    target_line,
+                    neighbor_chunks,
+                    1400,
+                ))
+            })
+            .await;
 
         match context {
             Ok(Some(context)) => build_snippet(query, &context, 1200),
@@ -1071,7 +1186,7 @@ impl Engine {
         &self,
         probes: Vec<FileFreshnessProbe>,
     ) -> Result<HashMap<String, bool>> {
-        run_low_priority_blocking("compute_file_staleness", move || {
+        self.run_search_lexical_blocking("compute_file_staleness", move || {
             let mut deduped = BTreeMap::new();
             for probe in probes {
                 deduped
@@ -1253,11 +1368,15 @@ impl Engine {
             .map(|(path, file)| (path.clone(), file.hash.clone()))
             .collect::<BTreeMap<_, _>>();
 
-        let collection_exists = self.inner.milvus.has_collection(&collection_name).await?;
+        let collection_exists = self
+            .inner
+            .milvus
+            .refresh_collection_presence(&collection_name)
+            .await?;
         let symbol_collection_exists = self
             .inner
             .milvus
-            .has_collection(&symbol_collection_name)
+            .refresh_collection_presence(&symbol_collection_name)
             .await?;
         let previous_snapshot = if force || !collection_exists {
             None
@@ -1520,13 +1639,18 @@ impl Engine {
         let repo_key = repo.display().to_string();
         let collection_name = collection_name(repo);
         let symbol_collection_name = symbol_collection_name(repo);
-        if self.inner.milvus.has_collection(&collection_name).await? {
+        if self
+            .inner
+            .milvus
+            .refresh_collection_presence(&collection_name)
+            .await?
+        {
             self.inner.milvus.drop_collection(&collection_name).await?;
         }
         if self
             .inner
             .milvus
-            .has_collection(&symbol_collection_name)
+            .refresh_collection_presence(&symbol_collection_name)
             .await?
         {
             self.inner
@@ -1568,15 +1692,19 @@ impl Engine {
     ) -> Result<Vec<RepoSearchHit>> {
         let collection_name = collection_name(repo);
         let dense_hits = if let Some(query_vector) = query_vector {
-            if plan.dense_weight > 0.0 && self.inner.milvus.has_collection(&collection_name).await?
-            {
-                self.inner
-                    .milvus
-                    .search_dense(&collection_name, query_vector, limit, filter_expression)
-                    .await?
-                    .into_iter()
-                    .filter(|hit| search_document_matches(hit, request))
-                    .collect::<Vec<_>>()
+            if plan.dense_weight > 0.0 {
+                let _dense_permit = self.acquire_dense_budget().await?;
+                if self.inner.milvus.has_collection(&collection_name).await? {
+                    self.inner
+                        .milvus
+                        .search_dense(&collection_name, query_vector, limit, filter_expression)
+                        .await?
+                        .into_iter()
+                        .filter(|hit| search_document_matches(hit, request))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }
@@ -1584,21 +1712,29 @@ impl Engine {
             Vec::new()
         };
 
-        let lexical_hits = run_low_priority_blocking("search_chunk_index", {
-            let repo_path = repo.to_path_buf();
-            let local_index = self.inner.local_index.clone();
-            let request = ChunkSearchRequest {
-                query: request.query.clone(),
-                limit,
-                flavor: plan.lexical_flavor(),
-                path_prefix: request.path_prefix.clone(),
-                language: request.language.clone(),
-                file: request.file.clone(),
-                extension_filter: request.extension_filter.clone(),
-            };
-            move || local_index.search_chunks(&repo_path, &request)
-        })
-        .await?;
+        let lexical_hits = self
+            .run_search_lexical_blocking("search_chunk_index", {
+                let repo_path = repo.to_path_buf();
+                let local_index = self.inner.local_index.clone();
+                let request = ChunkSearchRequest {
+                    query: request.query.clone(),
+                    limit,
+                    flavor: plan.lexical_flavor(),
+                    path_prefix: request.path_prefix.clone(),
+                    language: request.language.clone(),
+                    file: request.file.clone(),
+                    extension_filter: request.extension_filter.clone(),
+                };
+                move || local_index.search_chunks(&repo_path, &request)
+            })
+            .await?;
+
+        let symbol_collection_exists = if plan.symbol_semantic_share > 0.0 {
+            self.has_collection_on_search_path(&symbol_collection_name(repo))
+                .await?
+        } else {
+            false
+        };
 
         let symbol_hits = self
             .search_symbol_repo(
@@ -1617,11 +1753,7 @@ impl Engine {
                     query_vector,
                     lexical_share: plan.symbol_lexical_share,
                     semantic_share: plan.symbol_semantic_share,
-                    symbol_collection_exists: self
-                        .inner
-                        .milvus
-                        .has_collection(&symbol_collection_name(repo))
-                        .await?,
+                    symbol_collection_exists,
                 },
             )
             .await?;
@@ -1650,25 +1782,27 @@ impl Engine {
         limit: usize,
         fusion: SymbolFusionConfig<'_>,
     ) -> Result<Vec<RankedSymbolHit>> {
-        let indexed_hits = run_low_priority_blocking("search_symbol_index", {
-            let repo_path = repo.to_path_buf();
-            let local_index = self.inner.local_index.clone();
-            let request = SymbolSearchRequest {
-                query: request.query.clone(),
-                limit,
-                flavor: query_flavor(flavor),
-                path_prefix: request.path_prefix.clone(),
-                language: request.language.clone(),
-                kind: request.kind.clone(),
-                container: request.container.clone(),
-            };
-            move || local_index.search_symbols(&repo_path, &request)
-        })
-        .await?;
+        let indexed_hits = self
+            .run_search_lexical_blocking("search_symbol_index", {
+                let repo_path = repo.to_path_buf();
+                let local_index = self.inner.local_index.clone();
+                let request = SymbolSearchRequest {
+                    query: request.query.clone(),
+                    limit,
+                    flavor: query_flavor(flavor),
+                    path_prefix: request.path_prefix.clone(),
+                    language: request.language.clone(),
+                    kind: request.kind.clone(),
+                    container: request.container.clone(),
+                };
+                move || local_index.search_symbols(&repo_path, &request)
+            })
+            .await?;
 
         let semantic_hits = if fusion.semantic_share > 0.0 && fusion.symbol_collection_exists {
             let collection_name = symbol_collection_name(repo);
             if let Some(query_vector) = fusion.query_vector {
+                let _dense_permit = self.acquire_dense_budget().await?;
                 self.inner
                     .milvus
                     .search_dense(
@@ -1696,11 +1830,12 @@ impl Engine {
         );
         symbol_ids.sort();
         symbol_ids.dedup();
-        let authoritative = run_low_priority_blocking("load_symbol_rows", {
-            let symbol_store = self.inner.symbol_store.clone();
-            move || symbol_store.symbols_by_ids(&symbol_ids)
-        })
-        .await?;
+        let authoritative = self
+            .run_search_lexical_blocking("load_symbol_rows", {
+                let symbol_store = self.inner.symbol_store.clone();
+                move || symbol_store.symbols_by_ids(&symbol_ids)
+            })
+            .await?;
         let authoritative = authoritative
             .into_iter()
             .map(|symbol| (symbol.symbol_id.clone(), symbol))
@@ -1749,15 +1884,22 @@ impl Engine {
             .map(|hit| hit.combined_score)
             .filter(|score| *score > 0.0)
             .unwrap_or(1.0);
+        let mut file_chunk_cache: HashMap<String, Vec<LexicalChunkSearchHit>> = HashMap::new();
         for (rank, hit) in symbol_hits.into_iter().enumerate() {
-            let chunk_hit = run_low_priority_blocking("chunk_for_symbol_hit", {
+            if !file_chunk_cache.contains_key(&hit.relative_path) {
                 let repo_path = repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let relative_path = hit.relative_path.clone();
-                let start_line = hit.start_line;
-                move || local_index.chunk_for_file_line(&repo_path, &relative_path, start_line)
-            })
-            .await?;
+                let chunks = self
+                    .run_search_lexical_blocking("chunks_for_symbol_file", move || {
+                        local_index.chunks_for_file(&repo_path, &relative_path)
+                    })
+                    .await?;
+                file_chunk_cache.insert(hit.relative_path.clone(), chunks);
+            }
+            let chunk_hit = file_chunk_cache
+                .get(&hit.relative_path)
+                .and_then(|chunks| nearest_chunk_for_line(chunks, hit.start_line));
 
             let score = fused_source_score(rank, hit.combined_score, max_score, weight);
             if let Some(chunk_hit) = chunk_hit {
@@ -1810,7 +1952,7 @@ impl Engine {
         let repo_key = repo_key.to_string();
         let relative_path = relative_path.to_string();
         let symbol_store = self.inner.symbol_store.clone();
-        run_low_priority_blocking("load_file_outline_symbols", move || {
+        self.run_search_lexical_blocking("load_file_outline_symbols", move || {
             symbol_store.file_symbols(&repo_key, &relative_path)
         })
         .await
@@ -1819,7 +1961,7 @@ impl Engine {
     async fn repo_is_stale(&self, repo: &Path, entry: Option<&SnapshotEntry>) -> Result<bool> {
         let repo_path = repo.to_path_buf();
         let entry = entry.cloned();
-        run_low_priority_blocking("repo_stale_check", move || {
+        self.run_search_lexical_blocking("repo_stale_check", move || {
             let fingerprint = fingerprint_repo(&repo_path)?;
             Ok(fingerprint_changed(entry.as_ref(), &fingerprint))
         })
@@ -1834,7 +1976,11 @@ impl Engine {
         if matches!(
             entry.as_ref().map(|value| value.status.as_str()),
             Some("indexed")
-        ) && !self.inner.milvus.has_collection(&collection_name).await?
+        ) && !self
+            .inner
+            .milvus
+            .refresh_collection_presence(&collection_name)
+            .await?
         {
             self.inner.snapshot.remove(&repo_key).await?;
             return Ok(RepoStatus {
@@ -2542,6 +2688,23 @@ fn accumulate_lexical_hits(
         entry.lexical_score += score;
         entry.combined_score += score;
     }
+}
+
+fn nearest_chunk_for_line(
+    chunks: &[LexicalChunkSearchHit],
+    line: u64,
+) -> Option<LexicalChunkSearchHit> {
+    if let Some(chunk) = chunks
+        .iter()
+        .find(|chunk| chunk.start_line <= line && chunk.end_line >= line)
+    {
+        return Some(chunk.clone());
+    }
+
+    chunks
+        .iter()
+        .min_by_key(|chunk| distance_to_line(chunk.start_line, chunk.end_line, line))
+        .cloned()
 }
 
 fn accumulate_ranked_symbol_lexical_hits(
@@ -3412,15 +3575,19 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchMode,
-        SearchRequest, build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
-        collection_name, diff_files, hash_text_like_file, plan_search, run_low_priority_blocking,
-        scan_repo,
+        CONTENT_HASH_ALGORITHM, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets,
+        SearchMode, SearchRequest, build_chunk_context_snippet, build_root_hash, chunk_id,
+        classify_query, collection_name, diff_files, hash_text_like_file, plan_search,
+        run_low_priority_blocking, scan_repo,
     };
+    use crate::config::SearchConfig;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::Barrier;
     use xxhash_rust::xxh3::xxh3_128;
 
     fn temp_file_path(name: &str) -> std::path::PathBuf {
@@ -3638,6 +3805,112 @@ mod tests {
         assert!(snippet.contains("alpha"));
         assert!(snippet.contains("beta"));
         assert!(snippet.contains("gamma"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_requests_share_repo_search_budget() {
+        let budgets = SearchBudgets::new(&SearchConfig {
+            max_concurrent_requests: 2,
+            max_concurrent_repo_searches: 1,
+            max_concurrent_lexical_tasks: 1,
+            max_concurrent_dense_tasks: 1,
+            max_warm_repos: 1,
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..2)
+            .map(|_| {
+                let budgets = budgets.clone();
+                let barrier = barrier.clone();
+                let active = active.clone();
+                let max_active = max_active.clone();
+                tokio::spawn(async move {
+                    let _request = budgets.acquire_request().await.unwrap();
+                    barrier.wait().await;
+                    let _repo = budgets.acquire_repo_search().await.unwrap();
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lexical_tasks_never_exceed_global_limit() {
+        let budgets = SearchBudgets::new(&SearchConfig {
+            max_concurrent_requests: 3,
+            max_concurrent_repo_searches: 3,
+            max_concurrent_lexical_tasks: 1,
+            max_concurrent_dense_tasks: 2,
+            max_warm_repos: 2,
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..3)
+            .map(|_| {
+                let budgets = budgets.clone();
+                let active = active.clone();
+                let max_active = max_active.clone();
+                tokio::spawn(async move {
+                    let _lexical = budgets.acquire_lexical().await.unwrap();
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dense_tasks_never_exceed_global_limit() {
+        let budgets = SearchBudgets::new(&SearchConfig {
+            max_concurrent_requests: 4,
+            max_concurrent_repo_searches: 4,
+            max_concurrent_lexical_tasks: 2,
+            max_concurrent_dense_tasks: 2,
+            max_warm_repos: 2,
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..4)
+            .map(|_| {
+                let budgets = budgets.clone();
+                let active = active.clone();
+                let max_active = max_active.clone();
+                tokio::spawn(async move {
+                    let _dense = budgets.acquire_dense().await.unwrap();
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
     }
 
     #[test]

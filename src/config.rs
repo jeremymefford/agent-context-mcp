@@ -29,6 +29,7 @@ pub struct Config {
     pub default_group: String,
     pub groups: Vec<GroupConfig>,
     pub freshness: FreshnessConfig,
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +79,34 @@ pub struct MilvusConfig {
 pub struct FreshnessConfig {
     #[serde(default)]
     pub audit_interval_secs: Option<u64>,
-    #[serde(default = "default_search_parallelism")]
-    pub max_parallel_searches: usize,
+    #[serde(default)]
+    pub max_parallel_searches: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_max_concurrent_repo_searches")]
+    pub max_concurrent_repo_searches: usize,
+    #[serde(default = "default_max_concurrent_lexical_tasks")]
+    pub max_concurrent_lexical_tasks: usize,
+    #[serde(default = "default_max_concurrent_dense_tasks")]
+    pub max_concurrent_dense_tasks: usize,
+    #[serde(default = "default_max_warm_repos")]
+    pub max_warm_repos: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: default_max_concurrent_requests(),
+            max_concurrent_repo_searches: default_max_concurrent_repo_searches(),
+            max_concurrent_lexical_tasks: default_max_concurrent_lexical_tasks(),
+            max_concurrent_dense_tasks: default_max_concurrent_dense_tasks(),
+            max_warm_repos: default_max_warm_repos(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +141,8 @@ struct RawConfig {
     milvus: Option<RawMilvusConfig>,
     #[serde(default)]
     freshness: Option<FreshnessConfig>,
+    #[serde(default)]
+    search: Option<SearchConfig>,
     #[serde(default)]
     snapshot_path: Option<String>,
     #[serde(default)]
@@ -298,6 +327,7 @@ impl Config {
         };
 
         let freshness = raw.freshness.unwrap_or_default();
+        let search = build_search_config(raw.search.as_ref(), &freshness)?;
 
         let mut groups = if let Some(mut groups) = raw.groups {
             for group in &mut groups {
@@ -356,6 +386,7 @@ impl Config {
             default_group,
             groups: std::mem::take(&mut groups),
             freshness,
+            search,
         })
     }
 
@@ -597,7 +628,64 @@ fn default_config_path_candidates() -> Result<Vec<PathBuf>> {
     ])
 }
 
-fn default_search_parallelism() -> usize {
+fn build_search_config(
+    raw: Option<&SearchConfig>,
+    freshness: &FreshnessConfig,
+) -> Result<SearchConfig> {
+    let mut search = raw.cloned().unwrap_or_default();
+    if raw.is_none()
+        && let Some(legacy_parallelism) = freshness.max_parallel_searches
+    {
+        search.max_concurrent_repo_searches = legacy_parallelism;
+    }
+    validate_search_config(&search)?;
+    Ok(search)
+}
+
+fn validate_search_config(search: &SearchConfig) -> Result<()> {
+    for (name, value) in [
+        (
+            "search.max_concurrent_requests",
+            search.max_concurrent_requests,
+        ),
+        (
+            "search.max_concurrent_repo_searches",
+            search.max_concurrent_repo_searches,
+        ),
+        (
+            "search.max_concurrent_lexical_tasks",
+            search.max_concurrent_lexical_tasks,
+        ),
+        (
+            "search.max_concurrent_dense_tasks",
+            search.max_concurrent_dense_tasks,
+        ),
+        ("search.max_warm_repos", search.max_warm_repos),
+    ] {
+        if value == 0 {
+            bail!("{name} must be greater than 0");
+        }
+    }
+    Ok(())
+}
+
+fn default_max_concurrent_requests() -> usize {
+    2
+}
+
+fn default_max_concurrent_repo_searches() -> usize {
+    4
+}
+
+fn default_max_concurrent_lexical_tasks() -> usize {
+    2
+}
+
+fn default_max_concurrent_dense_tasks() -> usize {
+    2
+}
+
+fn default_max_warm_repos() -> usize {
     4
 }
 
@@ -814,6 +902,110 @@ mod tests {
         let config = Config::load_from_path(&config_path).unwrap();
         assert_eq!(config.embedding.provider, EmbeddingProvider::Ollama);
         assert_eq!(config.embedding.ollama.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn search_config_defaults_are_applied_when_block_is_absent() {
+        let dir = temp_dir("search-defaults");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert_eq!(config.search.max_concurrent_requests, 2);
+        assert_eq!(config.search.max_concurrent_repo_searches, 4);
+        assert_eq!(config.search.max_concurrent_lexical_tasks, 2);
+        assert_eq!(config.search.max_concurrent_dense_tasks, 2);
+        assert_eq!(config.search.max_warm_repos, 4);
+    }
+
+    #[test]
+    fn legacy_freshness_parallelism_maps_to_search_repo_budget() {
+        let dir = temp_dir("legacy-search-alias");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [freshness]
+                max_parallel_searches = 7
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert_eq!(config.search.max_concurrent_repo_searches, 7);
+    }
+
+    #[test]
+    fn search_block_takes_precedence_over_legacy_parallelism_alias() {
+        let dir = temp_dir("search-precedence");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [freshness]
+                max_parallel_searches = 7
+
+                [search]
+                max_concurrent_repo_searches = 3
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert_eq!(config.search.max_concurrent_repo_searches, 3);
+    }
+
+    #[test]
+    fn invalid_search_limits_are_rejected() {
+        let dir = temp_dir("invalid-search");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [search]
+                max_concurrent_requests = 0
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let error = Config::load_from_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("search.max_concurrent_requests"));
     }
 
     #[test]

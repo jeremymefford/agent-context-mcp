@@ -5,6 +5,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValu
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const COLLECTION_LIMIT_MESSAGE: &str = "[Error]: Your Zilliz Cloud account has hit its collection limit. To continue creating collections, you'll need to expand your capacity. We recommend visiting https://zilliz.com/pricing to explore options for dedicated or serverless clusters.";
@@ -14,6 +16,7 @@ pub struct MilvusClient {
     http: reqwest::Client,
     base_url: String,
     database: String,
+    collection_presence: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,10 +89,43 @@ impl MilvusClient {
             http,
             base_url: format!("{}/v2/vectordb", address.trim_end_matches('/')),
             database: config.database.clone(),
+            collection_presence: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub async fn has_collection(&self, collection_name: &str) -> Result<bool> {
+        if let Some(exists) = self.cached_collection_presence(collection_name)? {
+            return Ok(exists);
+        }
+        let exists = self.query_collection_presence(collection_name).await?;
+        self.set_collection_presence(collection_name, exists)?;
+        Ok(exists)
+    }
+
+    pub async fn refresh_collection_presence(&self, collection_name: &str) -> Result<bool> {
+        let exists = self.query_collection_presence(collection_name).await?;
+        self.set_collection_presence(collection_name, exists)?;
+        Ok(exists)
+    }
+
+    fn cached_collection_presence(&self, collection_name: &str) -> Result<Option<bool>> {
+        let cache = self
+            .collection_presence
+            .read()
+            .map_err(|_| anyhow!("Milvus collection presence cache poisoned"))?;
+        Ok(cache.get(collection_name).copied())
+    }
+
+    fn set_collection_presence(&self, collection_name: &str, exists: bool) -> Result<()> {
+        let mut cache = self
+            .collection_presence
+            .write()
+            .map_err(|_| anyhow!("Milvus collection presence cache poisoned"))?;
+        cache.insert(collection_name.to_string(), exists);
+        Ok(())
+    }
+
+    async fn query_collection_presence(&self, collection_name: &str) -> Result<bool> {
         #[derive(Debug, Deserialize)]
         struct HasCollection {
             #[serde(default)]
@@ -149,6 +185,7 @@ impl MilvusClient {
                 INDEX_TIMEOUT,
             )
             .await?;
+        self.set_collection_presence(collection_name, false)?;
         Ok(())
     }
 
@@ -277,6 +314,7 @@ impl MilvusClient {
             )
             .await?;
 
+        self.set_collection_presence(collection_name, true)?;
         self.ensure_loaded(collection_name).await
     }
 
@@ -600,7 +638,18 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_collection_limit_error;
+    use super::{MilvusClient, is_collection_limit_error};
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    fn test_client() -> MilvusClient {
+        MilvusClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:19530/v2/vectordb".to_string(),
+            database: String::new(),
+            collection_presence: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn detects_collection_limit_message() {
@@ -612,5 +661,23 @@ mod tests {
     #[test]
     fn ignores_unrelated_messages() {
         assert!(!is_collection_limit_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn collection_presence_cache_tracks_updates() {
+        let client = test_client();
+        assert_eq!(client.cached_collection_presence("chunks").unwrap(), None);
+
+        client.set_collection_presence("chunks", true).unwrap();
+        assert_eq!(
+            client.cached_collection_presence("chunks").unwrap(),
+            Some(true)
+        );
+
+        client.set_collection_presence("chunks", false).unwrap();
+        assert_eq!(
+            client.cached_collection_presence("chunks").unwrap(),
+            Some(false)
+        );
     }
 }
