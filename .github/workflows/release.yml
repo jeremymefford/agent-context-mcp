@@ -81,16 +81,26 @@ jobs:
           git push origin "refs/tags/v${VERSION}"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
-          generate_release_notes: true
-          overwrite_files: true
-          files: |
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TAG="v${VERSION}"
+          FILES=(
             release-artifacts/agent-context-darwin-arm64.tar.gz
             release-artifacts/agent-context-darwin-arm64.tar.gz.sha256
             release-artifacts/homebrew/agent-context.rb
+          )
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes
+          fi
 
       - name: Update Homebrew tap
         env:
