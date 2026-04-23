@@ -68,6 +68,7 @@ jobs:
             --output release-artifacts/homebrew/agent-context.rb
 
       - name: Create tag
+        if: ${{ github.ref_type != 'tag' }}
         shell: bash
         run: |
           VERSION=${{ steps.version.outputs.version }}
