@@ -107,10 +107,6 @@ Manual fallbacks:
 agent-context serve --listen 127.0.0.1:8765
 ```
 
-```bash
-agent-context install-launchd
-```
-
 ## 7. Connect your MCP client
 
 Examples:

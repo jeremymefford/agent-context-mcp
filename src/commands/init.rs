@@ -78,7 +78,7 @@ pub async fn run(
         render_config_flag(&config_path)
     );
     println!(
-        "4. Run `agent-context serve --listen 127.0.0.1:8765{}`",
+        "4. Preferred: `brew services start agent-context`; fallback: `agent-context serve --listen 127.0.0.1:8765{}`",
         render_config_flag(&config_path)
     );
     Ok(())

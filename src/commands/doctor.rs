@@ -1,4 +1,4 @@
-use crate::commands::support::{self, DEFAULT_LAUNCHD_LABEL, DEFAULT_LISTEN};
+use crate::commands::support::DEFAULT_LISTEN;
 use crate::config::Config;
 use crate::engine::Engine;
 use anyhow::{Context, Result, bail};
@@ -7,13 +7,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-pub async fn run(config: &Config, label: Option<&str>, listen: Option<&str>) -> Result<()> {
+pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
     let mut failures = 0usize;
     let listen = listen.unwrap_or(DEFAULT_LISTEN);
-    let label = label
-        .map(ToOwned::to_owned)
-        .or_else(find_installed_label)
-        .unwrap_or_else(|| DEFAULT_LAUNCHD_LABEL.to_string());
 
     print_check("config", true, config.config_path.display().to_string());
 
@@ -117,20 +113,30 @@ pub async fn run(config: &Config, label: Option<&str>, listen: Option<&str>) -> 
         }
     }
 
-    let launchd_state = launchd_state(&label)?;
-    match launchd_state {
-        Some("running") => print_check("launchd", true, label.clone()),
-        Some("installed") => print_check("launchd", true, format!("{label} (installed)")),
-        _ => print_warning(
-            "launchd",
+    match homebrew_service_status()? {
+        Some(status) if status.status == "started" => print_check(
+            "brew service",
+            true,
+            format!("{} ({})", status.name, status.status),
+        ),
+        Some(status) if status.status == "none" => print_warning(
+            "brew service",
             format!(
-                "{} is not installed; run `agent-context install-launchd`",
-                label
+                "{} is not running; start it with `brew services start agent-context`",
+                status.name
             ),
+        ),
+        Some(status) => print_warning(
+            "brew service",
+            format!("{} status={} file={}", status.name, status.status, status.file),
+        ),
+        None => print_warning(
+            "brew service",
+            "agent-context is not registered with Homebrew services".to_string(),
         ),
     }
 
-    if launchd_state.is_some() {
+    if matches!(homebrew_service_status()?, Some(status) if status.status == "started") {
         match health_endpoint(listen).await {
             Ok(()) => print_check("health endpoint", true, format!("http://{listen}/health")),
             Err(error) => {
@@ -148,30 +154,24 @@ pub async fn run(config: &Config, label: Option<&str>, listen: Option<&str>) -> 
     Ok(())
 }
 
-fn find_installed_label() -> Option<String> {
-    for label in support::existing_launchd_labels() {
-        if launchd_state(label).ok().flatten().is_some() {
-            return Some(label.to_string());
-        }
-    }
-    None
+#[derive(serde::Deserialize)]
+struct BrewServiceEntry {
+    name: String,
+    status: String,
+    file: String,
 }
 
-fn launchd_state(label: &str) -> Result<Option<&'static str>> {
-    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, label);
-    let output = Command::new("launchctl")
-        .args(["print", &target])
+fn homebrew_service_status() -> Result<Option<BrewServiceEntry>> {
+    let output = Command::new("brew")
+        .args(["services", "list", "--json"])
         .output()
-        .context("running launchctl print")?;
-    if output.status.success() {
-        return Ok(Some("running"));
+        .context("running `brew services list --json`")?;
+    if !output.status.success() {
+        bail!("`brew services list --json` failed");
     }
-
-    let plist_path = support::default_plist_path(label)?;
-    if plist_path.exists() {
-        return Ok(Some("installed"));
-    }
-    Ok(None)
+    let services: Vec<BrewServiceEntry> =
+        serde_json::from_slice(&output.stdout).context("parsing brew services JSON")?;
+    Ok(services.into_iter().find(|entry| entry.name == "agent-context"))
 }
 
 async fn health_endpoint(listen: &str) -> Result<()> {

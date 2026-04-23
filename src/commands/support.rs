@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_LAUNCHD_LABEL: &str = "dev.agent-context.mcp";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
 const HOOK_START: &str = "# >>> agent-context managed block >>>";
 const HOOK_END: &str = "# <<< agent-context managed block <<<";
@@ -12,24 +11,8 @@ pub fn library_dir() -> Result<PathBuf> {
     Ok(home.join("Library"))
 }
 
-pub fn launch_agents_dir() -> Result<PathBuf> {
-    Ok(library_dir()?.join("LaunchAgents"))
-}
-
 pub fn logs_dir() -> Result<PathBuf> {
     Ok(library_dir()?.join("Logs"))
-}
-
-pub fn default_plist_path(label: &str) -> Result<PathBuf> {
-    Ok(launch_agents_dir()?.join(format!("{label}.plist")))
-}
-
-pub fn stdout_log_path() -> Result<PathBuf> {
-    Ok(logs_dir()?.join("agent-context-mcp.log"))
-}
-
-pub fn stderr_log_path() -> Result<PathBuf> {
-    Ok(logs_dir()?.join("agent-context-mcp.err.log"))
 }
 
 pub fn hooks_log_path() -> Result<PathBuf> {
@@ -93,67 +76,6 @@ pub fn install_managed_hook(repo: &Path) -> Result<PathBuf> {
     Ok(hook_path)
 }
 
-pub fn plist_contents(
-    label: &str,
-    executable: &Path,
-    workdir: &Path,
-    listen: &str,
-    config_path: Option<&Path>,
-) -> Result<String> {
-    let stdout = stdout_log_path()?;
-    let stderr = stderr_log_path()?;
-    let mut args = vec![format!(
-        "<string>{}</string>",
-        xml_escape(&executable.display().to_string())
-    )];
-    if let Some(path) = config_path {
-        args.push("<string>--config</string>".to_string());
-        args.push(format!(
-            "<string>{}</string>",
-            xml_escape(&path.display().to_string())
-        ));
-    }
-    args.extend([
-        "<string>serve</string>".to_string(),
-        "<string>--listen</string>".to_string(),
-        format!("<string>{}</string>", xml_escape(listen)),
-    ]);
-
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    {}
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>WorkingDirectory</key>
-  <string>{}</string>
-  <key>StandardOutPath</key>
-  <string>{}</string>
-  <key>StandardErrorPath</key>
-  <string>{}</string>
-</dict>
-</plist>
-"#,
-        args.join("\n    "),
-        xml_escape(&workdir.display().to_string()),
-        xml_escape(&stdout.display().to_string()),
-        xml_escape(&stderr.display().to_string()),
-    ))
-}
-
-pub fn existing_launchd_labels() -> Vec<&'static str> {
-    vec![DEFAULT_LAUNCHD_LABEL, "com.jeremy.agent-context-mcp"]
-}
-
 fn replace_managed_block(existing: &str, block: &str) -> String {
     if let Some(start) = existing.find(HOOK_START)
         && let Some(end) = existing.find(HOOK_END)
@@ -193,13 +115,6 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 fn dirs_home() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home))
@@ -207,7 +122,7 @@ fn dirs_home() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{plist_contents, render_hook_block, replace_managed_block};
+    use super::{render_hook_block, replace_managed_block};
     use std::path::Path;
 
     #[test]
@@ -226,20 +141,5 @@ mod tests {
         );
         assert!(updated.contains("new"));
         assert!(!updated.contains("\nold\n"));
-    }
-
-    #[test]
-    fn plist_generation_includes_serve_arguments() {
-        let plist = plist_contents(
-            "dev.agent-context.mcp",
-            Path::new("/tmp/agent-context"),
-            Path::new("/tmp"),
-            "127.0.0.1:8765",
-            Some(Path::new("/tmp/config.toml")),
-        )
-        .unwrap();
-        assert!(plist.contains("serve"));
-        assert!(plist.contains("--listen"));
-        assert!(plist.contains("/tmp/config.toml"));
     }
 }

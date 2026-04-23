@@ -32,21 +32,20 @@ Recovery:
 agent-context reindex-all
 ```
 
-## Launchd service is installed but health is down
+## Homebrew service is installed but health is down
 
 Check:
 
 ```bash
-launchctl print gui/$(id -u)/dev.agent-context.mcp
-tail -n 200 ~/Library/Logs/agent-context-mcp.log
-tail -n 200 ~/Library/Logs/agent-context-mcp.err.log
+brew services list | grep agent-context
+tail -n 200 /opt/homebrew/var/log/agent-context.log
+tail -n 200 /opt/homebrew/var/log/agent-context.err.log
 ```
 
-Reinstall:
+Restart:
 
 ```bash
-agent-context uninstall-launchd
-agent-context install-launchd
+brew services restart agent-context
 ```
 
 ## Hooks are not refreshing on commit

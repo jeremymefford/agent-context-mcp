@@ -12,7 +12,14 @@ class AgentContext < Formula
   end
 
   service do
-    run [opt_bin/"agent-context", "serve", "--listen", "127.0.0.1:8765"]
+    run [
+      opt_bin/"agent-context",
+      "--config",
+      File.join(Dir.home, "Library", "Application Support", "agent-context", "config.toml"),
+      "serve",
+      "--listen",
+      "127.0.0.1:8765",
+    ]
     keep_alive true
     working_dir var
     log_path var/"log/agent-context.log"
@@ -24,7 +31,7 @@ class AgentContext < Formula
       agent-context expects:
 
         1. a running Milvus instance
-        2. a config file, usually created with `agent-context init`
+        2. a config file at ~/Library/Application Support/agent-context/config.toml
         3. an embedding provider configured via env vars or Ollama
 
       Preferred local setup:

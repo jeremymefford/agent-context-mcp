@@ -239,9 +239,8 @@ impl Config {
 
         let default_path = expand_path(DEFAULT_CONFIG_PATH)?;
         bail!(
-            "no agent-context config found at {} or {}; run `agent-context init` to create one",
-            default_path.display(),
-            expand_path(LEGACY_CONFIG_PATH)?.display()
+            "no agent-context config found at {}; run `agent-context init` to create one",
+            default_path.display()
         );
     }
 

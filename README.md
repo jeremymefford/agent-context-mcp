@@ -50,7 +50,6 @@ Required inputs the agent should confirm or infer before running commands:
   - `VOYAGE_API_KEY`
   - `OPENAI_API_KEY`
   - or a running Ollama server
-- whether the user wants a foreground MCP server or a launchd-managed service
 
 The recommended install order is:
 
@@ -140,8 +139,6 @@ An agent should verify each step before moving on.
 
    ```bash
    agent-context serve --listen 127.0.0.1:8765
-   # or
-   agent-context install-launchd
    ```
 
 7. Connect an MCP client.
@@ -193,8 +190,6 @@ Setup and repair:
 - `agent-context init`
 - `agent-context doctor`
 - `agent-context install-hook <repo>`
-- `agent-context install-launchd`
-- `agent-context uninstall-launchd`
 - `agent-context print-mcp-config --client codex|claude|copilot`
 
 Indexing and serving:

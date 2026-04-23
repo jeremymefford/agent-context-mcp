@@ -41,31 +41,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Validate config, credentials, backend reachability, and launchd state
+    /// Validate config, credentials, backend reachability, and service state
     Doctor {
-        /// launchd label to inspect
-        #[arg(long)]
-        label: Option<String>,
         /// Health endpoint bind address to probe
         #[arg(long)]
         listen: Option<String>,
     },
     /// Install the managed post-commit hook into one git repo
     InstallHook { repo: PathBuf },
-    /// Install or refresh the macOS launchd service for the MCP server
-    InstallLaunchd {
-        #[arg(long)]
-        label: Option<String>,
-        #[arg(long, default_value = "127.0.0.1:8765")]
-        listen: String,
-        #[arg(long)]
-        workdir: Option<PathBuf>,
-    },
-    /// Remove the macOS launchd service for the MCP server
-    UninstallLaunchd {
-        #[arg(long)]
-        label: Option<String>,
-    },
     /// Print client-ready MCP config for a supported editor or agent
     PrintMcpConfig {
         #[arg(long)]
@@ -124,27 +107,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Doctor { label, listen } => {
+        Command::Doctor { listen } => {
             let cfg = load_config(cli.config.as_deref())?;
-            commands::doctor::run(&cfg, label.as_deref(), listen.as_deref()).await
+            commands::doctor::run(&cfg, listen.as_deref()).await
         }
         Command::InstallHook { repo } => commands::install_hook::run(&repo).await,
-        Command::InstallLaunchd {
-            label,
-            listen,
-            workdir,
-        } => {
-            commands::install_launchd::run(
-                label.as_deref(),
-                &listen,
-                workdir.as_deref(),
-                cli.config.as_deref(),
-            )
-            .await
-        }
-        Command::UninstallLaunchd { label } => {
-            commands::uninstall_launchd::run(label.as_deref()).await
-        }
         Command::PrintMcpConfig { client, url } => {
             commands::print_mcp_config::run(&client, &url).await
         }

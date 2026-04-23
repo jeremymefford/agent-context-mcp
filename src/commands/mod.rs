@@ -1,7 +1,6 @@
 pub mod doctor;
 pub mod init;
 pub mod install_hook;
-pub mod install_launchd;
 pub mod list_tools;
 pub mod print_mcp_config;
 pub mod refresh_all;
@@ -10,4 +9,3 @@ pub mod reindex_all;
 pub mod search;
 pub mod serve;
 pub mod support;
-pub mod uninstall_launchd;
