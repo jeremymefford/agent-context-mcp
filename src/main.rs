@@ -82,6 +82,9 @@ enum Command {
         /// Bind address for the local MCP endpoint
         #[arg(long, default_value = "127.0.0.1:8765")]
         listen: String,
+        /// Allow binding the unauthenticated HTTP MCP server to a non-loopback address
+        #[arg(long, default_value_t = false)]
+        allow_remote_unauthenticated: bool,
     },
 }
 
@@ -132,9 +135,12 @@ async fn main() -> Result<()> {
             commands::search::run(&cfg, &path, &query, limit).await
         }
         Command::ListTools => commands::list_tools::run().await,
-        Command::Serve { listen } => {
+        Command::Serve {
+            listen,
+            allow_remote_unauthenticated,
+        } => {
             let cfg = load_config(cli.config.as_deref())?;
-            commands::serve::run(&cfg, &listen).await
+            commands::serve::run(&cfg, &listen, allow_remote_unauthenticated).await
         }
     }
 }

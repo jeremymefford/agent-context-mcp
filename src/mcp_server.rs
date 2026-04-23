@@ -5,7 +5,7 @@ use crate::engine::{
     render_outline_text, render_search_explanation_text, render_search_text, render_status_text,
     render_symbol_search_text,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{Router, routing::get};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -146,7 +147,12 @@ struct ListScopesResult {
     groups: Vec<ScopeSummary>,
 }
 
-pub async fn serve(config: &Config, listen: &str) -> Result<()> {
+pub async fn serve(
+    config: &Config,
+    listen: &str,
+    allow_remote_unauthenticated: bool,
+) -> Result<()> {
+    enforce_loopback_bind(listen, allow_remote_unauthenticated)?;
     let engine = Engine::new(config).await?;
     engine
         .mark_interrupted_indexing_failed("agent-context restarted while indexing was in progress")
@@ -202,25 +208,25 @@ pub async fn serve(config: &Config, listen: &str) -> Result<()> {
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Rust-native agent-context MCP server. One HTTP MCP server talks directly to the configured embedding provider and Milvus, supports named repo groups, and avoids spawned Node MCP workers. Preferred routing for agents: call `list_scopes` before guessing configured group ids; use `search_symbols` first for exact symbol and definition lookup by name; use `get_file_outline` after a symbol or file is known and you need indexed structure; use `search_code` for broader semantic or hybrid discovery when you do not already know the exact definition name; use `explain_search` when you need to understand how `search_code` will classify and weight a query. `scope` accepts a configured group id; `path` accepts an absolute repo path as a compatibility alias; if both are omitted, the configured default group is used.";
+const SERVER_INSTRUCTIONS: &str = "Rust-native agent-context MCP server. One HTTP MCP server talks directly to the configured embedding provider and Milvus, supports named repo groups, and avoids spawned Node MCP workers. Preferred routing for agents: call `list_scopes` before guessing configured group ids; use `search_symbols` first for exact symbol and definition lookup by name; use `get_file_outline` after a symbol or file is known and you need indexed structure; use `search_code` for broader semantic or hybrid discovery when you do not already know the exact definition name; use `explain_search` when you need to understand how `search_code` will classify and weight a query. `scope` accepts a configured group id; `path` accepts a configured absolute repo root as a compatibility alias; if both are omitted, the configured default group is used.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
         build_tool(
             "index_codebase",
-            "Start background indexing for one repo or every repo in a configured group. If neither `scope` nor `path` is provided, the configured default group is indexed.",
+            "Start background indexing for one configured repo or every repo in a configured group. If neither `scope` nor `path` is provided, the configured default group is indexed.",
             false,
             index_codebase_schema(),
         ),
         build_tool(
             "search_code",
-            "Search indexed code in one repo or across a configured group using query-planned dense, lexical, and symbol-aware ranking. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured group ids and absolute repo paths; if omitted, the configured default group is searched.",
+            "Search indexed code in one configured repo or across a configured group using query-planned dense, lexical, and symbol-aware ranking. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured group ids and configured absolute repo roots; if omitted, the configured default group is searched.",
             true,
             search_code_schema(),
         ),
         build_tool(
             "search_symbols",
-            "Preferred tool for exact symbol and definition lookup by name across one repo or a configured group. Use this before `search_code` when the user asks for a function, class, struct, trait, module, method, or other named definition. Prefer `scope` for configured groups and absolute repo paths; if omitted, the configured default group is searched.",
+            "Preferred tool for exact symbol and definition lookup by name across one configured repo or a configured group. Use this before `search_code` when the user asks for a function, class, struct, trait, module, method, or other named definition. Prefer `scope` for configured groups and configured absolute repo roots; if omitted, the configured default group is searched.",
             true,
             search_symbols_schema(),
         ),
@@ -241,7 +247,7 @@ pub fn tool_list() -> Vec<Tool> {
             "Drop the Rust-managed index for one repo or every repo in a configured group. If neither `scope` nor `path` is provided, the configured default group is cleared.",
             false,
             scope_args_schema(
-                "Optional configured group id or absolute repo path. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
+                "Optional configured group id or configured absolute repo root. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
             ),
         ),
         build_tool(
@@ -249,7 +255,7 @@ pub fn tool_list() -> Vec<Tool> {
             "Report indexing status, counts, and progress for one repo or a configured group. If neither `scope` nor `path` is provided, the configured default group is used.",
             true,
             scope_args_schema(
-                "Optional configured group id or absolute repo path. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
+                "Optional configured group id or configured absolute repo root. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
             ),
         ),
         build_tool(
@@ -263,6 +269,28 @@ pub fn tool_list() -> Vec<Tool> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+fn enforce_loopback_bind(listen: &str, allow_remote_unauthenticated: bool) -> Result<()> {
+    if allow_remote_unauthenticated || listen_is_loopback(listen) {
+        return Ok(());
+    }
+
+    bail!(
+        "refusing to bind unauthenticated HTTP MCP server to non-loopback address `{listen}`; use --allow-remote-unauthenticated to override"
+    );
+}
+
+fn listen_is_loopback(listen: &str) -> bool {
+    if let Ok(addr) = listen.parse::<SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+
+    if let Some(rest) = listen.strip_prefix("localhost:") {
+        return !rest.is_empty();
+    }
+
+    false
 }
 
 async fn wait_for_signal() {
@@ -323,7 +351,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
                         .start_background_indexing(
@@ -345,7 +373,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let extension_filter = normalize_extension_filter(&args.extension_filter)
                         .map_err(invalid_params)?;
@@ -377,7 +405,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
                         .engine
@@ -404,7 +432,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
                         .engine
@@ -421,7 +449,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let extension_filter = normalize_extension_filter(&args.extension_filter)
                         .map_err(invalid_params)?;
@@ -453,7 +481,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
                         .engine
@@ -470,7 +498,7 @@ impl ServerHandler for NativeServer {
                     let scope = self
                         .engine
                         .config()
-                        .resolve_scope(args.scope.as_deref(), args.path.as_deref())
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
                         .engine
@@ -773,10 +801,10 @@ fn index_codebase_schema() -> Map<String, Value> {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "IndexCodebaseArgs",
         "type": "object",
-        "description": "Start background indexing. Prefer `scope` for configured groups and absolute repo paths. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is indexed.",
+        "description": "Start background indexing. Prefer `scope` for configured groups and configured absolute repo roots. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is indexed.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or absolute repo path. Preferred over `path`. If omitted together with `path`, the configured default group is indexed."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts an absolute repo path or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is indexed."),
+            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
             "force": {
                 "type": "boolean",
                 "default": false,
@@ -816,10 +844,10 @@ fn search_code_schema() -> Map<String, Value> {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SearchCodeArgs",
         "type": "object",
-        "description": "Search indexed code using dense semantic search, a local lexical index, and symbol-aware boosts. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured groups and absolute repo paths. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is searched.",
+        "description": "Search indexed code using dense semantic search, a local lexical index, and symbol-aware boosts. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured groups and configured absolute repo roots. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is searched.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or absolute repo path. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts an absolute repo path or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
+            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
             "query": {
                 "type": "string",
                 "description": "Natural-language, identifier-like, or path/module-like query to search for. Prefer `search_symbols` instead when the intent is exact symbol or definition lookup by name."
@@ -869,8 +897,8 @@ fn search_symbols_schema() -> Map<String, Value> {
         "type": "object",
         "description": "Preferred tool for exact symbol and definition lookup by name. Search indexed definitions using the local symbol index before falling back to broader `search_code` queries.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or absolute repo path. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts an absolute repo path or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
+            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
             "query": {
                 "type": "string",
                 "description": "Exact or near-exact definition name, container, or path-oriented symbol query. Use this when the user asks for a function, class, struct, trait, module, method, or named definition."
@@ -902,8 +930,8 @@ fn get_file_outline_schema() -> Map<String, Value> {
         "type": "object",
         "description": "Return the indexed symbol outline for one repo-relative file. Use this after `search_symbols` or `search_code` when you already know the file and want indexed structure. If the requested group contains multiple repos with the same file path, each matching outline is returned.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or absolute repo path. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts an absolute repo path or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
+            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
             "file": {
                 "type": "string",
                 "description": "Repo-relative file path, such as `src/lib.rs` or `server/crates/api/src/schema.rs`."
@@ -923,7 +951,7 @@ fn scope_args_schema(scope_description: &str) -> Map<String, Value> {
         "type": "object",
         "properties": {
             "scope": nullable_string_schema(scope_description),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts an absolute repo path or configured group id. Prefer `scope` in new clients.")
+            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients.")
         }
     })
     .as_object()
@@ -947,9 +975,9 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_INSTRUCTIONS, SearchMode, default_limit, list_scopes_schema,
-        normalize_extension_filter, parse_search_mode, parse_splitter_kind, search_symbols_schema,
-        tool_list,
+        SERVER_INSTRUCTIONS, SearchMode, default_limit, enforce_loopback_bind, list_scopes_schema,
+        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
+        search_symbols_schema, tool_list,
     };
     use crate::engine::splitter::SplitterKind;
     use serde_json::Value;
@@ -957,6 +985,25 @@ mod tests {
     #[test]
     fn search_limit_default_matches_node_contract() {
         assert_eq!(default_limit(), 10);
+    }
+
+    #[test]
+    fn loopback_listeners_are_allowed_by_default() {
+        assert!(listen_is_loopback("127.0.0.1:8765"));
+        assert!(listen_is_loopback("[::1]:8765"));
+        assert!(listen_is_loopback("localhost:8765"));
+        assert!(enforce_loopback_bind("127.0.0.1:8765", false).is_ok());
+    }
+
+    #[test]
+    fn remote_listener_requires_explicit_override() {
+        let error = enforce_loopback_bind("0.0.0.0:8765", false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to bind unauthenticated")
+        );
+        assert!(enforce_loopback_bind("0.0.0.0:8765", true).is_ok());
     }
 
     #[test]

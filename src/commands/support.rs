@@ -41,11 +41,15 @@ pub fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
 
 pub fn render_hook_block(repo: &Path) -> Result<String> {
     let hooks_log = hooks_log_path()?;
+    let repo_shell = shell_single_quote(&repo.display().to_string());
+    let hooks_log_shell = shell_single_quote(&hooks_log.display().to_string());
     Ok(format!(
-        "{HOOK_START}\nAGENT_CONTEXT_BIN=\"${{AGENT_CONTEXT_BIN:-$(command -v agent-context 2>/dev/null || printf '%s' \"$HOME/.cargo/bin/agent-context\")}}\"\nif [ -x \"$AGENT_CONTEXT_BIN\" ]; then\n  nohup \"$AGENT_CONTEXT_BIN\" refresh-one \"{}\" >> \"{}\" 2>&1 &\nfi\n{HOOK_END}",
-        repo.display(),
-        hooks_log.display()
+        "{HOOK_START}\nAGENT_CONTEXT_BIN=\"${{AGENT_CONTEXT_BIN:-$(command -v agent-context 2>/dev/null || printf '%s' \"$HOME/.cargo/bin/agent-context\")}}\"\nif [ -x \"$AGENT_CONTEXT_BIN\" ]; then\n  nohup \"$AGENT_CONTEXT_BIN\" refresh-one {repo_shell} >> {hooks_log_shell} 2>&1 &\nfi\n{HOOK_END}"
     ))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub fn install_managed_hook(repo: &Path) -> Result<PathBuf> {
@@ -129,7 +133,7 @@ mod tests {
     fn hook_block_targets_repo_refresh() {
         let block = render_hook_block(Path::new("/tmp/repo")).unwrap();
         assert!(block.contains("refresh-one"));
-        assert!(block.contains("/tmp/repo"));
+        assert!(block.contains("refresh-one '/tmp/repo'"));
     }
 
     #[test]
@@ -141,5 +145,11 @@ mod tests {
         );
         assert!(updated.contains("new"));
         assert!(!updated.contains("\nold\n"));
+    }
+
+    #[test]
+    fn hook_block_shell_escapes_repo_path() {
+        let block = render_hook_block(Path::new("/tmp/repo'$(whoami)")).unwrap();
+        assert!(block.contains("refresh-one '/tmp/repo'\"'\"'$(whoami)'"));
     }
 }

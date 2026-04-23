@@ -423,9 +423,31 @@ impl Config {
         scope: Option<&str>,
         path_alias: Option<&str>,
     ) -> Result<ResolvedScope> {
+        self.resolve_scope_inner(scope, path_alias, false)
+    }
+
+    pub fn resolve_mcp_scope(
+        &self,
+        scope: Option<&str>,
+        path_alias: Option<&str>,
+    ) -> Result<ResolvedScope> {
+        self.resolve_scope_inner(scope, path_alias, true)
+    }
+
+    fn resolve_scope_inner(
+        &self,
+        scope: Option<&str>,
+        path_alias: Option<&str>,
+        require_configured_repo: bool,
+    ) -> Result<ResolvedScope> {
         let raw = scope.or(path_alias).unwrap_or(&self.default_group);
         if raw.starts_with('/') || raw.starts_with('~') {
             let repo = normalize_absolute_path(raw)?;
+            if require_configured_repo && !self.is_configured_repo(&repo)? {
+                bail!(
+                    "repo scope `{raw}` is not configured; MCP only allows configured repo roots or group ids"
+                );
+            }
             return Ok(ResolvedScope {
                 kind: ScopeKind::Repo,
                 id: repo.display().to_string(),
@@ -459,6 +481,13 @@ impl Config {
                 .map(|repo| normalize_path(repo))
                 .collect::<Result<Vec<_>>>()?,
         })
+    }
+
+    fn is_configured_repo(&self, repo: &Path) -> Result<bool> {
+        Ok(self
+            .all_repos()?
+            .iter()
+            .any(|configured| configured == repo))
     }
 }
 
@@ -515,6 +544,7 @@ impl EmbeddingConfig {
         }
 
         if let Some(path) = key_file {
+            validate_secret_file(path, provider_name)?;
             let key = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {provider_name} key at {}", path.display()))?;
             let key = key.trim().to_string();
@@ -750,6 +780,52 @@ fn normalize_absolute_path(path: &str) -> Result<PathBuf> {
         );
     }
     Ok(clean_path(input))
+}
+
+fn validate_secret_file(path: &Path, provider_name: &str) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading {provider_name} key metadata at {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "{provider_name} key file is not a regular file: {}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let symlink_metadata = std::fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "reading {provider_name} key file metadata at {}",
+                path.display()
+            )
+        })?;
+        if symlink_metadata.file_type().is_symlink() {
+            bail!(
+                "{provider_name} key file must not be a symlink: {}",
+                path.display()
+            );
+        }
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{provider_name} key file permissions are too open at {}; expected 600 or stricter",
+                path.display()
+            );
+        }
+
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "{provider_name} key file must be owned by the current user: {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn looks_like_relative_repo_path(raw: &str) -> bool {
@@ -1083,5 +1159,74 @@ mod tests {
             path.to_string()
                 .contains("must be absolute or start with `~`")
         );
+    }
+
+    #[test]
+    fn mcp_scope_rejects_unconfigured_absolute_repo_paths() {
+        let dir = temp_dir("mcp-repo-scope");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/configured-repo"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        let error = config
+            .resolve_mcp_scope(None, Some("/tmp/unconfigured-repo"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("is not configured"));
+        assert!(
+            config
+                .resolve_mcp_scope(None, Some("/tmp/configured-repo"))
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openai_key_file_rejects_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("openai-key-perms");
+        let key_path = dir.join("openai_key");
+        fs::write(&key_path, "secret").unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config_path = write_config(
+            &dir,
+            &format!(
+                r#"
+                [embedding]
+                provider = "openai"
+
+                [embedding.openai]
+                api_key_env = "THIS_ENV_SHOULD_NOT_EXIST_AGENT_CONTEXT"
+                key_file = "{}"
+                base_url = "https://api.openai.com/v1"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+                key_path.display()
+            ),
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        let error = config.embedding.api_key().unwrap_err();
+        assert!(error.to_string().contains("permissions are too open"));
     }
 }
