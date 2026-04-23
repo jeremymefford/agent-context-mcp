@@ -250,6 +250,7 @@ pub struct SearchRequest {
     pub language: Option<String>,
     pub file: Option<String>,
     pub dedupe_by_file: bool,
+    pub snippet_chars: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1117,7 +1118,9 @@ impl Engine {
                 .copied()
                 .unwrap_or(*repo_stale);
             let snippet_key = format!("{}:{}", hit.repo, hit.relative_path);
-            let content = if let Some(snippet) = snippet_cache.get(&snippet_key) {
+            let content = if request.snippet_chars == 0 {
+                String::new()
+            } else if let Some(snippet) = snippet_cache.get(&snippet_key) {
                 snippet.clone()
             } else {
                 let snippet = self
@@ -1126,6 +1129,7 @@ impl Engine {
                         hit,
                         &request.query,
                         plan.snippet_neighbor_chunks,
+                        request.snippet_chars,
                     )
                     .await;
                 snippet_cache.insert(snippet_key, snippet.clone());
@@ -1158,12 +1162,17 @@ impl Engine {
         hit: &RepoSearchHit,
         query: &str,
         neighbor_chunks: usize,
+        max_chars: usize,
     ) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
         let repo_path = repo.to_path_buf();
         let relative_path = hit.relative_path.clone();
         let target_line = hit.start_line;
-        let fallback = build_snippet(query, &hit.content, 900);
+        let fallback = build_snippet(query, &hit.content, max_chars);
         let local_index = self.inner.local_index.clone();
+        let context_chars = max_chars.saturating_mul(2).clamp(max_chars, 1200);
         let context = self
             .run_search_lexical_blocking("search_hit_context", move || {
                 let chunks = local_index.chunks_for_file(&repo_path, &relative_path)?;
@@ -1171,13 +1180,13 @@ impl Engine {
                     &chunks,
                     target_line,
                     neighbor_chunks,
-                    1400,
+                    context_chars,
                 ))
             })
             .await;
 
         match context {
-            Ok(Some(context)) => build_snippet(query, &context, 1200),
+            Ok(Some(context)) => build_snippet(query, &context, max_chars),
             _ => fallback,
         }
     }
@@ -2455,54 +2464,6 @@ pub fn render_search_text(result: &SearchResponse) -> String {
     lines.join("\n")
 }
 
-pub fn render_symbol_search_text(result: &SymbolSearchResponse) -> String {
-    let mut lines = vec![format!(
-        "Scope: {} partial={}",
-        result.label, result.partial
-    )];
-    if result.hits.is_empty() {
-        lines.push("No symbols.".to_string());
-    }
-    for (index, hit) in result.hits.iter().enumerate() {
-        lines.push(format!(
-            "{}. {} :: {}:{}-{} {} {} score={:.6} lexical={} semantic={} stale={}",
-            index + 1,
-            hit.repo_label,
-            hit.relative_path,
-            hit.start_line,
-            hit.end_line,
-            hit.kind,
-            hit.name,
-            hit.score,
-            hit.lexical_score.unwrap_or(0.0),
-            hit.semantic_score.unwrap_or(0.0),
-            hit.stale
-        ));
-    }
-    for error in &result.repo_errors {
-        lines.push(format!("ERR {}: {}", error.repo, error.error));
-    }
-    lines.join("\n")
-}
-
-pub fn render_outline_text(result: &FileOutlineResponse) -> String {
-    let mut lines = vec![format!("Scope: {} file={}", result.label, result.file)];
-    if result.matches.is_empty() {
-        lines.push("No indexed outline.".to_string());
-        return lines.join("\n");
-    }
-    for entry in &result.matches {
-        lines.push(format!(
-            "{} :: {} stale={} symbols={}",
-            entry.repo_label,
-            entry.relative_path,
-            entry.stale,
-            count_outline_nodes(&entry.symbols)
-        ));
-    }
-    lines.join("\n")
-}
-
 pub fn render_search_explanation_text(result: &SearchExplanation) -> String {
     format!(
         "Scope: {}\nquery={}\nrequested={} effective={} kind={} denseWeight={:.2} lexicalWeight={:.2} symbolWeight={:.2} symbolLexicalShare={:.2} symbolSemanticShare={:.2} dedupeByFile={}",
@@ -3250,13 +3211,6 @@ fn index_identity_status_for_snapshot(
     }
 }
 
-fn count_outline_nodes(nodes: &[OutlineNode]) -> usize {
-    nodes
-        .iter()
-        .map(|node| 1 + count_outline_nodes(&node.children))
-        .sum()
-}
-
 fn truncate_for_display(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -3739,6 +3693,7 @@ mod tests {
             language: None,
             file: None,
             dedupe_by_file: true,
+            snippet_chars: 360,
         });
         let constrained = plan_search(&SearchRequest {
             query: "where is the resolver".to_string(),
@@ -3749,6 +3704,7 @@ mod tests {
             language: None,
             file: Some("server/crates/api/src/schema.rs".to_string()),
             dedupe_by_file: true,
+            snippet_chars: 360,
         });
 
         assert!(constrained.lexical_weight > unconstrained.lexical_weight);

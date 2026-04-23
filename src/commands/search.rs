@@ -19,6 +19,7 @@ pub async fn run(config: &Config, path: &str, query: &str, limit: usize) -> Resu
                 language: None,
                 file: None,
                 dedupe_by_file: true,
+                snippet_chars: 800,
             },
         )
         .await?;

@@ -1,9 +1,10 @@
 use crate::config::{Config, ResolvedScope};
 use crate::engine::splitter::SplitterKind;
+use crate::engine::symbols::OutlineNode;
 use crate::engine::{
-    Engine, SearchMode, SearchRequest, SymbolSearchScopeRequest, render_clear_text,
-    render_outline_text, render_search_explanation_text, render_search_text, render_status_text,
-    render_symbol_search_text,
+    Engine, FileOutlineResponse, RepoSearchError, SearchMode, SearchPlanSummary, SearchRequest,
+    SearchResponse, SymbolSearchResponse, SymbolSearchScopeRequest, render_clear_text,
+    render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
 use axum::{Router, routing::get};
@@ -60,6 +61,12 @@ struct SearchCodeArgs {
     file: Option<String>,
     #[serde(default = "default_dedupe_by_file")]
     dedupe_by_file: bool,
+    #[serde(default)]
+    include_diagnostics: bool,
+    #[serde(default = "default_include_content")]
+    include_content: bool,
+    #[serde(default = "default_snippet_chars")]
+    snippet_chars: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -106,6 +113,8 @@ struct SearchSymbolsArgs {
     kind: Option<String>,
     #[serde(default)]
     container: Option<String>,
+    #[serde(default)]
+    include_diagnostics: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,6 +125,8 @@ struct FileOutlineArgs {
     #[serde(default)]
     path: Option<String>,
     file: String,
+    #[serde(default = "default_outline_depth")]
+    max_depth: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,14 +141,20 @@ struct IndexLaunchResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
-struct ListScopesArgs {}
+#[serde(rename_all = "camelCase")]
+struct ListScopesArgs {
+    #[serde(default)]
+    include_repos: bool,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScopeSummary {
     id: String,
     label: String,
-    repos: Vec<String>,
+    repo_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repos: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +162,88 @@ struct ScopeSummary {
 struct ListScopesResult {
     default_scope: String,
     groups: Vec<ScopeSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactSearchResponse {
+    scope: String,
+    label: String,
+    #[serde(skip_serializing_if = "is_false")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    repo_errors: Vec<RepoSearchError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<SearchPlanSummary>,
+    hits: Vec<CompactSearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactSearchHit {
+    repo_label: String,
+    relative_path: String,
+    start_line: u64,
+    end_line: u64,
+    language: String,
+    match_type: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    content: String,
+    #[serde(skip_serializing_if = "is_false")]
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dense_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactSymbolSearchResponse {
+    scope: String,
+    label: String,
+    #[serde(skip_serializing_if = "is_false")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    repo_errors: Vec<RepoSearchError>,
+    hits: Vec<CompactSymbolHit>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactSymbolHit {
+    symbol_id: String,
+    repo_label: String,
+    relative_path: String,
+    name: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<String>,
+    start_line: u64,
+    end_line: u64,
+    language: String,
+    #[serde(skip_serializing_if = "is_false")]
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_hash: Option<String>,
 }
 
 pub async fn serve(
@@ -208,59 +307,59 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Rust-native agent-context MCP server. One HTTP MCP server talks directly to the configured embedding provider and Milvus, supports named repo groups, and avoids spawned Node MCP workers. Preferred routing for agents: call `list_scopes` before guessing configured group ids; use `search_symbols` first for exact symbol and definition lookup by name; use `get_file_outline` after a symbol or file is known and you need indexed structure; use `search_code` for broader semantic or hybrid discovery when you do not already know the exact definition name; use `explain_search` when you need to understand how `search_code` will classify and weight a query. `scope` accepts a configured group id; `path` accepts a configured absolute repo root as a compatibility alias; if both are omitted, the configured default group is used.";
+const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use get_file_outline when the file is known. Use search_code for broader code search. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
         build_tool(
             "index_codebase",
-            "Start background indexing for one configured repo or every repo in a configured group. If neither `scope` nor `path` is provided, the configured default group is indexed.",
+            "Start background indexing for a configured scope. Defaults to the configured default group.",
             false,
             index_codebase_schema(),
         ),
         build_tool(
             "search_code",
-            "Search indexed code in one configured repo or across a configured group using query-planned dense, lexical, and symbol-aware ranking. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured group ids and configured absolute repo roots; if omitted, the configured default group is searched.",
+            "Broader code search over a configured scope. Use search_symbols first for exact definitions.",
             true,
             search_code_schema(),
         ),
         build_tool(
             "search_symbols",
-            "Preferred tool for exact symbol and definition lookup by name across one configured repo or a configured group. Use this before `search_code` when the user asks for a function, class, struct, trait, module, method, or other named definition. Prefer `scope` for configured groups and configured absolute repo roots; if omitted, the configured default group is searched.",
+            "Preferred tool for exact symbol and definition lookup.",
             true,
             search_symbols_schema(),
         ),
         build_tool(
             "get_file_outline",
-            "Return the indexed symbol outline for one repo-relative file across one repo or a configured group. Use this after `search_symbols` or `search_code` when you already know the file and want indexed structure. If a group contains multiple repos with the same file path, all matching outlines are returned.",
+            "Return the indexed symbol outline for a known repo-relative file.",
             true,
             get_file_outline_schema(),
         ),
         build_tool(
             "explain_search",
-            "Explain how `search_code` will classify a query, which indexes it will use, and how it will weight dense, lexical, and symbol signals. Use this when tuning retrieval or when an agent is unsure whether `search_code` or `search_symbols` is the better fit.",
+            "Explain how search_code will classify and weight a query.",
             true,
-            search_code_schema(),
+            explain_search_schema(),
         ),
         build_tool(
             "clear_index",
-            "Drop the Rust-managed index for one repo or every repo in a configured group. If neither `scope` nor `path` is provided, the configured default group is cleared.",
+            "Drop the index for a configured scope.",
             false,
             scope_args_schema(
-                "Optional configured group id or configured absolute repo root. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
+                "Configured group id or repo root. Defaults to the configured default group.",
             ),
         ),
         build_tool(
             "get_indexing_status",
-            "Report indexing status, counts, and progress for one repo or a configured group. If neither `scope` nor `path` is provided, the configured default group is used.",
+            "Report indexing status for a configured scope.",
             true,
             scope_args_schema(
-                "Optional configured group id or configured absolute repo root. Prefer calling `list_scopes` first for configured groups. If omitted, the configured default group is used.",
+                "Configured group id or repo root. Defaults to the configured default group.",
             ),
         ),
         build_tool(
             "list_scopes",
-            "Preferred first call for unfamiliar agents. Lists configured group scopes and the default scope so searches and indexing can target the right workspace without guessing group ids.",
+            "Preferred first call. Lists configured scopes.",
             true,
             list_scopes_schema(),
         ),
@@ -391,13 +490,22 @@ impl ServerHandler for NativeServer {
                                 language: normalize_optional_language(&args.language),
                                 file: normalize_optional_path(&args.file),
                                 dedupe_by_file: args.dedupe_by_file,
+                                snippet_chars: if args.include_content {
+                                    args.snippet_chars.min(1200)
+                                } else {
+                                    0
+                                },
                             },
                         )
                         .await
                         .map_err(internal_error)?;
                     Ok(tool_success(
-                        render_search_text(&result),
-                        serde_json::to_value(result).ok(),
+                        render_search_summary_text(&result),
+                        serde_json::to_value(compact_search_response(
+                            &result,
+                            args.include_diagnostics,
+                        ))
+                        .ok(),
                     ))
                 }
                 "search_symbols" => {
@@ -423,8 +531,12 @@ impl ServerHandler for NativeServer {
                         .await
                         .map_err(internal_error)?;
                     Ok(tool_success(
-                        render_symbol_search_text(&result),
-                        serde_json::to_value(result).ok(),
+                        render_symbol_search_summary_text(&result),
+                        serde_json::to_value(compact_symbol_search_response(
+                            &result,
+                            args.include_diagnostics,
+                        ))
+                        .ok(),
                     ))
                 }
                 "get_file_outline" => {
@@ -439,8 +551,9 @@ impl ServerHandler for NativeServer {
                         .get_file_outline(scope, &args.file)
                         .await
                         .map_err(internal_error)?;
+                    let result = compact_outline_response(result, args.max_depth.clamp(1, 16));
                     Ok(tool_success(
-                        render_outline_text(&result),
+                        render_outline_summary_text(&result),
                         serde_json::to_value(result).ok(),
                     ))
                 }
@@ -467,6 +580,7 @@ impl ServerHandler for NativeServer {
                                 language: normalize_optional_language(&args.language),
                                 file: normalize_optional_path(&args.file),
                                 dedupe_by_file: args.dedupe_by_file,
+                                snippet_chars: 0,
                             },
                         )
                         .await
@@ -511,8 +625,8 @@ impl ServerHandler for NativeServer {
                     ))
                 }
                 "list_scopes" => {
-                    let _: ListScopesArgs = parse_args(args)?;
-                    let result = self.list_scopes();
+                    let args: ListScopesArgs = parse_args(args)?;
+                    let result = self.list_scopes(args.include_repos);
                     Ok(tool_success(
                         render_list_scopes_text(&result),
                         serde_json::to_value(result).ok(),
@@ -527,7 +641,7 @@ impl ServerHandler for NativeServer {
 }
 
 impl NativeServer {
-    fn list_scopes(&self) -> ListScopesResult {
+    fn list_scopes(&self, include_repos: bool) -> ListScopesResult {
         let config = self.engine.config();
         ListScopesResult {
             default_scope: config.default_group.clone(),
@@ -537,7 +651,8 @@ impl NativeServer {
                 .map(|group| ScopeSummary {
                     id: group.id.clone(),
                     label: group.label.clone().unwrap_or_else(|| group.id.clone()),
-                    repos: group.repos.clone(),
+                    repo_count: group.repos.len(),
+                    repos: include_repos.then(|| group.repos.clone()),
                 })
                 .collect(),
         }
@@ -695,12 +810,200 @@ fn render_list_scopes_text(result: &ListScopesResult) -> String {
     for group in &result.groups {
         lines.push(format!(
             "{} ({}) repos={}",
-            group.label,
-            group.id,
-            group.repos.len()
+            group.label, group.id, group.repo_count
         ));
     }
     lines.join("\n")
+}
+
+fn render_search_summary_text(result: &SearchResponse) -> String {
+    let mut lines = vec![format!(
+        "Scope: {} hits={} partial={}",
+        result.label,
+        result.hits.len(),
+        result.partial
+    )];
+    for (index, hit) in result.hits.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} :: {}:{}-{} {}",
+            index + 1,
+            hit.repo_label,
+            hit.relative_path,
+            hit.start_line,
+            hit.end_line,
+            hit.match_type
+        ));
+    }
+    for error in &result.repo_errors {
+        lines.push(format!("ERR {}: {}", error.repo, error.error));
+    }
+    lines.join("\n")
+}
+
+fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
+    let mut lines = vec![format!(
+        "Scope: {} symbols={} partial={}",
+        result.label,
+        result.hits.len(),
+        result.partial
+    )];
+    for (index, hit) in result.hits.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} :: {}:{}-{} {} {}",
+            index + 1,
+            hit.repo_label,
+            hit.relative_path,
+            hit.start_line,
+            hit.end_line,
+            hit.kind,
+            hit.name
+        ));
+    }
+    for error in &result.repo_errors {
+        lines.push(format!("ERR {}: {}", error.repo, error.error));
+    }
+    lines.join("\n")
+}
+
+fn render_outline_summary_text(result: &FileOutlineResponse) -> String {
+    let mut lines = vec![format!("Scope: {} file={}", result.label, result.file)];
+    if result.matches.is_empty() {
+        lines.push("No indexed outline.".to_string());
+        return lines.join("\n");
+    }
+    for entry in &result.matches {
+        lines.push(format!(
+            "{} :: {} symbols={}",
+            entry.repo_label,
+            entry.relative_path,
+            count_outline_nodes(&entry.symbols)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn compact_search_response(
+    result: &SearchResponse,
+    include_diagnostics: bool,
+) -> CompactSearchResponse {
+    CompactSearchResponse {
+        scope: result.scope.clone(),
+        label: result.label.clone(),
+        partial: result.partial,
+        repo_errors: result.repo_errors.clone(),
+        plan: include_diagnostics.then(|| result.plan.clone()),
+        hits: result
+            .hits
+            .iter()
+            .map(|hit| CompactSearchHit {
+                repo_label: hit.repo_label.clone(),
+                relative_path: hit.relative_path.clone(),
+                start_line: hit.start_line,
+                end_line: hit.end_line,
+                language: hit.language.clone(),
+                match_type: hit.match_type.clone(),
+                content: hit.content.clone(),
+                stale: hit.stale,
+                repo: include_diagnostics.then(|| hit.repo.clone()),
+                score: include_diagnostics.then_some(round_score(hit.score)),
+                dense_score: include_diagnostics
+                    .then(|| hit.dense_score.map(round_score))
+                    .flatten(),
+                lexical_score: include_diagnostics
+                    .then(|| hit.lexical_score.map(round_score))
+                    .flatten(),
+                symbol_score: include_diagnostics
+                    .then(|| hit.symbol_score.map(round_score))
+                    .flatten(),
+                indexed_at: include_diagnostics
+                    .then(|| hit.indexed_at.clone())
+                    .flatten(),
+            })
+            .collect(),
+    }
+}
+
+fn compact_symbol_search_response(
+    result: &SymbolSearchResponse,
+    include_diagnostics: bool,
+) -> CompactSymbolSearchResponse {
+    CompactSymbolSearchResponse {
+        scope: result.scope.clone(),
+        label: result.label.clone(),
+        partial: result.partial,
+        repo_errors: result.repo_errors.clone(),
+        hits: result
+            .hits
+            .iter()
+            .map(|hit| CompactSymbolHit {
+                symbol_id: hit.symbol_id.clone(),
+                repo_label: hit.repo_label.clone(),
+                relative_path: hit.relative_path.clone(),
+                name: hit.name.clone(),
+                kind: hit.kind.clone(),
+                container: hit.container.clone(),
+                start_line: hit.start_line,
+                end_line: hit.end_line,
+                language: hit.language.clone(),
+                stale: hit.stale,
+                repo: include_diagnostics.then(|| hit.repo.clone()),
+                score: include_diagnostics.then_some(round_score(hit.score)),
+                lexical_score: include_diagnostics
+                    .then(|| hit.lexical_score.map(round_score))
+                    .flatten(),
+                semantic_score: include_diagnostics
+                    .then(|| hit.semantic_score.map(round_score))
+                    .flatten(),
+                indexed_at: include_diagnostics.then(|| hit.indexed_at.clone()),
+                file_hash: include_diagnostics.then(|| hit.file_hash.clone()),
+            })
+            .collect(),
+    }
+}
+
+fn compact_outline_response(
+    mut result: FileOutlineResponse,
+    max_depth: usize,
+) -> FileOutlineResponse {
+    for entry in &mut result.matches {
+        entry.symbols = prune_outline_nodes(&entry.symbols, max_depth);
+    }
+    result
+}
+
+fn prune_outline_nodes(nodes: &[OutlineNode], max_depth: usize) -> Vec<OutlineNode> {
+    nodes
+        .iter()
+        .map(|node| OutlineNode {
+            symbol_id: node.symbol_id.clone(),
+            name: node.name.clone(),
+            kind: node.kind.clone(),
+            container: node.container.clone(),
+            language: node.language.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+            children: if max_depth <= 1 {
+                Vec::new()
+            } else {
+                prune_outline_nodes(&node.children, max_depth - 1)
+            },
+        })
+        .collect()
+}
+
+fn count_outline_nodes(nodes: &[OutlineNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| 1 + count_outline_nodes(&node.children))
+        .sum()
+}
+
+fn round_score(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn invalid_params(error: anyhow::Error) -> McpError {
@@ -712,11 +1015,23 @@ fn internal_error(error: anyhow::Error) -> McpError {
 }
 
 fn default_limit() -> usize {
-    10
+    5
 }
 
 fn default_dedupe_by_file() -> bool {
     true
+}
+
+fn default_include_content() -> bool {
+    true
+}
+
+fn default_snippet_chars() -> usize {
+    360
+}
+
+fn default_outline_depth() -> usize {
+    2
 }
 
 fn default_splitter() -> String {
@@ -791,35 +1106,31 @@ fn normalize_optional_kind(value: &Option<String>) -> Option<String> {
 fn nullable_string_schema(description: &str) -> Value {
     json!({
         "description": description,
-        "default": Value::Null,
         "type": ["string", "null"]
     })
 }
 
 fn index_codebase_schema() -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "IndexCodebaseArgs",
         "type": "object",
-        "description": "Start background indexing. Prefer `scope` for configured groups and configured absolute repo roots. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is indexed.",
+        "description": "Start background indexing for a configured scope.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is indexed."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "force": {
                 "type": "boolean",
                 "default": false,
-                "description": "When true, drop and fully rebuild the Rust-managed collection before indexing."
+                "description": "Fully rebuild before indexing."
             },
             "splitter": {
                 "type": "string",
                 "enum": ["ast", "langchain"],
                 "default": "ast",
-                "description": "`ast` uses syntax-aware splitting with fallback; `langchain` uses the text-splitter path directly."
+                "description": "Chunking strategy."
             },
             "customExtensions": {
                 "type": "array",
                 "default": [],
-                "description": "Optional additional file extensions to include, such as ['.vue', '.svelte']",
+                "description": "Additional dotted file extensions.",
                 "items": {
                     "type": "string"
                 }
@@ -827,7 +1138,7 @@ fn index_codebase_schema() -> Map<String, Value> {
             "ignorePatterns": {
                 "type": "array",
                 "default": [],
-                "description": "Optional additional ignore patterns beyond built-in and file-based ignores, such as ['dist/**', '*.tmp']",
+                "description": "Additional ignore patterns.",
                 "items": {
                     "type": "string"
                 }
@@ -841,46 +1152,61 @@ fn index_codebase_schema() -> Map<String, Value> {
 
 fn search_code_schema() -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "SearchCodeArgs",
         "type": "object",
-        "description": "Search indexed code using dense semantic search, a local lexical index, and symbol-aware boosts. Use this for broader semantic or hybrid code discovery. For exact definition or symbol lookup by name, prefer `search_symbols` first. Prefer `scope` for configured groups and configured absolute repo roots. `path` is accepted as a compatibility alias. If neither is provided, the configured default group is searched.",
+        "description": "Broader code search. Use search_symbols first for exact definitions.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
                 "type": "string",
-                "description": "Natural-language, identifier-like, or path/module-like query to search for. Prefer `search_symbols` instead when the intent is exact symbol or definition lookup by name."
+                "description": "Natural-language, identifier, or path-like query."
             },
             "limit": {
                 "type": "integer",
                 "format": "uint",
                 "minimum": 1,
                 "maximum": 50,
-                "default": 10,
-                "description": "Maximum number of final merged results to return. Values above 50 are capped."
+                "default": 5,
+                "description": "Maximum hits."
             },
             "mode": {
                 "type": ["string", "null"],
                 "enum": ["auto", "semantic", "hybrid", "identifier", "path", null],
                 "default": "auto",
-                "description": "`auto` classifies the query and chooses dense/lexical/symbol weighting automatically. Override with a fixed search mode when needed."
+                "description": "Search mode."
             },
             "extensionFilter": {
                 "type": "array",
                 "default": [],
-                "description": "Optional list of dotted file extensions to filter search results, such as ['.rs', '.py'].",
+                "description": "Dotted file extensions to include.",
                 "items": {
                     "type": "string"
                 }
             },
-            "pathPrefix": nullable_string_schema("Optional repo-relative path prefix filter, such as `src/graphql/` or `server/crates/`."),
-            "language": nullable_string_schema("Optional normalized language filter, such as `rust`, `typescript`, or `python`."),
-            "file": nullable_string_schema("Optional repo-relative file path to constrain search to one indexed file."),
+            "pathPrefix": nullable_string_schema("Repo-relative path prefix filter."),
+            "language": nullable_string_schema("Normalized language filter."),
+            "file": nullable_string_schema("Repo-relative file path filter."),
             "dedupeByFile": {
                 "type": "boolean",
                 "default": true,
-                "description": "When true, only the best hit per file is returned. Set false to allow multiple top hits from the same file."
+                "description": "Return one best hit per file."
+            },
+            "includeContent": {
+                "type": "boolean",
+                "default": true,
+                "description": "Include compact snippets."
+            },
+            "snippetChars": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "maximum": 1200,
+                "default": 360,
+                "description": "Approximate max snippet characters."
+            },
+            "includeDiagnostics": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include scores, plan, timestamps, and absolute repo paths."
             }
         },
         "required": ["query"]
@@ -892,29 +1218,66 @@ fn search_code_schema() -> Map<String, Value> {
 
 fn search_symbols_schema() -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "SearchSymbolsArgs",
         "type": "object",
-        "description": "Preferred tool for exact symbol and definition lookup by name. Search indexed definitions using the local symbol index before falling back to broader `search_code` queries.",
+        "description": "Preferred exact symbol and definition lookup.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
                 "type": "string",
-                "description": "Exact or near-exact definition name, container, or path-oriented symbol query. Use this when the user asks for a function, class, struct, trait, module, method, or named definition."
+                "description": "Definition name, container, or path-like symbol query."
             },
             "limit": {
                 "type": "integer",
                 "format": "uint",
                 "minimum": 1,
                 "maximum": 50,
-                "default": 10,
-                "description": "Maximum number of symbol hits to return."
+                "default": 5,
+                "description": "Maximum hits."
             },
-            "pathPrefix": nullable_string_schema("Optional repo-relative path prefix filter."),
-            "language": nullable_string_schema("Optional normalized language filter."),
-            "kind": nullable_string_schema("Optional normalized symbol kind filter such as `function`, `class`, `struct`, or `module`."),
-            "container": nullable_string_schema("Optional container/module/class filter.")
+            "pathPrefix": nullable_string_schema("Repo-relative path prefix filter."),
+            "language": nullable_string_schema("Normalized language filter."),
+            "kind": nullable_string_schema("Symbol kind filter."),
+            "container": nullable_string_schema("Container/module/class filter."),
+            "includeDiagnostics": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include scores, timestamps, file hashes, and absolute repo paths."
+            }
+        },
+        "required": ["query"]
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
+fn explain_search_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Explain search_code query planning.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "query": {
+                "type": "string",
+                "description": "Query to explain."
+            },
+            "mode": {
+                "type": ["string", "null"],
+                "enum": ["auto", "semantic", "hybrid", "identifier", "path", null],
+                "default": "auto",
+                "description": "Search mode."
+            },
+            "extensionFilter": {
+                "type": "array",
+                "default": [],
+                "description": "Dotted file extensions to include.",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "pathPrefix": nullable_string_schema("Repo-relative path prefix filter."),
+            "language": nullable_string_schema("Normalized language filter."),
+            "file": nullable_string_schema("Repo-relative file path filter.")
         },
         "required": ["query"]
     })
@@ -925,16 +1288,21 @@ fn search_symbols_schema() -> Map<String, Value> {
 
 fn get_file_outline_schema() -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "FileOutlineArgs",
         "type": "object",
-        "description": "Return the indexed symbol outline for one repo-relative file. Use this after `search_symbols` or `search_code` when you already know the file and want indexed structure. If the requested group contains multiple repos with the same file path, each matching outline is returned.",
+        "description": "Return an indexed symbol outline for a known file.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or configured absolute repo root. Preferred over `path`. If omitted together with `path`, the configured default group is searched."),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients."),
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "file": {
                 "type": "string",
-                "description": "Repo-relative file path, such as `src/lib.rs` or `server/crates/api/src/schema.rs`."
+                "description": "Repo-relative file path."
+            },
+            "maxDepth": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 16,
+                "default": 2,
+                "description": "Maximum outline tree depth."
             }
         },
         "required": ["file"]
@@ -946,12 +1314,9 @@ fn get_file_outline_schema() -> Map<String, Value> {
 
 fn scope_args_schema(scope_description: &str) -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "ScopeArgs",
         "type": "object",
         "properties": {
-            "scope": nullable_string_schema(scope_description),
-            "path": nullable_string_schema("Compatibility alias for `scope`. Accepts a configured absolute repo root or configured group id. Prefer `scope` in new clients.")
+            "scope": nullable_string_schema(scope_description)
         }
     })
     .as_object()
@@ -961,11 +1326,15 @@ fn scope_args_schema(scope_description: &str) -> Map<String, Value> {
 
 fn list_scopes_schema() -> Map<String, Value> {
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "ListScopesArgs",
         "type": "object",
-        "description": "No arguments. Preferred first call for unfamiliar agents. Returns the configured default scope and all configured group scopes so search tools can be targeted without guessing group ids.",
-        "properties": {}
+        "description": "Lists configured scopes.",
+        "properties": {
+            "includeRepos": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include repo paths for each scope."
+            }
+        }
     })
     .as_object()
     .cloned()
@@ -975,16 +1344,21 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_INSTRUCTIONS, SearchMode, default_limit, enforce_loopback_bind, list_scopes_schema,
-        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
-        search_symbols_schema, tool_list,
+        SERVER_INSTRUCTIONS, SearchMode, compact_outline_response, compact_search_response,
+        default_limit, enforce_loopback_bind, list_scopes_schema, listen_is_loopback,
+        normalize_extension_filter, parse_search_mode, parse_splitter_kind, search_symbols_schema,
+        tool_list,
     };
     use crate::engine::splitter::SplitterKind;
-    use serde_json::Value;
+    use crate::engine::symbols::OutlineNode;
+    use crate::engine::{
+        FileOutlineMatch, FileOutlineResponse, SearchHit, SearchPlanSummary, SearchResponse,
+    };
+    use serde_json::{Value, to_value};
 
     #[test]
     fn search_limit_default_matches_node_contract() {
-        assert_eq!(default_limit(), 10);
+        assert_eq!(default_limit(), 5);
     }
 
     #[test]
@@ -1079,7 +1453,7 @@ mod tests {
             .and_then(|tool| tool.description.as_deref())
             .unwrap_or_default();
 
-        assert!(search_code.contains("prefer `search_symbols` first"));
+        assert!(search_code.contains("Use search_symbols first"));
         assert!(search_symbols.contains("Preferred tool for exact symbol"));
         assert!(list_scopes.contains("Preferred first call"));
     }
@@ -1093,7 +1467,7 @@ mod tests {
             .expect("search_code tool missing");
         let schema = Value::Object((*search_tool.input_schema).clone());
 
-        assert_eq!(schema["properties"]["limit"]["default"].as_u64(), Some(10));
+        assert_eq!(schema["properties"]["limit"]["default"].as_u64(), Some(5));
         assert_eq!(schema["properties"]["limit"]["maximum"].as_u64(), Some(50));
         assert_eq!(
             schema["properties"]["mode"]["default"].as_str(),
@@ -1103,13 +1477,18 @@ mod tests {
             schema["properties"]["extensionFilter"]["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("dotted file extensions")
+                .contains("Dotted file extensions")
         );
         assert!(
             schema["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("prefer `search_symbols` first")
+                .contains("Use search_symbols first")
+        );
+        assert!(schema["properties"].get("path").is_none());
+        assert_eq!(
+            schema["properties"]["snippetChars"]["default"].as_u64(),
+            Some(360)
         );
     }
 
@@ -1140,20 +1519,124 @@ mod tests {
             search_symbols["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Preferred tool for exact symbol")
+                .contains("Preferred exact symbol")
         );
         assert!(
             search_symbols["properties"]["query"]["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Use this when the user asks for a function")
+                .contains("Definition name")
         );
         assert!(
             list_scopes["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Preferred first call")
+                .contains("Lists configured scopes")
         );
-        assert!(SERVER_INSTRUCTIONS.contains("use `search_symbols` first"));
+        assert!(SERVER_INSTRUCTIONS.contains("search_symbols for exact definitions"));
+    }
+
+    #[test]
+    fn compact_search_response_omits_diagnostics_by_default() {
+        let response = SearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            plan: SearchPlanSummary {
+                requested_mode: "auto".to_string(),
+                effective_mode: "hybrid".to_string(),
+                query_kind: "mixed".to_string(),
+                dense_weight: 1.0,
+                lexical_weight: 1.0,
+                symbol_weight: 1.0,
+                symbol_lexical_share: 0.5,
+                symbol_semantic_share: 0.5,
+                dedupe_by_file: true,
+            },
+            hits: vec![SearchHit {
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                start_line: 10,
+                end_line: 12,
+                language: "rust".to_string(),
+                score: 0.42,
+                match_type: "hybrid".to_string(),
+                dense_score: Some(0.1),
+                lexical_score: Some(0.2),
+                symbol_score: Some(0.3),
+                indexed_at: Some("2026-01-01T00:00:00Z".to_string()),
+                stale: false,
+                content: "fn example() {}".to_string(),
+            }],
+        };
+
+        let value = to_value(compact_search_response(&response, false)).unwrap();
+        let hit = &value["hits"][0];
+
+        assert!(value.get("plan").is_none());
+        assert!(value.get("repoErrors").is_none());
+        assert!(hit.get("repo").is_none());
+        assert!(hit.get("score").is_none());
+        assert!(hit.get("denseScore").is_none());
+        assert!(hit.get("indexedAt").is_none());
+        assert!(hit.get("stale").is_none());
+        assert_eq!(hit["relativePath"].as_str(), Some("src/lib.rs"));
+        assert_eq!(hit["content"].as_str(), Some("fn example() {}"));
+    }
+
+    #[test]
+    fn compact_outline_response_prunes_to_requested_depth() {
+        let result = FileOutlineResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            file: "src/lib.rs".to_string(),
+            matches: vec![FileOutlineMatch {
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                indexed_at: Some("2026-01-01T00:00:00Z".to_string()),
+                stale: false,
+                symbols: vec![OutlineNode {
+                    symbol_id: "root".to_string(),
+                    name: "Root".to_string(),
+                    kind: "struct".to_string(),
+                    container: None,
+                    language: "rust".to_string(),
+                    start_line: 1,
+                    end_line: 20,
+                    children: vec![OutlineNode {
+                        symbol_id: "child".to_string(),
+                        name: "child".to_string(),
+                        kind: "method".to_string(),
+                        container: Some("Root".to_string()),
+                        language: "rust".to_string(),
+                        start_line: 5,
+                        end_line: 8,
+                        children: vec![OutlineNode {
+                            symbol_id: "grandchild".to_string(),
+                            name: "grandchild".to_string(),
+                            kind: "function".to_string(),
+                            container: Some("child".to_string()),
+                            language: "rust".to_string(),
+                            start_line: 6,
+                            end_line: 7,
+                            children: Vec::new(),
+                        }],
+                    }],
+                }],
+            }],
+        };
+
+        let compact = compact_outline_response(result, 2);
+
+        assert_eq!(compact.matches[0].symbols[0].children.len(), 1);
+        assert!(
+            compact.matches[0].symbols[0].children[0]
+                .children
+                .is_empty()
+        );
     }
 }
