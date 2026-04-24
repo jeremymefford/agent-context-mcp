@@ -8,7 +8,12 @@ use tantivy::query::{QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, Value as _,
 };
-use tantivy::{Index, IndexReader, ReloadPolicy, Term, doc};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
+
+const CHUNK_SEGMENT_COMPACTION_THRESHOLD: usize = 64;
+const SYMBOL_SEGMENT_COMPACTION_THRESHOLD: usize = 64;
+const DELETED_DOC_COMPACTION_MIN: u64 = 256;
+const DELETED_DOC_COMPACTION_RATIO: f64 = 0.20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,7 +168,7 @@ impl LocalIndexStore {
         }
         if let Some(handle) = self.open_existing_chunk_index(repo)? {
             let schema = ChunkSchema::from_index(&handle.index)?;
-            let mut writer = handle
+            let writer = handle
                 .index
                 .writer::<TantivyDocument>(32_000_000)
                 .context("opening chunk index writer")?;
@@ -173,7 +178,13 @@ impl LocalIndexStore {
                     relative_path,
                 ));
             }
-            writer.commit().context("committing chunk deletes")?;
+            finish_writer(
+                &handle.index,
+                writer,
+                CachedIndexKind::Chunk,
+                &self.chunk_index_dir(repo),
+                "committing chunk deletes",
+            )?;
             handle
                 .reader
                 .reload()
@@ -181,7 +192,7 @@ impl LocalIndexStore {
         }
         if let Some(handle) = self.open_existing_symbol_index(repo)? {
             let schema = SymbolSchema::from_index(&handle.index)?;
-            let mut writer = handle
+            let writer = handle
                 .index
                 .writer::<TantivyDocument>(16_000_000)
                 .context("opening symbol index writer")?;
@@ -191,7 +202,13 @@ impl LocalIndexStore {
                     relative_path,
                 ));
             }
-            writer.commit().context("committing symbol deletes")?;
+            finish_writer(
+                &handle.index,
+                writer,
+                CachedIndexKind::Symbol,
+                &self.symbol_index_dir(repo),
+                "committing symbol deletes",
+            )?;
             handle
                 .reader
                 .reload()
@@ -206,7 +223,7 @@ impl LocalIndexStore {
         }
         let handle = self.open_or_create_chunk_index(repo)?;
         let schema = ChunkSchema::from_index(&handle.index)?;
-        let mut writer = handle
+        let writer = handle
             .index
             .writer::<TantivyDocument>(64_000_000)
             .context("opening chunk index writer")?;
@@ -229,7 +246,13 @@ impl LocalIndexStore {
             ))
                 .context("adding chunk document to Tantivy")?;
         }
-        writer.commit().context("committing chunk documents")?;
+        finish_writer(
+            &handle.index,
+            writer,
+            CachedIndexKind::Chunk,
+            &self.chunk_index_dir(repo),
+            "committing chunk documents",
+        )?;
         handle
             .reader
             .reload()
@@ -237,43 +260,63 @@ impl LocalIndexStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn replace_symbol_docs(
         &self,
         repo: &Path,
         relative_path: &str,
         documents: &[SymbolIndexDoc],
     ) -> Result<()> {
+        self.replace_symbol_docs_batch(repo, &[(relative_path.to_string(), documents.to_vec())])
+    }
+
+    pub fn replace_symbol_docs_batch(
+        &self,
+        repo: &Path,
+        replacements: &[(String, Vec<SymbolIndexDoc>)],
+    ) -> Result<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
         let handle = self.open_or_create_symbol_index(repo)?;
         let schema = SymbolSchema::from_index(&handle.index)?;
-        let mut writer = handle
+        let writer = handle
             .index
             .writer::<TantivyDocument>(16_000_000)
             .context("opening symbol index writer")?;
-        writer.delete_term(Term::from_field_text(
-            schema.relative_path_raw,
-            relative_path,
-        ));
-        for document in documents {
-            writer
-                .add_document(doc!(
-                    schema.symbol_id => document.symbol_id.clone(),
-                    schema.relative_path_raw => document.relative_path.clone(),
-                    schema.relative_path_text => tokenize_path(&document.relative_path),
-                    schema.basename_raw => document.basename.clone(),
-                    schema.basename_text => tokenize_path(&document.basename),
-                    schema.name_raw => document.name.clone(),
-                    schema.name_text => tokenize_identifiers(&document.name),
-                    schema.kind => document.kind.clone(),
-                    schema.container_text => document.container.clone().unwrap_or_default(),
-                    schema.language => document.language.clone(),
-                    schema.start_line => document.start_line,
-                    schema.end_line => document.end_line,
-                    schema.indexed_at => document.indexed_at.clone(),
-                    schema.file_hash => document.file_hash.clone(),
-                ))
-                .context("adding symbol document to Tantivy")?;
+        for (relative_path, documents) in replacements {
+            writer.delete_term(Term::from_field_text(
+                schema.relative_path_raw,
+                relative_path,
+            ));
+            for document in documents {
+                writer
+                    .add_document(doc!(
+                        schema.symbol_id => document.symbol_id.clone(),
+                        schema.relative_path_raw => document.relative_path.clone(),
+                        schema.relative_path_text => tokenize_path(&document.relative_path),
+                        schema.basename_raw => document.basename.clone(),
+                        schema.basename_text => tokenize_path(&document.basename),
+                        schema.name_raw => document.name.clone(),
+                        schema.name_text => tokenize_identifiers(&document.name),
+                        schema.kind => document.kind.clone(),
+                        schema.container_text => document.container.clone().unwrap_or_default(),
+                        schema.language => document.language.clone(),
+                        schema.start_line => document.start_line,
+                        schema.end_line => document.end_line,
+                        schema.indexed_at => document.indexed_at.clone(),
+                        schema.file_hash => document.file_hash.clone(),
+                    ))
+                    .context("adding symbol document to Tantivy")?;
+            }
         }
-        writer.commit().context("committing symbol documents")?;
+        finish_writer(
+            &handle.index,
+            writer,
+            CachedIndexKind::Symbol,
+            &self.symbol_index_dir(repo),
+            "committing symbol documents",
+        )?;
         handle
             .reader
             .reload()
@@ -478,6 +521,7 @@ impl LocalIndexStore {
             Index::open_in_dir(&path)
                 .with_context(|| format!("opening Tantivy index {}", path.display()))?
         };
+        maintain_existing_index(&index, kind, &path)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -572,11 +616,113 @@ impl LocalIndexStore {
             .map_err(|_| anyhow!("local lexical index cache poisoned"))?;
         Ok(cache.repos.keys().cloned().collect())
     }
+
+    #[cfg(test)]
+    fn symbol_segment_count(&self, repo: &Path) -> Result<usize> {
+        let Some(handle) = self.open_existing_symbol_index(repo)? else {
+            return Ok(0);
+        };
+        Ok(handle.index.searchable_segment_metas()?.len())
+    }
 }
 
 fn next_access_tick(state: &mut RepoCacheState) -> u64 {
     state.access_tick = state.access_tick.saturating_add(1);
     state.access_tick
+}
+
+fn finish_writer(
+    index: &Index,
+    mut writer: IndexWriter,
+    kind: CachedIndexKind,
+    path: &Path,
+    commit_context: &'static str,
+) -> Result<()> {
+    writer.commit().context(commit_context)?;
+    compact_index_if_needed(index, &mut writer, kind, path)?;
+    writer
+        .wait_merging_threads()
+        .with_context(|| format!("waiting for Tantivy maintenance {}", path.display()))?;
+    Ok(())
+}
+
+fn maintain_existing_index(index: &Index, kind: CachedIndexKind, path: &Path) -> Result<()> {
+    if !index_needs_compaction(index, kind, path)? {
+        return Ok(());
+    }
+
+    let mut writer = index
+        .writer::<TantivyDocument>(64_000_000)
+        .with_context(|| format!("opening Tantivy maintenance writer {}", path.display()))?;
+    compact_index_if_needed(index, &mut writer, kind, path)?;
+    writer
+        .wait_merging_threads()
+        .with_context(|| format!("waiting for Tantivy maintenance {}", path.display()))?;
+    Ok(())
+}
+
+fn compact_index_if_needed(
+    index: &Index,
+    writer: &mut IndexWriter,
+    kind: CachedIndexKind,
+    path: &Path,
+) -> Result<()> {
+    let segment_metas = index
+        .searchable_segment_metas()
+        .with_context(|| format!("reading Tantivy segments {}", path.display()))?;
+    if !segment_metas_need_compaction(&segment_metas, kind) {
+        return Ok(());
+    }
+
+    let segment_ids = segment_metas
+        .iter()
+        .map(|segment| segment.id())
+        .collect::<Vec<_>>();
+    if segment_ids.is_empty() {
+        return Ok(());
+    }
+    writer
+        .merge(&segment_ids)
+        .wait()
+        .with_context(|| format!("compacting Tantivy index {}", path.display()))?;
+    Ok(())
+}
+
+fn index_needs_compaction(index: &Index, kind: CachedIndexKind, path: &Path) -> Result<bool> {
+    let segment_metas = index
+        .searchable_segment_metas()
+        .with_context(|| format!("reading Tantivy segments {}", path.display()))?;
+    Ok(segment_metas_need_compaction(&segment_metas, kind))
+}
+
+fn segment_metas_need_compaction(
+    segment_metas: &[tantivy::index::SegmentMeta],
+    kind: CachedIndexKind,
+) -> bool {
+    if segment_metas.len() > compaction_segment_threshold(kind) {
+        return true;
+    }
+
+    let deleted_docs = segment_metas
+        .iter()
+        .map(|segment| segment.num_deleted_docs() as u64)
+        .sum::<u64>();
+    if deleted_docs < DELETED_DOC_COMPACTION_MIN {
+        return false;
+    }
+
+    let max_docs = segment_metas
+        .iter()
+        .map(|segment| segment.max_doc() as u64)
+        .sum::<u64>();
+    max_docs > 0 && (deleted_docs as f64 / max_docs as f64) >= DELETED_DOC_COMPACTION_RATIO
+}
+
+fn compaction_segment_threshold(kind: CachedIndexKind) -> usize {
+    match kind {
+        CachedIndexKind::Chunk => CHUNK_SEGMENT_COMPACTION_THRESHOLD,
+        CachedIndexKind::Symbol => SYMBOL_SEGMENT_COMPACTION_THRESHOLD,
+    }
 }
 
 fn evict_lru_repos(state: &mut RepoCacheState, max_warm_repos: usize, preserve: Option<&Path>) {
@@ -1019,8 +1165,8 @@ fn u64_value(document: &TantivyDocument, field: Field) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor, SymbolIndexDoc,
-        SymbolSearchRequest,
+        ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor,
+        SYMBOL_SEGMENT_COMPACTION_THRESHOLD, SymbolIndexDoc, SymbolSearchRequest,
     };
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1132,6 +1278,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits.first().map(|hit| hit.name.as_str()), Some("Schema"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn symbol_index_maintenance_compacts_many_small_commits() {
+        let root = temp_path("symbol-maintenance");
+        let store = LocalIndexStore::new(root.clone(), 4);
+        let repo = std::path::Path::new("/tmp/example");
+
+        for index in 0..(SYMBOL_SEGMENT_COMPACTION_THRESHOLD + 8) {
+            let relative_path = format!("src/generated_{index}.rs");
+            store
+                .replace_symbol_docs(
+                    repo,
+                    &relative_path,
+                    &[SymbolIndexDoc {
+                        symbol_id: format!("sym_{index}"),
+                        relative_path: relative_path.clone(),
+                        basename: format!("generated_{index}.rs"),
+                        name: format!("Generated{index}"),
+                        kind: "struct".to_string(),
+                        container: None,
+                        language: "rust".to_string(),
+                        start_line: 1,
+                        end_line: 3,
+                        indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                        file_hash: format!("hash-{index}"),
+                    }],
+                )
+                .unwrap();
+        }
+
+        assert!(
+            store.symbol_segment_count(repo).unwrap() <= SYMBOL_SEGMENT_COMPACTION_THRESHOLD,
+            "symbol index should stay below the maintenance segment threshold"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

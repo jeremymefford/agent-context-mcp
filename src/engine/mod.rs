@@ -38,6 +38,7 @@ use self::splitter::{
 use self::symbols::{IndexedSymbol, OutlineNode, SymbolStore, build_outline, extract_symbols};
 
 const EMBEDDING_BATCH_SIZE: usize = 64;
+const SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE: usize = 64;
 const CHUNK_LIMIT: usize = 450_000;
 const RRF_K: f64 = 100.0;
 const CONTENT_HASH_ALGORITHM: &str = "xxh3_128";
@@ -386,6 +387,12 @@ struct PendingSymbolDocument {
     symbol: IndexedSymbol,
     basename: String,
     extension: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSymbolIndexReplacement {
+    relative_path: String,
+    documents: Vec<SymbolIndexDoc>,
 }
 
 #[derive(Debug, Clone)]
@@ -2107,37 +2114,37 @@ impl Engine {
 
     async fn write_file_symbols(
         &self,
-        repo: &Path,
         repo_key: &str,
         relative_path: &str,
         symbols: &[IndexedSymbol],
     ) -> Result<()> {
-        let symbol_docs = symbols
-            .iter()
-            .map(|symbol| SymbolIndexDoc {
-                symbol_id: symbol.symbol_id.clone(),
-                relative_path: symbol.relative_path.clone(),
-                basename: basename_for_path(&symbol.relative_path),
-                name: symbol.name.clone(),
-                kind: symbol.kind.clone(),
-                container: symbol.container.clone(),
-                language: symbol.language.clone(),
-                start_line: symbol.start_line,
-                end_line: symbol.end_line,
-                indexed_at: symbol.indexed_at.clone(),
-                file_hash: symbol.file_hash.clone(),
-            })
-            .collect::<Vec<_>>();
-        let repo_path = repo.to_path_buf();
         let repo_key = repo_key.to_string();
         let relative_path = relative_path.to_string();
         let symbol_store = self.inner.symbol_store.clone();
-        let local_index = self.inner.local_index.clone();
         let symbols = symbols.to_vec();
         run_low_priority_blocking("write_file_symbols", move || {
             symbol_store.replace_file_symbols(&repo_key, &relative_path, &symbols)?;
-            local_index.replace_symbol_docs(&repo_path, &relative_path, &symbol_docs)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn flush_symbol_index_replacements(
+        &self,
+        repo: &Path,
+        pending_replacements: &mut Vec<PendingSymbolIndexReplacement>,
+    ) -> Result<()> {
+        let replacements = std::mem::take(pending_replacements)
+            .into_iter()
+            .map(|replacement| (replacement.relative_path, replacement.documents))
+            .collect::<Vec<_>>();
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let repo_path = repo.to_path_buf();
+        let local_index = self.inner.local_index.clone();
+        run_low_priority_blocking("write_symbol_lexical_docs", move || {
+            local_index.replace_symbol_docs_batch(&repo_path, &replacements)
         })
         .await
     }
@@ -2153,6 +2160,7 @@ impl Engine {
     ) -> Result<ProcessFilesResult> {
         let mut pending_chunks = Vec::new();
         let mut pending_symbols = Vec::new();
+        let mut pending_symbol_index_replacements = Vec::new();
         let mut indexed_paths = HashSet::new();
         let mut processed_files = 0u64;
         let mut total_chunks = 0u64;
@@ -2192,8 +2200,32 @@ impl Engine {
                 &indexed_at,
                 &file.hash,
             )?;
-            self.write_file_symbols(repo, repo_key, &relative_path, &symbols)
+            self.write_file_symbols(repo_key, &relative_path, &symbols)
                 .await?;
+            let symbol_index_docs = symbols
+                .iter()
+                .map(|symbol| SymbolIndexDoc {
+                    symbol_id: symbol.symbol_id.clone(),
+                    relative_path: symbol.relative_path.clone(),
+                    basename: basename.clone(),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.clone(),
+                    container: symbol.container.clone(),
+                    language: symbol.language.clone(),
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    indexed_at: symbol.indexed_at.clone(),
+                    file_hash: symbol.file_hash.clone(),
+                })
+                .collect::<Vec<_>>();
+            pending_symbol_index_replacements.push(PendingSymbolIndexReplacement {
+                relative_path: relative_path.clone(),
+                documents: symbol_index_docs,
+            });
+            if pending_symbol_index_replacements.len() >= SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE {
+                self.flush_symbol_index_replacements(repo, &mut pending_symbol_index_replacements)
+                    .await?;
+            }
             if collections.symbol.is_some() {
                 pending_symbols.extend(symbols.iter().cloned().map(|symbol| {
                     PendingSymbolDocument {
@@ -2237,6 +2269,10 @@ impl Engine {
         }
         if !pending_symbols.is_empty() {
             self.flush_symbol_documents(collections.symbol, &mut pending_symbols)
+                .await?;
+        }
+        if !pending_symbol_index_replacements.is_empty() {
+            self.flush_symbol_index_replacements(repo, &mut pending_symbol_index_replacements)
                 .await?;
         }
 
@@ -2945,8 +2981,8 @@ fn query_signals(query: &str) -> QuerySignals {
 fn symbol_query_shares(kind: QueryKind) -> (f64, f64) {
     match kind {
         QueryKind::NaturalLanguage => (0.35, 0.65),
-        QueryKind::Identifier => (0.8, 0.2),
-        QueryKind::Path => (0.9, 0.1),
+        QueryKind::Identifier => (1.0, 0.0),
+        QueryKind::Path => (1.0, 0.0),
         QueryKind::Mixed => (0.55, 0.45),
     }
 }
@@ -3023,14 +3059,16 @@ fn plan_search(request: &SearchRequest) -> SearchPlan {
         match effective_mode {
             SearchMode::Semantic => (2.0, 0.6, 0.6, 2),
             SearchMode::Hybrid => (1.3, 1.5, 1.2, 2),
-            SearchMode::Identifier => (0.45, 2.35, 2.15, 1),
-            SearchMode::Path => (0.2, 2.5, 1.1, 1),
+            SearchMode::Identifier => (0.0, 2.35, 2.15, 1),
+            SearchMode::Path => (0.0, 2.5, 1.1, 1),
             SearchMode::Auto => unreachable!("auto mode should be resolved before planning"),
         };
 
     if request.path_prefix.is_some() || request.file.is_some() {
         lexical_weight += 0.35;
-        dense_weight = (dense_weight - 0.15_f64).max(0.15_f64);
+        if dense_weight > 0.0 {
+            dense_weight = (dense_weight - 0.15_f64).max(0.15_f64);
+        }
     }
     if request.language.is_some() {
         lexical_weight += 0.1;
@@ -3751,6 +3789,27 @@ mod tests {
         assert!(constrained.lexical_weight > unconstrained.lexical_weight);
         assert!(constrained.dense_weight < unconstrained.dense_weight);
         assert!(constrained.symbol_lexical_share > unconstrained.symbol_lexical_share);
+    }
+
+    #[test]
+    fn plan_search_keeps_identifier_and_path_queries_off_dense_backends() {
+        for query in ["GraphQLResolver", "server/crates/api/src/schema.rs"] {
+            let plan = plan_search(&SearchRequest {
+                query: query.to_string(),
+                limit: 10,
+                mode: SearchMode::Auto,
+                extension_filter: Vec::new(),
+                path_prefix: None,
+                language: None,
+                file: None,
+                dedupe_by_file: true,
+                snippet_chars: 360,
+            });
+
+            assert_eq!(plan.dense_weight, 0.0);
+            assert_eq!(plan.symbol_semantic_share, 0.0);
+            assert!(plan.symbol_lexical_share > 0.0);
+        }
     }
 
     #[test]
