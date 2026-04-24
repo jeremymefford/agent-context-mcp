@@ -56,6 +56,14 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:8765/mcp")]
         url: String,
     },
+    /// Dry-run or apply cleanup of stale agent-context Milvus collections
+    PruneStaleVectorCollections {
+        /// Actually drop stale collections; omitted means dry-run
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
+    /// Release loaded agent-context Milvus collections without deleting indexes
+    ReleaseVectorCollections,
     /// Incrementally refresh a single codebase or group
     RefreshOne {
         /// Absolute path to a repo or configured group id
@@ -117,6 +125,14 @@ async fn main() -> Result<()> {
         Command::InstallHook { repo } => commands::install_hook::run(&repo).await,
         Command::PrintMcpConfig { client, url } => {
             commands::print_mcp_config::run(&client, &url).await
+        }
+        Command::PruneStaleVectorCollections { apply } => {
+            let cfg = load_config(cli.config.as_deref())?;
+            commands::prune_stale_vector_collections::run(&cfg, apply).await
+        }
+        Command::ReleaseVectorCollections => {
+            let cfg = load_config(cli.config.as_deref())?;
+            commands::release_vector_collections::run(&cfg).await
         }
         Command::RefreshOne { path } => {
             let cfg = load_config(cli.config.as_deref())?;

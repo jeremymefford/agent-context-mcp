@@ -46,6 +46,9 @@ const LEGACY_CONTENT_HASH_ALGORITHM: &str = "sha256";
 const SNAPSHOT_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 const INDEX_FORMAT_VERSION: &str = "v1";
 const SEARCH_ROOT_VERSION: &str = "v1";
+const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
+const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
+const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -101,6 +104,16 @@ pub struct RepoChangeSummary {
     pub added: u64,
     pub modified: u64,
     pub removed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorHygieneReport {
+    pub expected_collections: usize,
+    pub agent_context_collections: Vec<String>,
+    pub stale_collections: Vec<String>,
+    pub loaded_collections: Vec<String>,
+    pub recommended_loaded_collection_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -641,6 +654,48 @@ impl Engine {
             &snapshot,
             &configured_embedding_fingerprint,
         ))
+    }
+
+    pub async fn vector_hygiene_report(&self) -> Result<VectorHygieneReport> {
+        let repos = self.inner.config.all_repos()?;
+        let expected = expected_vector_collections(&repos);
+        let mut agent_context_collections = self
+            .inner
+            .milvus
+            .list_collections()
+            .await?
+            .into_iter()
+            .filter(|collection| is_agent_context_vector_collection(collection))
+            .collect::<Vec<_>>();
+        agent_context_collections.sort();
+
+        let stale_collections = stale_vector_collections(&agent_context_collections, &expected);
+        let mut loaded_collections = Vec::new();
+        for collection in &agent_context_collections {
+            if self
+                .inner
+                .milvus
+                .collection_load_state(collection)
+                .await?
+                .as_deref()
+                == Some("LoadStateLoaded")
+            {
+                loaded_collections.push(collection.clone());
+            }
+        }
+
+        Ok(VectorHygieneReport {
+            expected_collections: expected.len(),
+            agent_context_collections,
+            stale_collections,
+            loaded_collections,
+            recommended_loaded_collection_limit: self
+                .inner
+                .config
+                .search
+                .max_warm_repos
+                .saturating_mul(2),
+        })
     }
 
     pub fn all_scope(&self) -> Result<ResolvedScope> {
@@ -1631,6 +1686,40 @@ impl Engine {
 
         match outcome {
             Ok((processing, changes, coverage)) => {
+                if vector_release_needed(full_reindex, &changes)
+                    && let Err(error) = self
+                        .maintain_vector_collections(
+                            &[collection_name.clone(), symbol_collection_name.clone()],
+                            vector_flush_needed(full_reindex, &changes),
+                        )
+                        .await
+                {
+                    let message = format!("vector maintenance failed: {error}");
+                    self.inner
+                        .snapshot
+                        .update(|snapshot| {
+                            let last_progress =
+                                snapshot.codebases.get(&repo_key).and_then(|entry| {
+                                    entry
+                                        .indexing_percentage
+                                        .or(entry.last_attempted_percentage)
+                                });
+                            snapshot.codebases.insert(
+                                repo_key.clone(),
+                                SnapshotEntry::failed(message.clone(), last_progress),
+                            );
+                        })
+                        .await?;
+                    return Ok(RepoIndexResult {
+                        repo: repo_key,
+                        indexed_files: None,
+                        total_chunks: None,
+                        index_status: Some("failed".to_string()),
+                        full_reindex,
+                        changes,
+                        error: Some(message),
+                    });
+                }
                 let fingerprint = fingerprint_repo(repo).ok();
                 let index_status =
                     index_status_for_coverage(processing.status, coverage, current_files.len());
@@ -1735,6 +1824,32 @@ impl Engine {
                 .with_context(|| format!("removing {}", merkle_path.display()))?;
         }
         self.inner.snapshot.remove(&repo_key).await?;
+        Ok(())
+    }
+
+    async fn maintain_vector_collections(&self, collections: &[String], flush: bool) -> Result<()> {
+        let mut collections = collections.to_vec();
+        collections.sort();
+        collections.dedup();
+
+        if flush {
+            for collection in &collections {
+                self.inner
+                    .milvus
+                    .flush_collection(collection)
+                    .await
+                    .with_context(|| format!("flushing Milvus collection {collection}"))?;
+            }
+        }
+
+        for collection in &collections {
+            self.inner
+                .milvus
+                .release_collection_if_loaded(collection)
+                .await
+                .with_context(|| format!("releasing Milvus collection {collection}"))?;
+        }
+
         Ok(())
     }
 
@@ -2080,6 +2195,30 @@ impl Engine {
                 error_message: None,
             },
         })
+    }
+
+    pub async fn prune_stale_vector_collections(&self) -> Result<Vec<String>> {
+        let report = self.vector_hygiene_report().await?;
+        for collection in &report.stale_collections {
+            self.inner
+                .milvus
+                .drop_collection(collection)
+                .await
+                .with_context(|| format!("dropping stale Milvus collection {collection}"))?;
+        }
+        Ok(report.stale_collections)
+    }
+
+    pub async fn release_loaded_vector_collections(&self) -> Result<Vec<String>> {
+        let report = self.vector_hygiene_report().await?;
+        for collection in &report.loaded_collections {
+            self.inner
+                .milvus
+                .release_collection_if_loaded(collection)
+                .await
+                .with_context(|| format!("releasing loaded Milvus collection {collection}"))?;
+        }
+        Ok(report.loaded_collections)
     }
 
     async fn record_fingerprint(
@@ -2447,6 +2586,42 @@ pub fn collection_name(repo: &Path) -> String {
 pub fn symbol_collection_name(repo: &Path) -> String {
     let digest = md5::compute(repo.display().to_string());
     format!("hybrid_symbols_{digest:x}")
+}
+
+fn expected_vector_collections(repos: &[PathBuf]) -> HashSet<String> {
+    repos
+        .iter()
+        .flat_map(|repo| [collection_name(repo), symbol_collection_name(repo)])
+        .collect()
+}
+
+fn stale_vector_collections(existing: &[String], expected: &HashSet<String>) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|collection| is_agent_context_vector_collection(collection))
+        .filter(|collection| !expected.contains(*collection))
+        .cloned()
+        .collect()
+}
+
+fn is_agent_context_vector_collection(collection: &str) -> bool {
+    collection.starts_with(CHUNK_COLLECTION_PREFIX)
+        || collection.starts_with(SYMBOL_COLLECTION_PREFIX)
+}
+
+fn vector_release_needed(full_reindex: bool, changes: &RepoChangeSummary) -> bool {
+    full_reindex || vector_changed_file_count(changes) > 0
+}
+
+fn vector_flush_needed(full_reindex: bool, changes: &RepoChangeSummary) -> bool {
+    full_reindex || vector_changed_file_count(changes) >= VECTOR_FLUSH_FILE_CHANGE_THRESHOLD
+}
+
+fn vector_changed_file_count(changes: &RepoChangeSummary) -> u64 {
+    changes
+        .added
+        .saturating_add(changes.modified)
+        .saturating_add(changes.removed)
 }
 
 pub fn chunk_id(relative_path: &str, start_line: u64, end_line: u64, content: &str) -> String {
@@ -3610,13 +3785,15 @@ mod tests {
         CONTENT_HASH_ALGORITHM, IndexCompletionStatus, IndexCoverage,
         LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode, SearchRequest,
         build_chunk_context_snippet, build_root_hash, chunk_id, classify_query, collection_name,
-        diff_files, hash_text_like_file, index_status_for_coverage, plan_search,
-        run_low_priority_blocking, scan_repo,
+        diff_files, expected_vector_collections, hash_text_like_file, index_status_for_coverage,
+        is_agent_context_vector_collection, plan_search, run_low_priority_blocking, scan_repo,
+        stale_vector_collections, symbol_collection_name, vector_flush_needed,
+        vector_release_needed,
     };
     use crate::config::SearchConfig;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3635,6 +3812,73 @@ mod tests {
     fn collection_name_matches_upstream_prefix_and_hash() {
         let collection = collection_name(Path::new("/tmp/example"));
         assert_eq!(collection, "hybrid_code_chunks_89a35363");
+    }
+
+    #[test]
+    fn vector_collection_helpers_identify_expected_and_stale_collections() {
+        let repos = vec![PathBuf::from("/tmp/example"), PathBuf::from("/tmp/another")];
+        let expected = expected_vector_collections(&repos);
+        assert!(expected.contains(&collection_name(Path::new("/tmp/example"))));
+        assert!(expected.contains(&symbol_collection_name(Path::new("/tmp/example"))));
+
+        let stale = stale_vector_collections(
+            &[
+                collection_name(Path::new("/tmp/example")),
+                "hybrid_code_chunks_deadbeef".to_string(),
+                "unrelated_collection".to_string(),
+            ],
+            &expected,
+        );
+
+        assert_eq!(stale, vec!["hybrid_code_chunks_deadbeef"]);
+        assert!(is_agent_context_vector_collection(
+            "hybrid_symbols_deadbeefdeadbeef"
+        ));
+        assert!(!is_agent_context_vector_collection("not_agent_context"));
+    }
+
+    #[test]
+    fn vector_release_runs_for_reindex_or_actual_changes() {
+        assert!(vector_release_needed(
+            true,
+            &super::RepoChangeSummary::default()
+        ));
+        assert!(vector_release_needed(
+            false,
+            &super::RepoChangeSummary {
+                added: 0,
+                modified: 1,
+                removed: 0,
+            }
+        ));
+        assert!(!vector_release_needed(
+            false,
+            &super::RepoChangeSummary::default()
+        ));
+    }
+
+    #[test]
+    fn vector_flush_runs_only_for_reindex_or_larger_batches() {
+        assert!(vector_flush_needed(
+            true,
+            &super::RepoChangeSummary::default()
+        ));
+        assert!(!vector_flush_needed(
+            false,
+            &super::RepoChangeSummary {
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }
+        ));
+        assert!(vector_flush_needed(
+            false,
+            &super::RepoChangeSummary {
+                added: 16,
+                modified: 16,
+                removed: 0,
+            }
+        ));
     }
 
     #[test]

@@ -151,17 +151,9 @@ impl MilvusClient {
     }
 
     pub async fn ensure_loaded(&self, collection_name: &str) -> Result<()> {
-        let state: LoadStatePayload = self
-            .post(
-                "/collections/get_load_state",
-                self.with_db(json!({
-                    "collectionName": collection_name,
-                })),
-                SEARCH_TIMEOUT,
-            )
-            .await?;
+        let state = self.collection_load_state(collection_name).await?;
 
-        if state.load_state.as_deref() != Some("LoadStateLoaded") {
+        if state.as_deref() != Some("LoadStateLoaded") {
             let _: Value = self
                 .post(
                     "/collections/load",
@@ -173,6 +165,55 @@ impl MilvusClient {
                 .await?;
         }
         Ok(())
+    }
+
+    pub async fn collection_load_state(&self, collection_name: &str) -> Result<Option<String>> {
+        let state: LoadStatePayload = self
+            .post(
+                "/collections/get_load_state",
+                self.with_db(json!({
+                    "collectionName": collection_name,
+                })),
+                SEARCH_TIMEOUT,
+            )
+            .await?;
+        Ok(state.load_state)
+    }
+
+    pub async fn list_collections(&self) -> Result<Vec<String>> {
+        self.post("/collections/list", self.with_db(json!({})), SEARCH_TIMEOUT)
+            .await
+    }
+
+    pub async fn flush_collection(&self, collection_name: &str) -> Result<()> {
+        let _: Value = self
+            .post(
+                "/collections/flush",
+                self.with_db(json!({
+                    "collectionName": collection_name,
+                })),
+                INDEX_TIMEOUT,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn release_collection_if_loaded(&self, collection_name: &str) -> Result<bool> {
+        let state = self.collection_load_state(collection_name).await?;
+        if state.as_deref() != Some("LoadStateLoaded") {
+            return Ok(false);
+        }
+
+        let _: Value = self
+            .post(
+                "/collections/release",
+                self.with_db(json!({
+                    "collectionName": collection_name,
+                })),
+                INDEX_TIMEOUT,
+            )
+            .await?;
+        Ok(true)
     }
 
     pub async fn drop_collection(&self, collection_name: &str) -> Result<()> {
@@ -315,7 +356,7 @@ impl MilvusClient {
             .await?;
 
         self.set_collection_presence(collection_name, true)?;
-        self.ensure_loaded(collection_name).await
+        Ok(())
     }
 
     pub async fn insert_documents(
@@ -323,7 +364,6 @@ impl MilvusClient {
         collection_name: &str,
         documents: &[VectorDocument],
     ) -> Result<()> {
-        self.ensure_loaded(collection_name).await?;
         let rows = documents
             .iter()
             .map(|document| {
@@ -360,6 +400,7 @@ impl MilvusClient {
         limit: usize,
         filter: Option<&str>,
     ) -> Result<Vec<SearchDocument>> {
+        self.ensure_loaded(collection_name).await?;
         let mut request = self.with_db(json!({
             "collectionName": collection_name,
             "data": [query_vector],
@@ -412,7 +453,6 @@ impl MilvusClient {
         if ids.is_empty() {
             return Ok(());
         }
-        self.ensure_loaded(collection_name).await?;
         let filter = format!(
             "id in [{}]",
             ids.iter()

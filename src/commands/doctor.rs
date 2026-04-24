@@ -113,6 +113,51 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
         }
     }
 
+    match engine.vector_hygiene_report().await {
+        Ok(report) => {
+            print_check(
+                "vector collections",
+                true,
+                format!(
+                    "configured={} present={} loaded={}/{}",
+                    report.expected_collections,
+                    report.agent_context_collections.len(),
+                    report.loaded_collections.len(),
+                    report.recommended_loaded_collection_limit
+                ),
+            );
+            if !report.stale_collections.is_empty() {
+                print_warning(
+                    "stale vector collections",
+                    format!(
+                        "{} unconfigured collection(s): {}",
+                        report.stale_collections.len(),
+                        format_collection_list(&report.stale_collections)
+                    ),
+                );
+            }
+            if report.loaded_collections.len() > report.recommended_loaded_collection_limit {
+                print_warning(
+                    "loaded vector collections",
+                    format!(
+                        "{} loaded collection(s) exceeds recommended limit {}; refresh/reindex now releases indexing loads, but stale or broad semantic searches can still keep Milvus warm: {}",
+                        report.loaded_collections.len(),
+                        report.recommended_loaded_collection_limit,
+                        format_collection_list(&report.loaded_collections)
+                    ),
+                );
+                print_warning(
+                    "vector release",
+                    "run `agent-context release-vector-collections` to unload warm Milvus collections without deleting indexes".to_string(),
+                );
+            }
+        }
+        Err(error) => print_warning(
+            "vector collections",
+            format!("unable to inspect Milvus vector hygiene: {error}"),
+        ),
+    }
+
     match homebrew_service_status()? {
         Some(status) if status.status == "started" => print_check(
             "brew service",
@@ -203,4 +248,17 @@ fn print_check(name: &str, ok: bool, detail: String) {
 
 fn print_warning(name: &str, detail: String) {
     println!("[warn] {name}: {detail}");
+}
+
+fn format_collection_list(collections: &[String]) -> String {
+    const MAX_NAMES: usize = 5;
+    let mut names = collections
+        .iter()
+        .take(MAX_NAMES)
+        .cloned()
+        .collect::<Vec<_>>();
+    if collections.len() > MAX_NAMES {
+        names.push(format!("... and {} more", collections.len() - MAX_NAMES));
+    }
+    names.join(", ")
 }

@@ -324,6 +324,9 @@ Setup and repair:
 - `agent-context doctor`
 - `agent-context install-hook <repo>`
 - `agent-context print-mcp-config --client codex|claude|copilot`
+- `agent-context prune-stale-vector-collections` (dry-run)
+- `agent-context prune-stale-vector-collections --apply`
+- `agent-context release-vector-collections`
 
 Indexing and serving:
 
@@ -390,6 +393,8 @@ If an agent is performing installation or recovery:
 
 - prefer absolute repo paths
 - run `doctor` before and after service installation
+- if `doctor` reports stale vector collections, run `prune-stale-vector-collections` first, then rerun with `--apply` after reviewing the names
+- if `doctor` reports too many loaded vector collections, run `release-vector-collections`; it unloads Milvus memory without deleting indexes
 - use `print-mcp-config` instead of hand-writing client snippets
 - assume provider or model changes require `reindex-all`
 - prefer `install-hook` over manual hook editing
