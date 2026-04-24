@@ -49,6 +49,7 @@ const SEARCH_ROOT_VERSION: &str = "v1";
 const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
 const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
 const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
+const REMOVED_REPO_INDEX_STATUS: &str = "removed";
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -737,12 +738,38 @@ impl Engine {
         custom_extensions: &[String],
         ignore_patterns: &[String],
     ) -> Result<ScopeIndexResult> {
-        self.ensure_index_identity(force).await?;
-        self.persist_index_identity().await?;
         let mut results = Vec::new();
         let mut has_errors = false;
+        let mut existing_repos = Vec::new();
 
         for repo in scope.repos {
+            if repo.is_absolute() && !repo.exists() {
+                match self.clear_removed_repo(&repo, force).await {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        has_errors = true;
+                        results.push(RepoIndexResult {
+                            repo: repo.display().to_string(),
+                            indexed_files: None,
+                            total_chunks: None,
+                            index_status: Some("failed".to_string()),
+                            full_reindex: force,
+                            changes: RepoChangeSummary::default(),
+                            error: Some(error.to_string()),
+                        });
+                    }
+                }
+            } else {
+                existing_repos.push(repo);
+            }
+        }
+
+        if !existing_repos.is_empty() {
+            self.ensure_index_identity(force).await?;
+            self.persist_index_identity().await?;
+        }
+
+        for repo in existing_repos {
             match self
                 .index_repo(&repo, force, splitter, custom_extensions, ignore_patterns)
                 .await
@@ -1377,6 +1404,10 @@ impl Engine {
             if existing.status != "indexed" {
                 continue;
             }
+            if repo.is_absolute() && !repo.exists() {
+                refreshed.push(self.clear_removed_repo(&repo, false).await?);
+                continue;
+            }
 
             let repo_path = repo.clone();
             let Ok(fingerprint) =
@@ -1434,6 +1465,10 @@ impl Engine {
         custom_extensions: &[String],
         ignore_patterns: &[String],
     ) -> Result<RepoIndexResult> {
+        validate_absolute_repo_path(repo)?;
+        if !repo.exists() {
+            return self.clear_removed_repo(repo, force).await;
+        }
         validate_repo_path(repo)?;
         let repo_key = repo.display().to_string();
         self.inner
@@ -1780,8 +1815,29 @@ impl Engine {
         }
     }
 
+    async fn clear_removed_repo(&self, repo: &Path, force: bool) -> Result<RepoIndexResult> {
+        let removed_files = self.previous_indexed_file_count(repo).await;
+        self.clear_repo_indexes(repo).await?;
+        Ok(removed_repo_index_result(repo, removed_files, force))
+    }
+
+    async fn previous_indexed_file_count(&self, repo: &Path) -> u64 {
+        let merkle_path = merkle_snapshot_path(&self.inner.config.merkle_dir(), repo);
+        if !merkle_path.exists() {
+            return 0;
+        }
+        load_merkle_snapshot(&merkle_path)
+            .await
+            .map(|snapshot| snapshot.file_hashes.len() as u64)
+            .unwrap_or(0)
+    }
+
     async fn clear_repo(&self, repo: &Path) -> Result<()> {
-        validate_repo_path(repo)?;
+        validate_absolute_repo_path(repo)?;
+        self.clear_repo_indexes(repo).await
+    }
+
+    async fn clear_repo_indexes(&self, repo: &Path) -> Result<()> {
         let repo_key = repo.display().to_string();
         let collection_name = collection_name(repo);
         let symbol_collection_name = symbol_collection_name(repo);
@@ -2624,6 +2680,22 @@ fn vector_changed_file_count(changes: &RepoChangeSummary) -> u64 {
         .saturating_add(changes.removed)
 }
 
+fn removed_repo_index_result(repo: &Path, removed_files: u64, force: bool) -> RepoIndexResult {
+    RepoIndexResult {
+        repo: repo.display().to_string(),
+        indexed_files: None,
+        total_chunks: None,
+        index_status: Some(REMOVED_REPO_INDEX_STATUS.to_string()),
+        full_reindex: force,
+        changes: RepoChangeSummary {
+            added: 0,
+            modified: 0,
+            removed: removed_files,
+        },
+        error: None,
+    }
+}
+
 pub fn chunk_id(relative_path: &str, start_line: u64, end_line: u64, content: &str) -> String {
     let digest = xxhash_rust::xxh3::xxh3_128(
         format!("{relative_path}:{start_line}:{end_line}:{content}").as_bytes(),
@@ -2771,14 +2843,19 @@ pub fn render_status_text(result: &StatusReport) -> String {
 }
 
 fn validate_repo_path(repo: &Path) -> Result<()> {
-    if !repo.is_absolute() {
-        anyhow::bail!("repo path must be absolute: {}", repo.display());
-    }
+    validate_absolute_repo_path(repo)?;
     if !repo.exists() {
         anyhow::bail!("repo path does not exist: {}", repo.display());
     }
     if !repo.is_dir() {
         anyhow::bail!("repo path is not a directory: {}", repo.display());
+    }
+    Ok(())
+}
+
+fn validate_absolute_repo_path(repo: &Path) -> Result<()> {
+    if !repo.is_absolute() {
+        anyhow::bail!("repo path must be absolute: {}", repo.display());
     }
     Ok(())
 }
@@ -3786,9 +3863,9 @@ mod tests {
         LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode, SearchRequest,
         build_chunk_context_snippet, build_root_hash, chunk_id, classify_query, collection_name,
         diff_files, expected_vector_collections, hash_text_like_file, index_status_for_coverage,
-        is_agent_context_vector_collection, plan_search, run_low_priority_blocking, scan_repo,
-        stale_vector_collections, symbol_collection_name, vector_flush_needed,
-        vector_release_needed,
+        is_agent_context_vector_collection, plan_search, removed_repo_index_result,
+        run_low_priority_blocking, scan_repo, stale_vector_collections, symbol_collection_name,
+        validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
     };
     use crate::config::SearchConfig;
     use std::collections::BTreeMap;
@@ -3879,6 +3956,24 @@ mod tests {
                 removed: 0,
             }
         ));
+    }
+
+    #[test]
+    fn removed_repo_index_result_reports_cleanup_without_error() {
+        let result = removed_repo_index_result(Path::new("/tmp/deleted-repo"), 42, false);
+
+        assert_eq!(result.repo, "/tmp/deleted-repo");
+        assert_eq!(result.index_status.as_deref(), Some("removed"));
+        assert_eq!(result.changes.removed, 42);
+        assert!(result.indexed_files.is_none());
+        assert!(result.total_chunks.is_none());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn absolute_validation_allows_missing_paths_for_cleanup() {
+        assert!(validate_absolute_repo_path(Path::new("/tmp/deleted-repo")).is_ok());
+        assert!(validate_absolute_repo_path(Path::new("relative/repo")).is_err());
     }
 
     #[test]
