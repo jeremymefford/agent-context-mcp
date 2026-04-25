@@ -443,13 +443,10 @@ impl IndexCompletionStatus {
 fn index_status_for_coverage(
     processing_status: IndexCompletionStatus,
     coverage: IndexCoverage,
-    current_file_count: usize,
 ) -> String {
     if coverage.indexed_files == 0 && coverage.total_chunks == 0 {
         "empty".to_string()
-    } else if processing_status == IndexCompletionStatus::LimitReached
-        || coverage.indexed_files < current_file_count as u64
-    {
+    } else if processing_status == IndexCompletionStatus::LimitReached {
         IndexCompletionStatus::LimitReached.as_str().to_string()
     } else {
         IndexCompletionStatus::Completed.as_str().to_string()
@@ -1756,8 +1753,7 @@ impl Engine {
                     });
                 }
                 let fingerprint = fingerprint_repo(repo).ok();
-                let index_status =
-                    index_status_for_coverage(processing.status, coverage, current_files.len());
+                let index_status = index_status_for_coverage(processing.status, coverage);
                 self.inner
                     .snapshot
                     .update(|snapshot| {
@@ -4152,18 +4148,18 @@ mod tests {
     }
 
     #[test]
-    fn index_status_uses_total_coverage_not_last_incremental_delta() {
+    fn index_status_only_reports_limit_when_processing_hits_chunk_limit() {
         let coverage = IndexCoverage {
             indexed_files: 561,
             total_chunks: 16_448,
         };
 
         assert_eq!(
-            index_status_for_coverage(IndexCompletionStatus::Completed, coverage, 561),
+            index_status_for_coverage(IndexCompletionStatus::Completed, coverage),
             "completed"
         );
         assert_eq!(
-            index_status_for_coverage(IndexCompletionStatus::Completed, coverage, 600),
+            index_status_for_coverage(IndexCompletionStatus::LimitReached, coverage),
             "limit_reached"
         );
         assert_eq!(
@@ -4173,7 +4169,6 @@ mod tests {
                     indexed_files: 0,
                     total_chunks: 0,
                 },
-                0,
             ),
             "empty"
         );

@@ -66,6 +66,9 @@ enum Command {
     ReleaseVectorCollections,
     /// Incrementally refresh a single codebase or group
     RefreshOne {
+        /// Clear and fully reindex this repo or group
+        #[arg(long)]
+        force: bool,
         /// Absolute path to a repo or configured group id
         path: String,
     },
@@ -134,9 +137,9 @@ async fn main() -> Result<()> {
             let cfg = load_config(cli.config.as_deref())?;
             commands::release_vector_collections::run(&cfg).await
         }
-        Command::RefreshOne { path } => {
+        Command::RefreshOne { force, path } => {
             let cfg = load_config(cli.config.as_deref())?;
-            commands::refresh_one::run(&cfg, &path).await
+            commands::refresh_one::run(&cfg, &path, force).await
         }
         Command::RefreshAll => {
             let cfg = load_config(cli.config.as_deref())?;
