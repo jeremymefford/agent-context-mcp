@@ -1,6 +1,7 @@
 pub mod embedding;
 pub mod freshness;
 pub mod lexical;
+pub mod live_files;
 pub mod milvus;
 pub mod splitter;
 pub mod symbols;
@@ -31,6 +32,7 @@ use self::lexical::{
     ChunkIndexDoc, ChunkSearchHit as LexicalChunkSearchHit, ChunkSearchRequest, LocalIndexStore,
     QueryFlavor, SymbolIndexDoc, SymbolSearchRequest,
 };
+use self::live_files::{LiveFileSnapshot, LiveFileStore, TextMatch};
 use self::milvus::{MilvusClient, SearchDocument, VectorDocument};
 use self::splitter::{
     CodeChunk, SplitterKind, default_supported_extensions, language_for_extension, split_text,
@@ -50,6 +52,10 @@ const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
 const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
 const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
 const REMOVED_REPO_INDEX_STATUS: &str = "removed";
+const LIVE_FILE_CACHE_LIMIT: usize = 64;
+const SEARCH_TEXT_SHORTLIST_LIMIT: usize = 64;
+const SEARCH_TEXT_FALLBACK_MAX_FILES: usize = 64;
+const SEARCH_TEXT_PREVIEW_CHARS: usize = 180;
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -66,6 +72,7 @@ struct EngineInner {
     milvus: MilvusClient,
     embedding: EmbeddingClient,
     local_index: LocalIndexStore,
+    live_files: LiveFileStore,
     symbol_store: SymbolStore,
     search_budgets: SearchBudgets,
 }
@@ -205,6 +212,28 @@ pub struct SymbolSearchResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TextSearchResponse {
+    pub scope: String,
+    pub label: String,
+    pub partial: bool,
+    pub repo_errors: Vec<RepoSearchError>,
+    pub hits: Vec<TextSearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSearchHit {
+    pub repo: String,
+    pub repo_label: String,
+    pub relative_path: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub preview: String,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SymbolSearchHit {
     pub symbol_id: String,
     pub repo: String,
@@ -222,6 +251,93 @@ pub struct SymbolSearchHit {
     pub indexed_at: String,
     pub file_hash: String,
     pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareEditTargetResponse {
+    pub status: EditTargetStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anchors: Vec<EditTargetAnchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_quality: Option<AnchorQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_type: Option<EditResolutionType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_file_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<EditTargetCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_end_line: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EditTargetStatus {
+    Ready,
+    Ambiguous,
+    NeedsNarrowing,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditResolutionType {
+    Symbol,
+    LineHint,
+    Literal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorQuality {
+    Strong,
+    Weak,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditTargetAnchor {
+    pub line: u64,
+    pub text: String,
+    pub unique_in_file: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditTargetCandidate {
+    pub repo: String,
+    pub repo_label: String,
+    pub relative_path: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,6 +392,33 @@ pub struct SymbolSearchScopeRequest {
     pub language: Option<String>,
     pub kind: Option<String>,
     pub container: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextSearchScopeRequest {
+    pub query: String,
+    pub limit: usize,
+    pub path_prefix: Option<String>,
+    pub language: Option<String>,
+    pub file: Option<String>,
+    pub extension_filter: Vec<String>,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub context_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrepareEditTargetRequest {
+    pub repo: Option<String>,
+    pub file: Option<String>,
+    pub symbol_id: Option<String>,
+    pub line_hint: Option<u64>,
+    pub query: Option<String>,
+    pub occurrence: Option<usize>,
+    pub before_lines: usize,
+    pub after_lines: usize,
+    pub max_lines: usize,
+    pub anchor_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -370,6 +513,33 @@ struct RepoSearchHit {
     lexical_score: f64,
     symbol_score: f64,
     combined_score: f64,
+}
+
+type LiveFileRequestCache = HashMap<String, Arc<LiveFileSnapshot>>;
+
+#[derive(Debug, Clone)]
+struct IndexedFileMetadata {
+    indexed_at: Option<String>,
+    indexed_file_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEditSymbol {
+    repo: PathBuf,
+    symbol: IndexedSymbol,
+}
+
+#[derive(Clone)]
+struct ReadyEditTarget {
+    snapshot: Arc<LiveFileSnapshot>,
+    start_line: u64,
+    end_line: u64,
+    resolution_type: EditResolutionType,
+    symbol_id: Option<String>,
+    indexed_metadata: IndexedFileMetadata,
+    truncated: bool,
+    symbol_signature_line: Option<u64>,
+    query: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -625,6 +795,7 @@ impl Engine {
                     config.search_index_dir(),
                     config.search.max_warm_repos,
                 ),
+                live_files: LiveFileStore::new(LIVE_FILE_CACHE_LIMIT),
                 symbol_store: SymbolStore::new(config.symbol_db_path()),
                 search_budgets: SearchBudgets::new(&config.search),
             }),
@@ -1145,6 +1316,85 @@ impl Engine {
         })
     }
 
+    pub async fn search_text_scope(
+        &self,
+        scope: ResolvedScope,
+        request: TextSearchScopeRequest,
+    ) -> Result<TextSearchResponse> {
+        if request.query.trim().is_empty() {
+            bail!("search_text requires a non-empty `query`");
+        }
+        if request.file.is_none() && request.path_prefix.is_none() {
+            bail!("search_text requires `file` or `pathPrefix`");
+        }
+        let _request_permit = self.acquire_request_budget().await?;
+        let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
+        let scope_repos = scope.repos;
+
+        let mut stream = futures::stream::iter(scope_repos.into_iter().map(|repo| {
+            let engine = self.clone();
+            let request = request.clone();
+            let repo_name = repo.display().to_string();
+            async move {
+                let result = async {
+                    let _repo_permit = engine.acquire_repo_search_budget().await?;
+                    engine.search_text_repo(&repo, &request).await
+                }
+                .await;
+                (repo_name, result)
+            }
+        }))
+        .buffer_unordered(parallelism);
+
+        let mut repo_errors = Vec::new();
+        let mut hits = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                (_repo, Ok(repo_hits)) => hits.extend(repo_hits),
+                (repo, Err(error)) => repo_errors.push(RepoSearchError {
+                    repo,
+                    error: error.to_string(),
+                }),
+            }
+        }
+
+        hits.sort_by(|left, right| {
+            left.relative_path
+                .cmp(&right.relative_path)
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.repo_label.cmp(&right.repo_label))
+        });
+        hits.truncate(request.limit);
+
+        Ok(TextSearchResponse {
+            scope: scope.id,
+            label: scope.label,
+            partial: !repo_errors.is_empty(),
+            repo_errors,
+            hits,
+        })
+    }
+
+    pub async fn prepare_edit_target(
+        &self,
+        scope: ResolvedScope,
+        request: PrepareEditTargetRequest,
+    ) -> Result<PrepareEditTargetResponse> {
+        if request.symbol_id.is_none() && request.file.is_none() {
+            bail!("prepare_edit_target requires `symbolId` or `file`");
+        }
+        if request.file.is_some() && request.line_hint.is_none() && request.query.is_none() {
+            bail!("prepare_edit_target requires `lineHint` or `query` when `file` is provided");
+        }
+        let _request_permit = self.acquire_request_budget().await?;
+        if let Some(symbol_id) = &request.symbol_id {
+            return self
+                .prepare_symbol_edit_target(scope, symbol_id, &request)
+                .await;
+        }
+        self.prepare_file_edit_target(scope, &request).await
+    }
+
     pub async fn get_file_outline(
         &self,
         scope: ResolvedScope,
@@ -1195,6 +1445,770 @@ impl Engine {
             file: normalized_file,
             matches,
         })
+    }
+
+    async fn search_text_repo(
+        &self,
+        repo: &Path,
+        request: &TextSearchScopeRequest,
+    ) -> Result<Vec<TextSearchHit>> {
+        let candidate_files = self.search_text_candidate_files(repo, request).await?;
+        let mut cache = LiveFileRequestCache::new();
+        let mut hits = Vec::new();
+
+        for relative_path in candidate_files {
+            let snapshot = match self.load_live_file(repo, &relative_path, &mut cache).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if request.file.is_none() {
+                        continue;
+                    }
+                    if !live_file_exists(repo, &relative_path)? {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let matches = snapshot.find_literal_matches(
+                &request.query,
+                request.case_sensitive,
+                request.whole_word,
+                request.limit.saturating_mul(4).max(8),
+            )?;
+            for matched in matches {
+                let preview_start = matched
+                    .start_line
+                    .saturating_sub(request.context_lines as u64)
+                    .max(1);
+                let preview_end =
+                    (matched.end_line + request.context_lines as u64).min(snapshot.total_lines());
+                let preview = snapshot
+                    .slice_lines(preview_start, preview_end)
+                    .map(|text| compact_preview(text, SEARCH_TEXT_PREVIEW_CHARS))
+                    .unwrap_or_default();
+                hits.push(TextSearchHit {
+                    repo: repo.display().to_string(),
+                    repo_label: repo_basename(&repo.display().to_string()),
+                    relative_path: snapshot.relative_path.clone(),
+                    start_line: matched.start_line,
+                    end_line: matched.end_line,
+                    preview,
+                    stale: false,
+                });
+                if hits.len() >= request.limit.saturating_mul(4) {
+                    break;
+                }
+            }
+            if hits.len() >= request.limit.saturating_mul(4) {
+                break;
+            }
+        }
+
+        Ok(hits)
+    }
+
+    async fn search_text_candidate_files(
+        &self,
+        repo: &Path,
+        request: &TextSearchScopeRequest,
+    ) -> Result<Vec<String>> {
+        if let Some(file) = &request.file {
+            return Ok(vec![normalize_relative_path(file)]);
+        }
+
+        let lexical_hits = self
+            .run_search_lexical_blocking("search_text_shortlist", {
+                let repo_path = repo.to_path_buf();
+                let local_index = self.inner.local_index.clone();
+                let request = ChunkSearchRequest {
+                    query: request.query.clone(),
+                    limit: SEARCH_TEXT_SHORTLIST_LIMIT,
+                    flavor: query_flavor(classify_query(&request.query)),
+                    path_prefix: request.path_prefix.clone(),
+                    language: request.language.clone(),
+                    file: None,
+                    extension_filter: request.extension_filter.clone(),
+                };
+                move || local_index.search_chunks(&repo_path, &request)
+            })
+            .await?;
+        let mut files = lexical_hits
+            .into_iter()
+            .map(|hit| hit.relative_path)
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        if !files.is_empty() {
+            return Ok(files);
+        }
+
+        let path_prefix = request.path_prefix.clone();
+        let language = request.language.clone();
+        let extension_filter = request.extension_filter.clone();
+        let repo_path = repo.to_path_buf();
+        let fallback: Vec<String> = self
+            .run_search_lexical_blocking("search_text_fallback_candidates", move || {
+                collect_live_candidate_files(
+                    &repo_path,
+                    path_prefix.as_deref(),
+                    language.as_deref(),
+                    &extension_filter,
+                )
+            })
+            .await?;
+        if fallback.len() <= SEARCH_TEXT_FALLBACK_MAX_FILES {
+            return Ok(fallback);
+        }
+        Ok(Vec::new())
+    }
+
+    async fn prepare_symbol_edit_target(
+        &self,
+        scope: ResolvedScope,
+        symbol_id: &str,
+        request: &PrepareEditTargetRequest,
+    ) -> Result<PrepareEditTargetResponse> {
+        let Some(repo) = self.resolve_prepare_repo(&scope, request.repo.as_deref(), true)? else {
+            return Ok(PrepareEditTargetResponse {
+                status: EditTargetStatus::NotFound,
+                repo: None,
+                repo_label: None,
+                relative_path: None,
+                start_line: None,
+                end_line: None,
+                content: None,
+                anchors: Vec::new(),
+                anchor_quality: None,
+                resolution_type: None,
+                file_hash: None,
+                indexed: None,
+                stale: None,
+                indexed_at: None,
+                indexed_file_hash: None,
+                symbol_id: Some(symbol_id.to_string()),
+                truncated: None,
+                candidates: Vec::new(),
+                symbol_start_line: None,
+                symbol_end_line: None,
+            });
+        };
+
+        let Some(resolved) = self.resolve_symbol_in_repo(&repo, symbol_id).await? else {
+            return Ok(PrepareEditTargetResponse {
+                status: EditTargetStatus::NotFound,
+                repo: Some(repo.display().to_string()),
+                repo_label: Some(repo_basename(&repo.display().to_string())),
+                relative_path: None,
+                start_line: None,
+                end_line: None,
+                content: None,
+                anchors: Vec::new(),
+                anchor_quality: None,
+                resolution_type: None,
+                file_hash: None,
+                indexed: Some(false),
+                stale: Some(false),
+                indexed_at: None,
+                indexed_file_hash: None,
+                symbol_id: Some(symbol_id.to_string()),
+                truncated: None,
+                candidates: Vec::new(),
+                symbol_start_line: None,
+                symbol_end_line: None,
+            });
+        };
+
+        let mut cache = LiveFileRequestCache::new();
+        let snapshot = self
+            .load_live_file(&resolved.repo, &resolved.symbol.relative_path, &mut cache)
+            .await?;
+        let indexed_metadata = IndexedFileMetadata {
+            indexed_at: Some(resolved.symbol.indexed_at.clone()),
+            indexed_file_hash: Some(resolved.symbol.file_hash.clone()),
+        };
+
+        if let Some(query) = request.query.as_deref() {
+            let matches = snapshot
+                .find_literal_matches(query, true, false, usize::MAX)?
+                .into_iter()
+                .filter(|matched| {
+                    matched.start_line >= resolved.symbol.start_line
+                        && matched.end_line <= resolved.symbol.end_line
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Ok(not_found_prepare_response(
+                    &resolved.repo,
+                    Some(&resolved.symbol.relative_path),
+                    Some(symbol_id),
+                ));
+            }
+            if let Some(ready) = self.pick_ready_match_target(
+                &snapshot,
+                &resolved.symbol,
+                &indexed_metadata,
+                &matches,
+                request,
+                EditResolutionType::Literal,
+            )? {
+                return self.build_ready_prepare_response(ready, request).await;
+            }
+            return Ok(self.build_ambiguous_prepare_response(
+                &resolved.repo,
+                &snapshot,
+                matches,
+                request,
+            ));
+        }
+
+        let symbol_lines = span_line_count(resolved.symbol.start_line, resolved.symbol.end_line);
+        if symbol_lines <= request.max_lines as u64 {
+            return self
+                .build_ready_prepare_response(
+                    ReadyEditTarget {
+                        snapshot,
+                        start_line: resolved.symbol.start_line,
+                        end_line: resolved.symbol.end_line,
+                        resolution_type: EditResolutionType::Symbol,
+                        symbol_id: Some(resolved.symbol.symbol_id.clone()),
+                        indexed_metadata,
+                        truncated: false,
+                        symbol_signature_line: Some(resolved.symbol.start_line),
+                        query: None,
+                    },
+                    request,
+                )
+                .await;
+        }
+
+        if let Some(line_hint) = request.line_hint {
+            let (start_line, end_line, truncated) = bounded_window(
+                snapshot.total_lines(),
+                line_hint.clamp(resolved.symbol.start_line, resolved.symbol.end_line),
+                line_hint.clamp(resolved.symbol.start_line, resolved.symbol.end_line),
+                request.before_lines,
+                request.after_lines,
+                request.max_lines,
+            );
+            return self
+                .build_ready_prepare_response(
+                    ReadyEditTarget {
+                        snapshot,
+                        start_line,
+                        end_line,
+                        resolution_type: EditResolutionType::LineHint,
+                        symbol_id: Some(resolved.symbol.symbol_id.clone()),
+                        indexed_metadata,
+                        truncated: truncated
+                            || start_line != resolved.symbol.start_line
+                            || end_line != resolved.symbol.end_line,
+                        symbol_signature_line: Some(resolved.symbol.start_line),
+                        query: None,
+                    },
+                    request,
+                )
+                .await;
+        }
+
+        let header_end = (resolved.symbol.start_line + request.max_lines as u64 - 1)
+            .min(resolved.symbol.end_line)
+            .min(snapshot.total_lines());
+        let content = snapshot
+            .slice_lines(resolved.symbol.start_line, header_end)
+            .map(ToString::to_string);
+        Ok(PrepareEditTargetResponse {
+            status: EditTargetStatus::NeedsNarrowing,
+            repo: Some(resolved.repo.display().to_string()),
+            repo_label: Some(repo_basename(&resolved.repo.display().to_string())),
+            relative_path: Some(resolved.symbol.relative_path.clone()),
+            start_line: Some(resolved.symbol.start_line),
+            end_line: Some(header_end),
+            content,
+            anchors: Vec::new(),
+            anchor_quality: None,
+            resolution_type: Some(EditResolutionType::Symbol),
+            file_hash: Some(snapshot.file_hash.clone()),
+            indexed: Some(true),
+            stale: Some(snapshot.file_hash != resolved.symbol.file_hash),
+            indexed_at: Some(resolved.symbol.indexed_at.clone()),
+            indexed_file_hash: Some(resolved.symbol.file_hash.clone()),
+            symbol_id: Some(resolved.symbol.symbol_id.clone()),
+            truncated: Some(true),
+            candidates: Vec::new(),
+            symbol_start_line: Some(resolved.symbol.start_line),
+            symbol_end_line: Some(resolved.symbol.end_line),
+        })
+    }
+
+    async fn prepare_file_edit_target(
+        &self,
+        scope: ResolvedScope,
+        request: &PrepareEditTargetRequest,
+    ) -> Result<PrepareEditTargetResponse> {
+        let file = request
+            .file
+            .as_deref()
+            .map(normalize_relative_path)
+            .context("prepare_edit_target requires `file` when `symbolId` is not provided")?;
+        let repos = self.resolve_prepare_repos(&scope, request.repo.as_deref())?;
+        let mut candidates = Vec::new();
+        let mut cache = LiveFileRequestCache::new();
+
+        for repo in repos {
+            let _repo_permit = self.acquire_repo_search_budget().await?;
+            let snapshot = match self.load_live_file(&repo, &file, &mut cache).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => continue,
+            };
+            if let Some(query) = request.query.as_deref() {
+                let matches = snapshot
+                    .find_literal_matches(query, true, false, usize::MAX)?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if matches.is_empty() {
+                    continue;
+                }
+                let indexed_metadata = self
+                    .indexed_file_metadata(&repo, &snapshot.relative_path)
+                    .await?;
+                if let Some(ready) = self.pick_ready_file_match_target(
+                    &snapshot,
+                    indexed_metadata.clone(),
+                    &matches,
+                    request,
+                )? {
+                    candidates.push(ready);
+                } else {
+                    return Ok(
+                        self.build_ambiguous_prepare_response(&repo, &snapshot, matches, request)
+                    );
+                }
+                continue;
+            }
+
+            let line_hint = request.line_hint.context(
+                "prepare_edit_target requires `lineHint` or `query` when `file` is provided",
+            )?;
+            let indexed_metadata = self
+                .indexed_file_metadata(&repo, &snapshot.relative_path)
+                .await?;
+            let file_symbols = self
+                .load_file_outline_symbols(&repo.display().to_string(), &snapshot.relative_path)
+                .await?;
+            if let Some(symbol) = narrowest_covering_symbol(&file_symbols, line_hint) {
+                let symbol_lines = span_line_count(symbol.start_line, symbol.end_line);
+                if symbol_lines <= request.max_lines as u64 {
+                    candidates.push(ReadyEditTarget {
+                        snapshot: snapshot.clone(),
+                        start_line: symbol.start_line,
+                        end_line: symbol.end_line,
+                        resolution_type: EditResolutionType::Symbol,
+                        symbol_id: Some(symbol.symbol_id.clone()),
+                        indexed_metadata,
+                        truncated: false,
+                        symbol_signature_line: Some(symbol.start_line),
+                        query: None,
+                    });
+                } else {
+                    let (start_line, end_line, truncated) = bounded_window(
+                        snapshot.total_lines(),
+                        line_hint,
+                        line_hint,
+                        request.before_lines,
+                        request.after_lines,
+                        request.max_lines,
+                    );
+                    candidates.push(ReadyEditTarget {
+                        snapshot: snapshot.clone(),
+                        start_line,
+                        end_line,
+                        resolution_type: EditResolutionType::LineHint,
+                        symbol_id: Some(symbol.symbol_id.clone()),
+                        indexed_metadata,
+                        truncated: truncated
+                            || start_line != symbol.start_line
+                            || end_line != symbol.end_line,
+                        symbol_signature_line: Some(symbol.start_line),
+                        query: None,
+                    });
+                }
+            } else {
+                let (start_line, end_line, truncated) = bounded_window(
+                    snapshot.total_lines(),
+                    line_hint,
+                    line_hint,
+                    request.before_lines,
+                    request.after_lines,
+                    request.max_lines,
+                );
+                candidates.push(ReadyEditTarget {
+                    snapshot,
+                    start_line,
+                    end_line,
+                    resolution_type: EditResolutionType::LineHint,
+                    symbol_id: None,
+                    indexed_metadata,
+                    truncated,
+                    symbol_signature_line: None,
+                    query: None,
+                });
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(not_found_prepare_response_for_file(&file));
+        }
+        if candidates.len() == 1 {
+            return self
+                .build_ready_prepare_response(candidates.remove(0), request)
+                .await;
+        }
+        Ok(PrepareEditTargetResponse {
+            status: EditTargetStatus::Ambiguous,
+            repo: None,
+            repo_label: None,
+            relative_path: Some(file),
+            start_line: None,
+            end_line: None,
+            content: None,
+            anchors: Vec::new(),
+            anchor_quality: None,
+            resolution_type: None,
+            file_hash: None,
+            indexed: None,
+            stale: None,
+            indexed_at: None,
+            indexed_file_hash: None,
+            symbol_id: None,
+            truncated: None,
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| EditTargetCandidate {
+                    repo: candidate.snapshot.repo.display().to_string(),
+                    repo_label: repo_basename(&candidate.snapshot.repo.display().to_string()),
+                    relative_path: candidate.snapshot.relative_path.clone(),
+                    start_line: candidate.start_line,
+                    end_line: candidate.end_line,
+                    preview: candidate
+                        .snapshot
+                        .slice_lines(candidate.start_line, candidate.end_line)
+                        .map(|text| compact_preview(text, SEARCH_TEXT_PREVIEW_CHARS))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            symbol_start_line: None,
+            symbol_end_line: None,
+        })
+    }
+
+    async fn build_ready_prepare_response(
+        &self,
+        ready: ReadyEditTarget,
+        request: &PrepareEditTargetRequest,
+    ) -> Result<PrepareEditTargetResponse> {
+        let content = ready
+            .snapshot
+            .slice_lines(ready.start_line, ready.end_line)
+            .map(ToString::to_string)
+            .context("selected edit target lines are unavailable")?;
+        let anchors = select_edit_anchors(
+            &ready.snapshot,
+            ready.start_line,
+            ready.end_line,
+            request.anchor_count,
+            ready.query.as_deref(),
+            ready.symbol_signature_line,
+        );
+        let anchor_quality = if anchors.iter().any(|anchor| anchor.unique_in_file) {
+            AnchorQuality::Strong
+        } else {
+            AnchorQuality::Weak
+        };
+        let indexed = ready.indexed_metadata.indexed_file_hash.is_some();
+        let stale = ready
+            .indexed_metadata
+            .indexed_file_hash
+            .as_deref()
+            .is_some_and(|hash| hash != ready.snapshot.file_hash);
+        Ok(PrepareEditTargetResponse {
+            status: EditTargetStatus::Ready,
+            repo: Some(ready.snapshot.repo.display().to_string()),
+            repo_label: Some(repo_basename(&ready.snapshot.repo.display().to_string())),
+            relative_path: Some(ready.snapshot.relative_path.clone()),
+            start_line: Some(ready.start_line),
+            end_line: Some(ready.end_line),
+            content: Some(content),
+            anchors,
+            anchor_quality: Some(anchor_quality),
+            resolution_type: Some(ready.resolution_type),
+            file_hash: Some(ready.snapshot.file_hash.clone()),
+            indexed: Some(indexed),
+            stale: Some(stale),
+            indexed_at: ready.indexed_metadata.indexed_at,
+            indexed_file_hash: ready.indexed_metadata.indexed_file_hash,
+            symbol_id: ready.symbol_id,
+            truncated: Some(ready.truncated),
+            candidates: Vec::new(),
+            symbol_start_line: None,
+            symbol_end_line: None,
+        })
+    }
+
+    async fn load_live_file(
+        &self,
+        repo: &Path,
+        relative_path: &str,
+        cache: &mut LiveFileRequestCache,
+    ) -> Result<Arc<LiveFileSnapshot>> {
+        let normalized = normalize_relative_path(relative_path);
+        let key = file_freshness_key(repo, &normalized);
+        if let Some(snapshot) = cache.get(&key) {
+            return Ok(snapshot.clone());
+        }
+        let repo_path = repo.to_path_buf();
+        let live_files = self.inner.live_files.clone();
+        let snapshot = self
+            .run_search_lexical_blocking("load_live_file", move || {
+                live_files.load_snapshot(&repo_path, &normalized)
+            })
+            .await?;
+        cache.insert(key, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn indexed_file_metadata(
+        &self,
+        repo: &Path,
+        relative_path: &str,
+    ) -> Result<IndexedFileMetadata> {
+        let repo_path = repo.to_path_buf();
+        let normalized_path = normalize_relative_path(relative_path);
+        let chunk_path = normalized_path.clone();
+        let local_index = self.inner.local_index.clone();
+        let chunk_metadata = self
+            .run_search_lexical_blocking("indexed_file_chunk_metadata", move || {
+                let chunks = local_index.chunks_for_file(&repo_path, &chunk_path)?;
+                Ok::<_, anyhow::Error>(
+                    chunks
+                        .first()
+                        .map(|chunk| IndexedFileMetadata {
+                            indexed_at: Some(chunk.indexed_at.clone()),
+                            indexed_file_hash: Some(chunk.file_hash.clone()),
+                        })
+                        .unwrap_or(IndexedFileMetadata {
+                            indexed_at: None,
+                            indexed_file_hash: None,
+                        }),
+                )
+            })
+            .await?;
+        if chunk_metadata.indexed_file_hash.is_some() {
+            return Ok(chunk_metadata);
+        }
+
+        let repo_key = repo.display().to_string();
+        let symbol_path = normalized_path.clone();
+        let symbol_store = self.inner.symbol_store.clone();
+        self.run_search_lexical_blocking("indexed_file_symbol_metadata", move || {
+            let symbols = symbol_store.file_symbols(&repo_key, &symbol_path)?;
+            Ok::<_, anyhow::Error>(
+                symbols
+                    .first()
+                    .map(|symbol| IndexedFileMetadata {
+                        indexed_at: Some(symbol.indexed_at.clone()),
+                        indexed_file_hash: Some(symbol.file_hash.clone()),
+                    })
+                    .unwrap_or(IndexedFileMetadata {
+                        indexed_at: None,
+                        indexed_file_hash: None,
+                    }),
+            )
+        })
+        .await
+    }
+
+    async fn resolve_symbol_in_repo(
+        &self,
+        repo: &Path,
+        symbol_id: &str,
+    ) -> Result<Option<ResolvedEditSymbol>> {
+        let repo_key = repo.display().to_string();
+        let symbol_id = symbol_id.to_string();
+        let symbol_store = self.inner.symbol_store.clone();
+        let symbol = self
+            .run_search_lexical_blocking("resolve_symbol_for_edit", move || {
+                symbol_store.symbol_by_id(&repo_key, &symbol_id)
+            })
+            .await?;
+        Ok(symbol.map(|symbol| ResolvedEditSymbol {
+            repo: repo.to_path_buf(),
+            symbol,
+        }))
+    }
+
+    fn resolve_prepare_repos(
+        &self,
+        scope: &ResolvedScope,
+        repo_hint: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
+        if let Some(repo) = self.resolve_prepare_repo(scope, repo_hint, false)? {
+            return Ok(vec![repo]);
+        }
+        Ok(scope.repos.clone())
+    }
+
+    fn resolve_prepare_repo(
+        &self,
+        scope: &ResolvedScope,
+        repo_hint: Option<&str>,
+        require_single: bool,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(repo_hint) = repo_hint {
+            let hint = repo_hint.trim();
+            let matches = scope
+                .repos
+                .iter()
+                .filter(|repo| {
+                    repo.display().to_string() == hint
+                        || repo
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| value == hint)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            return match matches.len() {
+                0 => bail!("repo `{hint}` is not part of the selected scope"),
+                1 => Ok(matches.into_iter().next()),
+                _ => bail!("repo `{hint}` is ambiguous within the selected scope"),
+            };
+        }
+        if !require_single {
+            return Ok(None);
+        }
+        match scope.repos.as_slice() {
+            [repo] => Ok(Some(repo.clone())),
+            _ => bail!("repo is required when resolving `symbolId` within a multi-repo scope"),
+        }
+    }
+
+    fn pick_ready_match_target(
+        &self,
+        snapshot: &Arc<LiveFileSnapshot>,
+        symbol: &IndexedSymbol,
+        indexed_metadata: &IndexedFileMetadata,
+        matches: &[TextMatch],
+        request: &PrepareEditTargetRequest,
+        resolution_type: EditResolutionType,
+    ) -> Result<Option<ReadyEditTarget>> {
+        let Some(selected) = select_text_match(matches, request.line_hint, request.occurrence)
+        else {
+            return Ok(None);
+        };
+        let (start_line, end_line, truncated) = bounded_window(
+            snapshot.total_lines(),
+            selected.start_line,
+            selected.end_line,
+            request.before_lines,
+            request.after_lines,
+            request.max_lines,
+        );
+        Ok(Some(ReadyEditTarget {
+            snapshot: snapshot.clone(),
+            start_line,
+            end_line,
+            resolution_type,
+            symbol_id: Some(symbol.symbol_id.clone()),
+            indexed_metadata: indexed_metadata.clone(),
+            truncated: truncated || start_line != symbol.start_line || end_line != symbol.end_line,
+            symbol_signature_line: Some(symbol.start_line),
+            query: request.query.clone(),
+        }))
+    }
+
+    fn pick_ready_file_match_target(
+        &self,
+        snapshot: &Arc<LiveFileSnapshot>,
+        indexed_metadata: IndexedFileMetadata,
+        matches: &[TextMatch],
+        request: &PrepareEditTargetRequest,
+    ) -> Result<Option<ReadyEditTarget>> {
+        let Some(selected) = select_text_match(matches, request.line_hint, request.occurrence)
+        else {
+            return Ok(None);
+        };
+        let (start_line, end_line, truncated) = bounded_window(
+            snapshot.total_lines(),
+            selected.start_line,
+            selected.end_line,
+            request.before_lines,
+            request.after_lines,
+            request.max_lines,
+        );
+        Ok(Some(ReadyEditTarget {
+            snapshot: snapshot.clone(),
+            start_line,
+            end_line,
+            resolution_type: EditResolutionType::Literal,
+            symbol_id: None,
+            indexed_metadata,
+            truncated,
+            symbol_signature_line: None,
+            query: request.query.clone(),
+        }))
+    }
+
+    fn build_ambiguous_prepare_response(
+        &self,
+        repo: &Path,
+        snapshot: &Arc<LiveFileSnapshot>,
+        matches: Vec<TextMatch>,
+        request: &PrepareEditTargetRequest,
+    ) -> PrepareEditTargetResponse {
+        let candidates = matches
+            .into_iter()
+            .map(|matched| {
+                let preview_start = matched
+                    .start_line
+                    .saturating_sub(request.before_lines as u64)
+                    .max(1);
+                let preview_end =
+                    (matched.end_line + request.after_lines as u64).min(snapshot.total_lines());
+                EditTargetCandidate {
+                    repo: repo.display().to_string(),
+                    repo_label: repo_basename(&repo.display().to_string()),
+                    relative_path: snapshot.relative_path.clone(),
+                    start_line: matched.start_line,
+                    end_line: matched.end_line,
+                    preview: snapshot
+                        .slice_lines(preview_start, preview_end)
+                        .map(|text| compact_preview(text, SEARCH_TEXT_PREVIEW_CHARS))
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        PrepareEditTargetResponse {
+            status: EditTargetStatus::Ambiguous,
+            repo: Some(repo.display().to_string()),
+            repo_label: Some(repo_basename(&repo.display().to_string())),
+            relative_path: Some(snapshot.relative_path.clone()),
+            start_line: None,
+            end_line: None,
+            content: None,
+            anchors: Vec::new(),
+            anchor_quality: None,
+            resolution_type: None,
+            file_hash: None,
+            indexed: None,
+            stale: None,
+            indexed_at: None,
+            indexed_file_hash: None,
+            symbol_id: None,
+            truncated: None,
+            candidates,
+            symbol_start_line: None,
+            symbol_end_line: None,
+        }
     }
 
     async fn finalize_search_hits(
@@ -2057,7 +3071,8 @@ impl Engine {
         let authoritative = self
             .run_search_lexical_blocking("load_symbol_rows", {
                 let symbol_store = self.inner.symbol_store.clone();
-                move || symbol_store.symbols_by_ids(&symbol_ids)
+                let repo_key = repo.display().to_string();
+                move || symbol_store.symbols_by_repo_and_ids(&repo_key, &symbol_ids)
             })
             .await?;
         let authoritative = authoritative
@@ -3436,6 +4451,10 @@ fn build_snippet(query: &str, content: &str, max_chars: usize) -> String {
     truncate_for_display(content, max_chars)
 }
 
+fn compact_preview(content: &str, max_chars: usize) -> String {
+    truncate_for_display(content.trim_matches(['\r', '\n']), max_chars)
+}
+
 fn build_chunk_context_snippet(
     chunks: &[self::lexical::ChunkSearchHit],
     target_line: u64,
@@ -3681,6 +4700,363 @@ fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
     builder.build().context("building ignore matcher")
 }
 
+fn collect_live_candidate_files(
+    repo: &Path,
+    path_prefix: Option<&str>,
+    language: Option<&str>,
+    extension_filter: &[String],
+) -> Result<Vec<String>> {
+    let normalized_prefix = path_prefix
+        .map(normalize_relative_path)
+        .filter(|prefix| !prefix.is_empty())
+        .context("search_text fallback requires `pathPrefix`")?;
+    let prefix_path = repo.join(&normalized_prefix);
+    let walk_root = if prefix_path.is_dir() {
+        prefix_path
+    } else {
+        prefix_path
+            .parent()
+            .filter(|parent| parent.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| repo.to_path_buf())
+    };
+
+    let mut files = Vec::new();
+    let mut builder = WalkBuilder::new(&walk_root);
+    builder.hidden(true);
+    builder.git_ignore(true);
+    builder.git_exclude(true);
+    builder.git_global(true);
+    builder.follow_links(false);
+    builder.require_git(false);
+
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let absolute_path = entry.path();
+        let Ok(relative_path) = absolute_path.strip_prefix(repo) else {
+            continue;
+        };
+        let relative_path = relative_path.display().to_string().replace('\\', "/");
+        if !relative_path.starts_with(&normalized_prefix) {
+            continue;
+        }
+        if !path_matches_live_filters(&relative_path, language, extension_filter) {
+            continue;
+        }
+        if hash_text_like_file(absolute_path)?.is_none() {
+            continue;
+        }
+        files.push(relative_path);
+    }
+
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn live_file_exists(repo: &Path, relative_path: &str) -> Result<bool> {
+    let canonical_repo = repo
+        .canonicalize()
+        .with_context(|| format!("resolving repo root {}", repo.display()))?;
+    let normalized_relative_path = normalize_relative_path(relative_path);
+    if normalized_relative_path.is_empty() {
+        return Ok(false);
+    }
+
+    let requested_path = canonical_repo.join(&normalized_relative_path);
+    let metadata = match std::fs::symlink_metadata(&requested_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading metadata for {}", requested_path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+
+    let canonical_file = requested_path
+        .canonicalize()
+        .with_context(|| format!("resolving file {}", requested_path.display()))?;
+    if !canonical_file.starts_with(&canonical_repo) {
+        bail!(
+            "file `{normalized_relative_path}` escapes repo root {}",
+            canonical_repo.display()
+        );
+    }
+
+    Ok(true)
+}
+
+fn path_matches_live_filters(
+    relative_path: &str,
+    language: Option<&str>,
+    extension_filter: &[String],
+) -> bool {
+    let extension = relative_path_extension(relative_path);
+    if !extension_filter.is_empty() && !extension_filter.iter().any(|value| value == &extension) {
+        return false;
+    }
+    if language.is_some_and(|expected| language_for_extension(&extension) != expected) {
+        return false;
+    }
+    !extension.is_empty() && default_supported_extensions().contains(&extension)
+}
+
+fn relative_path_extension(relative_path: &str) -> String {
+    Path::new(relative_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default()
+}
+
+fn not_found_prepare_response(
+    repo: &Path,
+    relative_path: Option<&str>,
+    symbol_id: Option<&str>,
+) -> PrepareEditTargetResponse {
+    PrepareEditTargetResponse {
+        status: EditTargetStatus::NotFound,
+        repo: Some(repo.display().to_string()),
+        repo_label: Some(repo_basename(&repo.display().to_string())),
+        relative_path: relative_path.map(ToString::to_string),
+        start_line: None,
+        end_line: None,
+        content: None,
+        anchors: Vec::new(),
+        anchor_quality: None,
+        resolution_type: None,
+        file_hash: None,
+        indexed: None,
+        stale: None,
+        indexed_at: None,
+        indexed_file_hash: None,
+        symbol_id: symbol_id.map(ToString::to_string),
+        truncated: None,
+        candidates: Vec::new(),
+        symbol_start_line: None,
+        symbol_end_line: None,
+    }
+}
+
+fn not_found_prepare_response_for_file(file: &str) -> PrepareEditTargetResponse {
+    PrepareEditTargetResponse {
+        status: EditTargetStatus::NotFound,
+        repo: None,
+        repo_label: None,
+        relative_path: Some(file.to_string()),
+        start_line: None,
+        end_line: None,
+        content: None,
+        anchors: Vec::new(),
+        anchor_quality: None,
+        resolution_type: None,
+        file_hash: None,
+        indexed: None,
+        stale: None,
+        indexed_at: None,
+        indexed_file_hash: None,
+        symbol_id: None,
+        truncated: None,
+        candidates: Vec::new(),
+        symbol_start_line: None,
+        symbol_end_line: None,
+    }
+}
+
+fn span_line_count(start_line: u64, end_line: u64) -> u64 {
+    end_line.saturating_sub(start_line).saturating_add(1)
+}
+
+fn bounded_window(
+    total_lines: u64,
+    focus_start: u64,
+    focus_end: u64,
+    before_lines: usize,
+    after_lines: usize,
+    max_lines: usize,
+) -> (u64, u64, bool) {
+    if total_lines == 0 {
+        return (0, 0, false);
+    }
+
+    let max_lines = max_lines.max(1) as u64;
+    let focus_start = focus_start.clamp(1, total_lines);
+    let focus_end = focus_end.clamp(focus_start, total_lines);
+    let mut start_line = focus_start.saturating_sub(before_lines as u64).max(1);
+    let mut end_line = (focus_end + after_lines as u64).min(total_lines);
+    let mut truncated = false;
+
+    while span_line_count(start_line, end_line) > max_lines {
+        truncated = true;
+        let extra_before = focus_start.saturating_sub(start_line);
+        let extra_after = end_line.saturating_sub(focus_end);
+        if extra_after > extra_before && end_line > focus_end {
+            end_line = end_line.saturating_sub(1);
+        } else if start_line < focus_start {
+            start_line = start_line.saturating_add(1);
+        } else if end_line > focus_end {
+            end_line = end_line.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+
+    (start_line, end_line, truncated)
+}
+
+fn narrowest_covering_symbol(symbols: &[IndexedSymbol], line: u64) -> Option<&IndexedSymbol> {
+    symbols
+        .iter()
+        .filter(|symbol| symbol.start_line <= line && symbol.end_line >= line)
+        .min_by(|left, right| {
+            span_line_count(left.start_line, left.end_line)
+                .cmp(&span_line_count(right.start_line, right.end_line))
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.end_line.cmp(&right.end_line))
+                .then(left.name.cmp(&right.name))
+        })
+}
+
+fn select_text_match(
+    matches: &[TextMatch],
+    line_hint: Option<u64>,
+    occurrence: Option<usize>,
+) -> Option<TextMatch> {
+    if matches.is_empty() {
+        return None;
+    }
+
+    if let Some(occurrence) = occurrence {
+        return occurrence
+            .checked_sub(1)
+            .and_then(|index| matches.get(index).copied());
+    }
+
+    if let Some(line_hint) = line_hint {
+        let mut ranked = matches
+            .iter()
+            .copied()
+            .map(|matched| {
+                let distance = if line_hint < matched.start_line {
+                    matched.start_line - line_hint
+                } else {
+                    line_hint.saturating_sub(matched.end_line)
+                };
+                (matched, distance)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then(left.0.start_line.cmp(&right.0.start_line))
+                .then(left.0.end_line.cmp(&right.0.end_line))
+        });
+        let first = ranked.first().copied()?;
+        if ranked.get(1).is_some_and(|second| second.1 == first.1) {
+            return None;
+        }
+        return Some(first.0);
+    }
+
+    (matches.len() == 1).then_some(matches[0])
+}
+
+fn select_edit_anchors(
+    snapshot: &LiveFileSnapshot,
+    start_line: u64,
+    end_line: u64,
+    anchor_count: usize,
+    query: Option<&str>,
+    symbol_signature_line: Option<u64>,
+) -> Vec<EditTargetAnchor> {
+    let anchor_count = anchor_count.clamp(1, 3);
+    let mut line_counts = HashMap::new();
+    for line in 1..=snapshot.total_lines() {
+        let Some(text) = snapshot.line_text(line) else {
+            continue;
+        };
+        let normalized = normalize_anchor_text(text);
+        if normalized.is_empty() {
+            continue;
+        }
+        *line_counts.entry(normalized.to_string()).or_insert(0usize) += 1;
+    }
+
+    let mut ranked = Vec::new();
+    for line in start_line..=end_line {
+        let Some(text) = snapshot.line_text(line) else {
+            continue;
+        };
+        let normalized = normalize_anchor_text(text);
+        if !is_anchor_candidate(normalized) {
+            continue;
+        }
+        let unique_in_file = line_counts.get(normalized).copied().unwrap_or(0) == 1;
+        let query_match = query.is_some_and(|needle| !needle.is_empty() && text.contains(needle));
+        let signature_match = symbol_signature_line == Some(line);
+        let structural_bonus = normalized
+            .chars()
+            .any(|character| matches!(character, '=' | ':' | '(' | ')' | '[' | ']' | '{' | '}'))
+            as i32;
+        let score = (unique_in_file as i32 * 1000)
+            + (query_match as i32 * 600)
+            + (signature_match as i32 * 500)
+            + (normalized.chars().any(char::is_alphanumeric) as i32 * 100)
+            + (structural_bonus * 25)
+            - (line.saturating_sub(start_line) as i32);
+        ranked.push((score, line, normalized.to_string(), unique_in_file));
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    ranked.truncate(anchor_count);
+    ranked.sort_by_key(|(_, line, _, _)| *line);
+
+    ranked
+        .into_iter()
+        .map(|(_, line, text, unique_in_file)| EditTargetAnchor {
+            line,
+            text,
+            unique_in_file,
+        })
+        .collect()
+}
+
+fn normalize_anchor_text(text: &str) -> &str {
+    text.trim_end_matches(['\r', '\n']).trim()
+}
+
+fn is_anchor_candidate(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if matches!(
+        text,
+        "{" | "}" | "(" | ")" | "[" | "]" | "," | ");" | "};" | "];"
+    ) {
+        return false;
+    }
+    text.chars().any(char::is_alphanumeric)
+}
+
 fn collect_ignore_patterns(repo: &Path, explicit_patterns: &[String]) -> Result<Vec<String>> {
     let mut patterns = explicit_patterns.to_vec();
 
@@ -3855,15 +5231,19 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, IndexCompletionStatus, IndexCoverage,
+        CONTENT_HASH_ALGORITHM, EditTargetAnchor, IndexCompletionStatus, IndexCoverage,
         LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode, SearchRequest,
-        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query, collection_name,
-        diff_files, expected_vector_collections, hash_text_like_file, index_status_for_coverage,
-        is_agent_context_vector_collection, plan_search, removed_repo_index_result,
-        run_low_priority_blocking, scan_repo, stale_vector_collections, symbol_collection_name,
+        TextMatch, bounded_window, build_chunk_context_snippet, build_root_hash, chunk_id,
+        classify_query, collect_live_candidate_files, collection_name, diff_files,
+        expected_vector_collections, hash_text_like_file, index_status_for_coverage,
+        is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
+        plan_search, removed_repo_index_result, run_low_priority_blocking, scan_repo,
+        select_edit_anchors, select_text_match, stale_vector_collections, symbol_collection_name,
         validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
     };
     use crate::config::SearchConfig;
+    use crate::engine::live_files::LiveFileStore;
+    use crate::engine::symbols::IndexedSymbol;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3879,6 +5259,141 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("agent-context-{name}-{nanos}"))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = temp_file_path(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn select_text_match_requires_disambiguation_for_repeated_hits() {
+        let matches = vec![
+            TextMatch {
+                start_byte: 0,
+                end_byte: 4,
+                start_line: 10,
+                end_line: 10,
+            },
+            TextMatch {
+                start_byte: 10,
+                end_byte: 14,
+                start_line: 20,
+                end_line: 20,
+            },
+        ];
+
+        assert!(select_text_match(&matches, None, None).is_none());
+        assert_eq!(
+            select_text_match(&matches, None, Some(2)).map(|matched| matched.start_line),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn bounded_window_keeps_focus_line_and_caps_span() {
+        let (start_line, end_line, truncated) = bounded_window(100, 40, 40, 10, 10, 5);
+
+        assert!(truncated);
+        assert!(start_line <= 40);
+        assert!(end_line >= 40);
+        assert_eq!(end_line - start_line + 1, 5);
+    }
+
+    #[test]
+    fn narrowest_covering_symbol_prefers_inner_symbol() {
+        let outer = IndexedSymbol {
+            symbol_id: "outer".to_string(),
+            repo: "/tmp/repo".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            name: "outer".to_string(),
+            kind: "function".to_string(),
+            container: None,
+            language: "rust".to_string(),
+            start_line: 10,
+            end_line: 30,
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            file_hash: "hash".to_string(),
+            parent_symbol_id: None,
+        };
+        let inner = IndexedSymbol {
+            symbol_id: "inner".to_string(),
+            repo: "/tmp/repo".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            name: "inner".to_string(),
+            kind: "function".to_string(),
+            container: Some("outer".to_string()),
+            language: "rust".to_string(),
+            start_line: 18,
+            end_line: 22,
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            file_hash: "hash".to_string(),
+            parent_symbol_id: Some("outer".to_string()),
+        };
+
+        let symbols = [outer, inner];
+        let selected = narrowest_covering_symbol(&symbols, 20).unwrap();
+        assert_eq!(selected.symbol_id, "inner");
+    }
+
+    #[test]
+    fn select_edit_anchors_prefers_unique_query_line() {
+        let repo = temp_dir("anchors-repo");
+        let file = repo.join("src").join("lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            "fn alpha() {\n    let shared = 1;\n    let target = build_value();\n    let shared = 1;\n}\n",
+        )
+        .unwrap();
+
+        let snapshot = LiveFileStore::new(4)
+            .load_snapshot(&repo, "src/lib.rs")
+            .unwrap();
+        let anchors = select_edit_anchors(&snapshot, 1, 5, 2, Some("build_value"), Some(1));
+
+        assert!(!anchors.is_empty());
+        assert!(anchors.iter().any(|anchor: &EditTargetAnchor| {
+            anchor.text.contains("build_value") && anchor.unique_in_file
+        }));
+    }
+
+    #[test]
+    fn collect_live_candidate_files_respects_prefix_and_language() {
+        let repo = temp_dir("candidates-repo");
+        let prefix = repo.join("src").join("pipeline");
+        fs::create_dir_all(&prefix).unwrap();
+        fs::write(prefix.join("worker.rs"), "fn build_worker() {}\n").unwrap();
+        fs::write(prefix.join("worker.py"), "def build_worker():\n    pass\n").unwrap();
+        fs::write(repo.join("src").join("other.rs"), "fn other() {}\n").unwrap();
+
+        let rust_only =
+            collect_live_candidate_files(&repo, Some("src/pipeline"), Some("rust"), &[]).unwrap();
+        let explicit_python =
+            collect_live_candidate_files(&repo, Some("src/pipeline"), None, &[String::from(".py")])
+                .unwrap();
+
+        assert_eq!(rust_only, vec!["src/pipeline/worker.rs".to_string()]);
+        assert_eq!(explicit_python, vec!["src/pipeline/worker.py".to_string()]);
+    }
+
+    #[test]
+    fn live_file_exists_distinguishes_missing_paths_from_escape_attempts() {
+        let repo = temp_dir("live-file-exists-repo");
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("lib.rs"), "fn main() {}\n").unwrap();
+
+        assert!(live_file_exists(&repo, "src/lib.rs").unwrap());
+        assert!(!live_file_exists(&repo, "src/missing.rs").unwrap());
+
+        let outside = temp_file_path("outside.rs");
+        fs::write(&outside, "fn outside() {}\n").unwrap();
+        let escaped = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        assert!(live_file_exists(&repo, &escaped).is_err());
+
+        let _ = fs::remove_file(outside);
     }
 
     #[test]

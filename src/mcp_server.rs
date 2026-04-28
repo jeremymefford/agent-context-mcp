@@ -2,8 +2,10 @@ use crate::config::{Config, ResolvedScope};
 use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
-    Engine, FileOutlineResponse, RepoSearchError, SearchMode, SearchPlanSummary, SearchRequest,
-    SearchResponse, SymbolSearchResponse, SymbolSearchScopeRequest, render_clear_text,
+    AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetStatus, Engine,
+    FileOutlineResponse, PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError,
+    SearchMode, SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchResponse,
+    SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest, render_clear_text,
     render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
@@ -115,6 +117,61 @@ struct SearchSymbolsArgs {
     container: Option<String>,
     #[serde(default)]
     include_diagnostics: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SearchTextArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    query: String,
+    #[serde(default = "default_text_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    extension_filter: Vec<String>,
+    #[serde(default = "default_case_sensitive")]
+    case_sensitive: bool,
+    #[serde(default)]
+    whole_word: bool,
+    #[serde(default)]
+    context_lines: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PrepareEditTargetArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    symbol_id: Option<String>,
+    #[serde(default)]
+    line_hint: Option<u64>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    occurrence: Option<usize>,
+    #[serde(default = "default_before_lines")]
+    before_lines: usize,
+    #[serde(default = "default_after_lines")]
+    after_lines: usize,
+    #[serde(default = "default_max_lines")]
+    max_lines: usize,
+    #[serde(default = "default_anchor_count")]
+    anchor_count: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -246,6 +303,74 @@ struct CompactSymbolHit {
     file_hash: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactTextSearchResponse {
+    scope: String,
+    label: String,
+    #[serde(skip_serializing_if = "is_false")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    repo_errors: Vec<RepoSearchError>,
+    hits: Vec<CompactTextSearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactTextSearchHit {
+    repo_label: String,
+    relative_path: String,
+    start_line: u64,
+    end_line: u64,
+    preview: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactPrepareEditTargetResponse {
+    status: EditTargetStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relative_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    anchors: Vec<EditTargetAnchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor_quality: Option<AnchorQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution_type: Option<EditResolutionType>,
+    #[serde(skip_serializing_if = "is_false")]
+    stale: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    unindexed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_id: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidates: Vec<CompactEditTargetCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_end_line: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactEditTargetCandidate {
+    repo_label: String,
+    relative_path: String,
+    start_line: u64,
+    end_line: u64,
+    preview: String,
+}
+
 pub async fn serve(
     config: &Config,
     listen: &str,
@@ -307,7 +432,7 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use get_file_outline when the file is known. Use search_code for broader code search. scope defaults to the configured default group.";
+const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code to discover files and behavior. When you already know the file or pathPrefix and need an exact literal match, use search_text instead of shell grep. Immediately before editing, use prepare_edit_target instead of raw file reads; it returns the live bounded patch window and unique anchors. Use get_file_outline when the file is known. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
@@ -319,19 +444,31 @@ pub fn tool_list() -> Vec<Tool> {
         ),
         build_tool(
             "search_code",
-            "Broader code search over a configured scope. Use search_symbols first for exact definitions.",
+            "Broader code discovery across indexed repos. Use search_symbols first for exact definitions.",
             true,
             search_code_schema(),
         ),
         build_tool(
             "search_symbols",
-            "Preferred tool for exact symbol and definition lookup.",
+            "Exact symbol and definition lookup. Use this when you know or suspect the definition name.",
             true,
             search_symbols_schema(),
         ),
         build_tool(
+            "search_text",
+            "Exact literal confirmation inside a known file or pathPrefix. Use this instead of narrow shell grep once discovery is done.",
+            true,
+            search_text_schema(),
+        ),
+        build_tool(
+            "prepare_edit_target",
+            "Use immediately before editing instead of sed/bat/cat. Returns the live bounded patch window, exact content, and unique anchors.",
+            true,
+            prepare_edit_target_schema(),
+        ),
+        build_tool(
             "get_file_outline",
-            "Return the indexed symbol outline for a known repo-relative file.",
+            "Return the indexed symbol outline for a known repo-relative file. Cheaper than reading the whole file.",
             true,
             get_file_outline_schema(),
         ),
@@ -537,6 +674,69 @@ impl ServerHandler for NativeServer {
                             args.include_diagnostics,
                         ))
                         .ok(),
+                    ))
+                }
+                "search_text" => {
+                    let args: SearchTextArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let extension_filter = normalize_extension_filter(&args.extension_filter)
+                        .map_err(invalid_params)?;
+                    let result = self
+                        .engine
+                        .search_text_scope(
+                            scope,
+                            TextSearchScopeRequest {
+                                query: args.query,
+                                limit: args.limit.clamp(1, 50),
+                                path_prefix: normalize_optional_path(&args.path_prefix),
+                                language: normalize_optional_language(&args.language),
+                                file: normalize_optional_path(&args.file),
+                                extension_filter,
+                                case_sensitive: args.case_sensitive,
+                                whole_word: args.whole_word,
+                                context_lines: args.context_lines.min(12),
+                            },
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                    Ok(tool_success(
+                        render_text_search_summary_text(&result),
+                        serde_json::to_value(compact_text_search_response(&result)).ok(),
+                    ))
+                }
+                "prepare_edit_target" => {
+                    let args: PrepareEditTargetArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let result = self
+                        .engine
+                        .prepare_edit_target(
+                            scope,
+                            PrepareEditTargetRequest {
+                                repo: normalize_optional_string(&args.repo),
+                                file: normalize_optional_path(&args.file),
+                                symbol_id: normalize_optional_string(&args.symbol_id),
+                                line_hint: args.line_hint,
+                                query: args.query.filter(|value| !value.is_empty()),
+                                occurrence: args.occurrence,
+                                before_lines: args.before_lines.min(32),
+                                after_lines: args.after_lines.min(64),
+                                max_lines: args.max_lines.clamp(1, 200),
+                                anchor_count: args.anchor_count.clamp(1, 3),
+                            },
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                    Ok(tool_success(
+                        render_prepare_edit_target_summary_text(&result),
+                        serde_json::to_value(compact_prepare_edit_target_response(&result)).ok(),
                     ))
                 }
                 "get_file_outline" => {
@@ -865,6 +1065,52 @@ fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
     lines.join("\n")
 }
 
+fn render_text_search_summary_text(result: &TextSearchResponse) -> String {
+    let mut lines = vec![format!(
+        "Scope: {} hits={} partial={}",
+        result.label,
+        result.hits.len(),
+        result.partial
+    )];
+    if result.hits.is_empty() {
+        lines.push("No exact literal hits.".to_string());
+    }
+    for error in &result.repo_errors {
+        lines.push(format!("ERR {}: {}", error.repo, error.error));
+    }
+    lines.join("\n")
+}
+
+fn render_prepare_edit_target_summary_text(
+    result: &crate::engine::PrepareEditTargetResponse,
+) -> String {
+    match result.status {
+        EditTargetStatus::Ready => format!(
+            "Ready {} :: {}:{}-{} anchors={}",
+            result.repo_label.as_deref().unwrap_or("unknown"),
+            result.relative_path.as_deref().unwrap_or("unknown"),
+            result.start_line.unwrap_or(0),
+            result.end_line.unwrap_or(0),
+            result.anchors.len()
+        ),
+        EditTargetStatus::Ambiguous => format!(
+            "Ambiguous {} candidates={}",
+            result.relative_path.as_deref().unwrap_or("target"),
+            result.candidates.len()
+        ),
+        EditTargetStatus::NeedsNarrowing => format!(
+            "Needs narrowing {} symbolSpan={}-{}",
+            result.relative_path.as_deref().unwrap_or("target"),
+            result.symbol_start_line.unwrap_or(0),
+            result.symbol_end_line.unwrap_or(0)
+        ),
+        EditTargetStatus::NotFound => format!(
+            "Not found {}",
+            result.relative_path.as_deref().unwrap_or("target")
+        ),
+    }
+}
+
 fn render_outline_summary_text(result: &FileOutlineResponse) -> String {
     let mut lines = vec![format!("Scope: {} file={}", result.label, result.file)];
     if result.matches.is_empty() {
@@ -961,6 +1207,59 @@ fn compact_symbol_search_response(
     }
 }
 
+fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearchResponse {
+    CompactTextSearchResponse {
+        scope: result.scope.clone(),
+        label: result.label.clone(),
+        partial: result.partial,
+        repo_errors: result.repo_errors.clone(),
+        hits: result
+            .hits
+            .iter()
+            .map(|hit| CompactTextSearchHit {
+                repo_label: hit.repo_label.clone(),
+                relative_path: hit.relative_path.clone(),
+                start_line: hit.start_line,
+                end_line: hit.end_line,
+                preview: hit.preview.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn compact_prepare_edit_target_response(
+    result: &PrepareEditTargetResponse,
+) -> CompactPrepareEditTargetResponse {
+    CompactPrepareEditTargetResponse {
+        status: result.status,
+        repo_label: result.repo_label.clone(),
+        relative_path: result.relative_path.clone(),
+        start_line: result.start_line,
+        end_line: result.end_line,
+        content: result.content.clone(),
+        anchors: result.anchors.clone(),
+        anchor_quality: result.anchor_quality,
+        resolution_type: result.resolution_type,
+        stale: result.stale.unwrap_or(false),
+        unindexed: matches!(result.indexed, Some(false)),
+        symbol_id: result.symbol_id.clone(),
+        truncated: result.truncated.unwrap_or(false),
+        candidates: result
+            .candidates
+            .iter()
+            .map(|candidate| CompactEditTargetCandidate {
+                repo_label: candidate.repo_label.clone(),
+                relative_path: candidate.relative_path.clone(),
+                start_line: candidate.start_line,
+                end_line: candidate.end_line,
+                preview: candidate.preview.clone(),
+            })
+            .collect(),
+        symbol_start_line: result.symbol_start_line,
+        symbol_end_line: result.symbol_end_line,
+    }
+}
+
 fn compact_outline_response(
     mut result: FileOutlineResponse,
     max_depth: usize,
@@ -1018,7 +1317,15 @@ fn default_limit() -> usize {
     5
 }
 
+fn default_text_search_limit() -> usize {
+    10
+}
+
 fn default_dedupe_by_file() -> bool {
+    true
+}
+
+fn default_case_sensitive() -> bool {
     true
 }
 
@@ -1031,6 +1338,22 @@ fn default_snippet_chars() -> usize {
 }
 
 fn default_outline_depth() -> usize {
+    2
+}
+
+fn default_before_lines() -> usize {
+    3
+}
+
+fn default_after_lines() -> usize {
+    8
+}
+
+fn default_max_lines() -> usize {
+    60
+}
+
+fn default_anchor_count() -> usize {
     2
 }
 
@@ -1153,7 +1476,7 @@ fn index_codebase_schema() -> Map<String, Value> {
 fn search_code_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Broader code search. Use search_symbols first for exact definitions.",
+        "description": "Broader code discovery. Use search_symbols first for exact definitions, then search_text or prepare_edit_target once the file is known.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
@@ -1219,7 +1542,7 @@ fn search_code_schema() -> Map<String, Value> {
 fn search_symbols_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Preferred exact symbol and definition lookup.",
+        "description": "Exact symbol and definition lookup. Prefer this before raw file reads when the definition name is known or suspected.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
@@ -1245,6 +1568,121 @@ fn search_symbols_schema() -> Map<String, Value> {
             }
         },
         "required": ["query"]
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
+fn search_text_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Exact literal confirmation after discovery. Use when file or pathPrefix is already known. This is the MCP replacement for narrow rg/grep.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "query": {
+                "type": "string",
+                "description": "Exact literal text to match. Regex is not supported."
+            },
+            "limit": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 10,
+                "description": "Maximum hits."
+            },
+            "file": nullable_string_schema("Repo-relative file path to search."),
+            "pathPrefix": nullable_string_schema("Repo-relative path prefix to bound subtree search."),
+            "language": nullable_string_schema("Normalized language filter."),
+            "extensionFilter": {
+                "type": "array",
+                "default": [],
+                "description": "Dotted file extensions to include.",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "caseSensitive": {
+                "type": "boolean",
+                "default": true,
+                "description": "Match case exactly."
+            },
+            "wholeWord": {
+                "type": "boolean",
+                "default": false,
+                "description": "Require whole-word matches."
+            },
+            "contextLines": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "maximum": 12,
+                "default": 0,
+                "description": "Extra surrounding lines in each preview."
+            }
+        },
+        "required": ["query"]
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
+fn prepare_edit_target_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Use immediately before editing instead of raw file reads. Returns the live bounded patch window, exact content, and unique anchors.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "repo": nullable_string_schema("Repo root or repo basename when disambiguating within a multi-repo scope."),
+            "file": nullable_string_schema("Repo-relative file path. Required if symbolId is not provided."),
+            "symbolId": nullable_string_schema("Indexed symbol id to prepare for editing."),
+            "lineHint": {
+                "type": ["integer", "null"],
+                "format": "uint64",
+                "description": "1-based line hint used to narrow the live edit window."
+            },
+            "query": nullable_string_schema("Exact literal text used to narrow the edit target."),
+            "occurrence": {
+                "type": ["integer", "null"],
+                "format": "uint",
+                "minimum": 1,
+                "description": "1-based occurrence selector for repeated literal matches."
+            },
+            "beforeLines": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "maximum": 32,
+                "default": 3,
+                "description": "Extra lines before the target window."
+            },
+            "afterLines": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "maximum": 64,
+                "default": 8,
+                "description": "Extra lines after the target window."
+            },
+            "maxLines": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 60,
+                "description": "Hard cap for returned content lines."
+            },
+            "anchorCount": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 2,
+                "description": "Maximum number of unique patch anchors to return."
+            }
+        }
     })
     .as_object()
     .cloned()
@@ -1344,15 +1782,18 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_INSTRUCTIONS, SearchMode, compact_outline_response, compact_search_response,
-        default_limit, enforce_loopback_bind, list_scopes_schema, listen_is_loopback,
-        normalize_extension_filter, parse_search_mode, parse_splitter_kind, search_symbols_schema,
-        tool_list,
+        SERVER_INSTRUCTIONS, SearchMode, compact_outline_response,
+        compact_prepare_edit_target_response, compact_search_response,
+        compact_text_search_response, default_limit, enforce_loopback_bind, list_scopes_schema,
+        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
+        prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
     };
     use crate::engine::splitter::SplitterKind;
     use crate::engine::symbols::OutlineNode;
     use crate::engine::{
-        FileOutlineMatch, FileOutlineResponse, SearchHit, SearchPlanSummary, SearchResponse,
+        AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetStatus, FileOutlineMatch,
+        FileOutlineResponse, PrepareEditTargetResponse, SearchHit, SearchPlanSummary,
+        SearchResponse, TextSearchHit, TextSearchResponse,
     };
     use serde_json::{Value, to_value};
 
@@ -1430,6 +1871,8 @@ mod tests {
         let tools = tool_list();
         assert!(tools.iter().any(|tool| tool.name == "list_scopes"));
         assert!(tools.iter().any(|tool| tool.name == "search_symbols"));
+        assert!(tools.iter().any(|tool| tool.name == "search_text"));
+        assert!(tools.iter().any(|tool| tool.name == "prepare_edit_target"));
         assert!(tools.iter().any(|tool| tool.name == "get_file_outline"));
         assert!(tools.iter().any(|tool| tool.name == "explain_search"));
     }
@@ -1447,14 +1890,26 @@ mod tests {
             .find(|tool| tool.name == "search_symbols")
             .and_then(|tool| tool.description.as_deref())
             .unwrap_or_default();
+        let search_text = tools
+            .iter()
+            .find(|tool| tool.name == "search_text")
+            .and_then(|tool| tool.description.as_deref())
+            .unwrap_or_default();
+        let prepare_edit_target = tools
+            .iter()
+            .find(|tool| tool.name == "prepare_edit_target")
+            .and_then(|tool| tool.description.as_deref())
+            .unwrap_or_default();
         let list_scopes = tools
             .iter()
             .find(|tool| tool.name == "list_scopes")
             .and_then(|tool| tool.description.as_deref())
             .unwrap_or_default();
 
-        assert!(search_code.contains("Use search_symbols first"));
-        assert!(search_symbols.contains("Preferred tool for exact symbol"));
+        assert!(search_code.contains("Broader code discovery"));
+        assert!(search_symbols.contains("definition name"));
+        assert!(search_text.contains("instead of narrow shell grep"));
+        assert!(prepare_edit_target.contains("instead of sed/bat/cat"));
         assert!(list_scopes.contains("Preferred first call"));
     }
 
@@ -1513,13 +1968,15 @@ mod tests {
     #[test]
     fn symbol_and_scope_schemas_advertise_preferred_usage() {
         let search_symbols = Value::Object(search_symbols_schema());
+        let search_text = Value::Object(search_text_schema());
+        let prepare = Value::Object(prepare_edit_target_schema());
         let list_scopes = Value::Object(list_scopes_schema());
 
         assert!(
             search_symbols["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Preferred exact symbol")
+                .contains("Exact symbol and definition lookup")
         );
         assert!(
             search_symbols["properties"]["query"]["description"]
@@ -1528,12 +1985,90 @@ mod tests {
                 .contains("Definition name")
         );
         assert!(
+            search_text["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("replacement for narrow rg/grep")
+        );
+        assert!(
+            prepare["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("instead of raw file reads")
+        );
+        assert!(
             list_scopes["description"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("Lists configured scopes")
         );
         assert!(SERVER_INSTRUCTIONS.contains("search_symbols for exact definitions"));
+        assert!(SERVER_INSTRUCTIONS.contains("search_text instead of shell grep"));
+        assert!(SERVER_INSTRUCTIONS.contains("prepare_edit_target instead of raw file reads"));
+    }
+
+    #[test]
+    fn compact_text_search_response_stays_small() {
+        let response = TextSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            hits: vec![TextSearchHit {
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                start_line: 10,
+                end_line: 10,
+                preview: "fn build() {}".to_string(),
+                stale: false,
+            }],
+        };
+
+        let json = to_value(compact_text_search_response(&response)).unwrap();
+        assert!(json["hits"][0].get("repo").is_none());
+        assert_eq!(json["hits"][0]["preview"], "fn build() {}");
+    }
+
+    #[test]
+    fn compact_prepare_edit_target_response_omits_heavy_diagnostics() {
+        let response = PrepareEditTargetResponse {
+            status: EditTargetStatus::Ready,
+            repo: Some("/tmp/repo".to_string()),
+            repo_label: Some("repo".to_string()),
+            relative_path: Some("src/lib.rs".to_string()),
+            start_line: Some(10),
+            end_line: Some(14),
+            content: Some("fn build() {}\n".to_string()),
+            anchors: vec![EditTargetAnchor {
+                line: 10,
+                text: "fn build() {".to_string(),
+                unique_in_file: true,
+            }],
+            anchor_quality: Some(AnchorQuality::Strong),
+            resolution_type: Some(EditResolutionType::Literal),
+            file_hash: Some("abc".to_string()),
+            indexed: Some(true),
+            stale: Some(false),
+            indexed_at: Some("2026-01-01T00:00:00Z".to_string()),
+            indexed_file_hash: Some("abc".to_string()),
+            symbol_id: Some("sym_123".to_string()),
+            truncated: Some(false),
+            candidates: Vec::new(),
+            symbol_start_line: None,
+            symbol_end_line: None,
+        };
+
+        let json = to_value(compact_prepare_edit_target_response(&response)).unwrap();
+        assert_eq!(json["repoLabel"], "repo");
+        assert!(json.get("repo").is_none());
+        assert!(json.get("fileHash").is_none());
+        assert!(json.get("indexedAt").is_none());
+        assert!(json.get("indexedFileHash").is_none());
+        assert!(json.get("stale").is_none());
+        assert!(json.get("unindexed").is_none());
+        assert!(json.get("truncated").is_none());
+        assert_eq!(json["anchors"][0]["text"], "fn build() {");
     }
 
     #[test]

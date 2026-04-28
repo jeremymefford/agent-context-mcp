@@ -28,6 +28,8 @@ They are complementary more than competitive. If you want long-term agent memory
 
 - **Semantic search** for natural-language queries like `find the GraphQL schema builder`.
 - **Symbol search** for exact definitions like `build_schema`, `KeyStore`, or `SessionManager`.
+- **Exact text search** for literal strings inside a known file or bounded subtree when an agent needs precise confirmation instead of another ranked search.
+- **Edit-target preparation** that returns live-file exact content, bounded edit windows, and unique patch anchors immediately before editing.
 - **File outlines** so an agent can inspect structure without scanning entire files.
 - **Hybrid ranking** so exact identifiers, paths, and semantic matches work in one search flow.
 - **Multi-repo scopes** so one MCP server can search a named workspace instead of a single repo.
@@ -294,6 +296,8 @@ Current tools:
 - `index_codebase`
 - `search_code`
 - `search_symbols`
+- `search_text`
+- `prepare_edit_target`
 - `get_file_outline`
 - `explain_search`
 - `clear_index`
@@ -303,8 +307,11 @@ Preferred routing:
 
 - use `list_scopes` first in an unfamiliar workspace
 - use `search_symbols` first for exact definition lookup
+- use `search_text` for exact literal matches inside a known file or bounded repo-relative tree instead of narrow `rg` or `grep`
+- use `prepare_edit_target` immediately before editing instead of raw file reads so the patch is anchored on live file content
 - use `get_file_outline` once the target file is known
 - use `search_code` for broader semantic or hybrid discovery
+- fall back to shell search only for regex-heavy cases, unindexed files, or MCP outages
 
 ## Example Agent Workflow
 
@@ -313,8 +320,10 @@ Typical flow for a code-assistant task:
 1. `list_scopes`
 2. `search_symbols` for an exact symbol if one is known
 3. `search_code` for broader behavior or semantic discovery
-4. `get_file_outline` on the chosen file
-5. read and edit the exact files that the search results identified
+4. `search_text` when a known file or subtree needs exact literal confirmation
+5. `get_file_outline` on the chosen file
+6. `prepare_edit_target` immediately before editing
+7. read and edit the exact files that the search results identified
 
 ## CLI Commands
 

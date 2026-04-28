@@ -424,7 +424,37 @@ impl SymbolStore {
         Ok(())
     }
 
-    pub fn symbols_by_ids(&self, ids: &[String]) -> Result<Vec<IndexedSymbol>> {
+    pub fn symbol_by_id(&self, repo: &str, symbol_id: &str) -> Result<Option<IndexedSymbol>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT
+                    symbol_id,
+                    repo,
+                    relative_path,
+                    name,
+                    kind,
+                    container,
+                    language,
+                    start_line,
+                    end_line,
+                    indexed_at,
+                    file_hash,
+                    parent_symbol_id
+                 FROM symbols
+                 WHERE repo = ?1 AND symbol_id = ?2",
+                params![repo, symbol_id],
+                map_symbol_row,
+            )
+            .optional()
+            .with_context(|| format!("loading symbol {repo}:{symbol_id}"))
+    }
+
+    pub fn symbols_by_repo_and_ids(
+        &self,
+        repo: &str,
+        ids: &[String],
+    ) -> Result<Vec<IndexedSymbol>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -446,14 +476,14 @@ impl SymbolStore {
                     file_hash,
                     parent_symbol_id
                 FROM symbols
-                WHERE symbol_id = ?1",
+                WHERE repo = ?1 AND symbol_id = ?2",
             )
             .context("preparing symbol lookup")?;
         for id in ids {
             if let Some(symbol) = statement
-                .query_row(params![id], map_symbol_row)
+                .query_row(params![repo, id], map_symbol_row)
                 .optional()
-                .with_context(|| format!("loading symbol {id}"))?
+                .with_context(|| format!("loading symbol {repo}:{id}"))?
             {
                 symbols.push(symbol);
             }
@@ -497,12 +527,13 @@ impl SymbolStore {
         }
         let connection = Connection::open(&self.path)
             .with_context(|| format!("opening symbol db {}", self.path.display()))?;
+        migrate_symbol_schema(&connection)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
                  CREATE TABLE IF NOT EXISTS symbols (
-                    symbol_id TEXT PRIMARY KEY,
+                    symbol_id TEXT NOT NULL,
                     repo TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -513,7 +544,8 @@ impl SymbolStore {
                     end_line INTEGER NOT NULL,
                     indexed_at TEXT NOT NULL,
                     file_hash TEXT NOT NULL,
-                    parent_symbol_id TEXT
+                    parent_symbol_id TEXT,
+                    PRIMARY KEY (repo, symbol_id)
                  );
                  CREATE INDEX IF NOT EXISTS idx_symbols_repo_path ON symbols(repo, relative_path, start_line, end_line);
                  CREATE INDEX IF NOT EXISTS idx_symbols_repo_name ON symbols(repo, name, kind);",
@@ -521,6 +553,82 @@ impl SymbolStore {
             .context("initializing symbol db schema")?;
         Ok(connection)
     }
+}
+
+fn migrate_symbol_schema(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .context("initializing symbol db pragmas")?;
+
+    let existing_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'symbols'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("loading symbol table schema")?
+        .flatten();
+
+    let Some(existing_sql) = existing_sql else {
+        return Ok(());
+    };
+    if existing_sql.contains("PRIMARY KEY (repo, symbol_id)") {
+        return Ok(());
+    }
+
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE symbols RENAME TO symbols_legacy;
+             CREATE TABLE symbols (
+                symbol_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                container TEXT,
+                language TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                parent_symbol_id TEXT,
+                PRIMARY KEY (repo, symbol_id)
+             );
+             INSERT INTO symbols (
+                symbol_id,
+                repo,
+                relative_path,
+                name,
+                kind,
+                container,
+                language,
+                start_line,
+                end_line,
+                indexed_at,
+                file_hash,
+                parent_symbol_id
+             )
+             SELECT
+                symbol_id,
+                repo,
+                relative_path,
+                name,
+                kind,
+                container,
+                language,
+                start_line,
+                end_line,
+                indexed_at,
+                file_hash,
+                parent_symbol_id
+             FROM symbols_legacy;
+             DROP TABLE symbols_legacy;
+             COMMIT;",
+        )
+        .context("migrating symbol table schema")?;
+    Ok(())
 }
 
 pub fn extract_symbols(
@@ -866,8 +974,50 @@ mod tests {
             .iter()
             .map(|symbol| symbol.symbol_id.clone())
             .collect::<Vec<_>>();
-        let by_id = store.symbols_by_ids(&ids).unwrap();
+        let by_id = store.symbols_by_repo_and_ids("/tmp/repo", &ids).unwrap();
         assert_eq!(by_id.len(), symbols.len());
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn repo_scoped_symbol_ids_do_not_collide() {
+        let db_path = temp_path("repo-scoped");
+        let store = SymbolStore::new(db_path.clone());
+        let left = extract_symbols(
+            "/tmp/repo-a",
+            "src/main.kt",
+            std::path::Path::new("src/main.kt"),
+            "class Engine { fun search() {} }",
+            "2026-01-01T00:00:00Z",
+            "hash-a",
+        )
+        .unwrap();
+        let mut right = extract_symbols(
+            "/tmp/repo-b",
+            "src/main.kt",
+            std::path::Path::new("src/main.kt"),
+            "class Engine { fun search() {} }",
+            "2026-01-01T00:00:00Z",
+            "hash-b",
+        )
+        .unwrap();
+
+        let duplicate_id = left[0].symbol_id.clone();
+        right[0].symbol_id = duplicate_id.clone();
+
+        store
+            .replace_file_symbols("/tmp/repo-a", "src/main.kt", &left)
+            .unwrap();
+        store
+            .replace_file_symbols("/tmp/repo-b", "src/main.kt", &right)
+            .unwrap();
+
+        let left_symbol = store.symbol_by_id("/tmp/repo-a", &duplicate_id).unwrap();
+        let right_symbol = store.symbol_by_id("/tmp/repo-b", &duplicate_id).unwrap();
+
+        assert_eq!(left_symbol.unwrap().file_hash, "hash-a");
+        assert_eq!(right_symbol.unwrap().file_hash, "hash-b");
 
         let _ = fs::remove_file(db_path);
     }
