@@ -2,11 +2,11 @@ use crate::config::{Config, ResolvedScope};
 use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
-    AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetStatus, Engine,
-    FileOutlineResponse, PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError,
-    SearchMode, SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchResponse,
-    SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest, render_clear_text,
-    render_search_explanation_text, render_status_text,
+    AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode, EditTargetStatus,
+    Engine, FileOutlineResponse, PrepareEditTargetRequest, PrepareEditTargetResponse,
+    RepoSearchError, SearchMode, SearchPlanSummary, SearchRequest, SearchResponse,
+    SymbolSearchResponse, SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest,
+    render_clear_text, render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
 use axum::{Router, routing::get};
@@ -141,7 +141,7 @@ struct SearchTextArgs {
     case_sensitive: bool,
     #[serde(default)]
     whole_word: bool,
-    #[serde(default)]
+    #[serde(default = "default_text_search_context_lines")]
     context_lines: usize,
 }
 
@@ -359,6 +359,10 @@ struct CompactPrepareEditTargetResponse {
     symbol_start_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol_end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<EditTargetReasonCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next_tool: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -432,7 +436,7 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code to discover files and behavior. When you already know the file or pathPrefix and need an exact literal match, use search_text instead of shell grep. Immediately before editing, use prepare_edit_target instead of raw file reads; it returns the live bounded patch window and unique anchors. Use get_file_outline when the file is known. scope defaults to the configured default group.";
+const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code for broader discovery; its snippets are discovery hints, not authoritative reads. Use search_text for exact literals, identifiers, test names, and log lines in a known file or subtree instead of shell rg. Use get_file_outline for file structure once the file is known. Use prepare_edit_target only when the exact patch location is already known; it is the final pre-patch step, not a general reader or overview tool. If prepare_edit_target returns needsNarrowing or ambiguous, go back to search_text or get_file_outline. Fall back to shell rg/sed/bat only when regex is required or MCP exact inspection is unavailable. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
@@ -443,34 +447,34 @@ pub fn tool_list() -> Vec<Tool> {
             index_codebase_schema(),
         ),
         build_tool(
-            "search_code",
-            "Broader code discovery across indexed repos. Use search_symbols first for exact definitions.",
-            true,
-            search_code_schema(),
-        ),
-        build_tool(
             "search_symbols",
             "Exact symbol and definition lookup. Use this when you know or suspect the definition name.",
             true,
             search_symbols_schema(),
         ),
         build_tool(
+            "search_code",
+            "Broader code discovery across indexed repos. Snippets are discovery hints; use search_text for exact follow-up once a file or pathPrefix is known.",
+            true,
+            search_code_schema(),
+        ),
+        build_tool(
             "search_text",
-            "Exact literal confirmation inside a known file or pathPrefix. Use this instead of narrow shell grep once discovery is done.",
+            "Exact literal confirmation inside a known file or pathPrefix. Use this instead of shell rg for identifiers, test names, log lines, and exact strings once discovery is done.",
             true,
             search_text_schema(),
         ),
         build_tool(
-            "prepare_edit_target",
-            "Use immediately before editing instead of sed/bat/cat. Returns the live bounded patch window, exact content, and unique anchors.",
-            true,
-            prepare_edit_target_schema(),
-        ),
-        build_tool(
             "get_file_outline",
-            "Return the indexed symbol outline for a known repo-relative file. Cheaper than reading the whole file.",
+            "Return the indexed symbol outline for a known repo-relative file. Use this for structure instead of broad file reads.",
             true,
             get_file_outline_schema(),
+        ),
+        build_tool(
+            "prepare_edit_target",
+            "Final pre-patch step only. Use immediately before editing instead of sed/bat/cat after the exact patch location is known. Not for overview or broad inspection.",
+            true,
+            prepare_edit_target_schema(),
         ),
         build_tool(
             "explain_search",
@@ -726,9 +730,9 @@ impl ServerHandler for NativeServer {
                                 line_hint: args.line_hint,
                                 query: args.query.filter(|value| !value.is_empty()),
                                 occurrence: args.occurrence,
-                                before_lines: args.before_lines.min(32),
-                                after_lines: args.after_lines.min(64),
-                                max_lines: args.max_lines.clamp(1, 200),
+                                before_lines: args.before_lines.min(4),
+                                after_lines: args.after_lines.min(8),
+                                max_lines: args.max_lines.clamp(1, 32),
                                 anchor_count: args.anchor_count.clamp(1, 3),
                             },
                         )
@@ -1094,20 +1098,39 @@ fn render_prepare_edit_target_summary_text(
             result.anchors.len()
         ),
         EditTargetStatus::Ambiguous => format!(
-            "Ambiguous {} candidates={}",
+            "Ambiguous {} candidates={} next={}",
             result.relative_path.as_deref().unwrap_or("target"),
-            result.candidates.len()
+            result.candidates.len(),
+            result
+                .suggested_next_tool
+                .as_deref()
+                .unwrap_or("prepare_edit_target")
         ),
         EditTargetStatus::NeedsNarrowing => format!(
-            "Needs narrowing {} symbolSpan={}-{}",
+            "Needs narrowing {} reason={} next={}",
             result.relative_path.as_deref().unwrap_or("target"),
-            result.symbol_start_line.unwrap_or(0),
-            result.symbol_end_line.unwrap_or(0)
+            result
+                .reason_code
+                .map(reason_code_label)
+                .unwrap_or("unknown"),
+            result
+                .suggested_next_tool
+                .as_deref()
+                .unwrap_or("search_text")
         ),
         EditTargetStatus::NotFound => format!(
             "Not found {}",
             result.relative_path.as_deref().unwrap_or("target")
         ),
+    }
+}
+
+fn reason_code_label(reason: EditTargetReasonCode) -> &'static str {
+    match reason {
+        EditTargetReasonCode::WindowTooBroad => "window_too_broad",
+        EditTargetReasonCode::LargeSymbol => "large_symbol",
+        EditTargetReasonCode::MultipleMatches => "multiple_matches",
+        EditTargetReasonCode::WeakAnchors => "weak_anchors",
     }
 }
 
@@ -1257,6 +1280,8 @@ fn compact_prepare_edit_target_response(
             .collect(),
         symbol_start_line: result.symbol_start_line,
         symbol_end_line: result.symbol_end_line,
+        reason_code: result.reason_code,
+        suggested_next_tool: result.suggested_next_tool.clone(),
     }
 }
 
@@ -1321,6 +1346,10 @@ fn default_text_search_limit() -> usize {
     10
 }
 
+fn default_text_search_context_lines() -> usize {
+    1
+}
+
 fn default_dedupe_by_file() -> bool {
     true
 }
@@ -1342,15 +1371,15 @@ fn default_outline_depth() -> usize {
 }
 
 fn default_before_lines() -> usize {
-    3
+    2
 }
 
 fn default_after_lines() -> usize {
-    8
+    6
 }
 
 fn default_max_lines() -> usize {
-    60
+    32
 }
 
 fn default_anchor_count() -> usize {
@@ -1476,7 +1505,7 @@ fn index_codebase_schema() -> Map<String, Value> {
 fn search_code_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Broader code discovery. Use search_symbols first for exact definitions, then search_text or prepare_edit_target once the file is known.",
+        "description": "Broader code discovery. Use search_symbols first for exact definitions. Treat snippets as discovery hints, then use search_text or get_file_outline once the file is known. Use prepare_edit_target only when the exact patch location is already known.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
@@ -1516,7 +1545,7 @@ fn search_code_schema() -> Map<String, Value> {
             "includeContent": {
                 "type": "boolean",
                 "default": true,
-                "description": "Include compact snippets."
+                "description": "Include compact discovery snippets. Use search_text or prepare_edit_target for authoritative follow-up."
             },
             "snippetChars": {
                 "type": "integer",
@@ -1524,7 +1553,7 @@ fn search_code_schema() -> Map<String, Value> {
                 "minimum": 0,
                 "maximum": 1200,
                 "default": 360,
-                "description": "Approximate max snippet characters."
+                "description": "Approximate max discovery snippet characters."
             },
             "includeDiagnostics": {
                 "type": "boolean",
@@ -1577,7 +1606,7 @@ fn search_symbols_schema() -> Map<String, Value> {
 fn search_text_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Exact literal confirmation after discovery. Use when file or pathPrefix is already known. This is the MCP replacement for narrow rg/grep.",
+        "description": "Exact literal confirmation after discovery. Use when file or pathPrefix is already known. This is the MCP replacement for narrow shell rg when you need exact strings, identifiers, test names, or log lines.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "query": {
@@ -1618,7 +1647,7 @@ fn search_text_schema() -> Map<String, Value> {
                 "format": "uint",
                 "minimum": 0,
                 "maximum": 12,
-                "default": 0,
+                "default": 1,
                 "description": "Extra surrounding lines in each preview."
             }
         },
@@ -1632,7 +1661,7 @@ fn search_text_schema() -> Map<String, Value> {
 fn prepare_edit_target_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Use immediately before editing instead of raw file reads. Returns the live bounded patch window, exact content, and unique anchors.",
+        "description": "Final pre-patch step only. Use after search_symbols, search_code, search_text, or get_file_outline has already identified the exact patch location. Not for overview or broad inspection. If it returns ambiguous or needsNarrowing, go back to search_text or get_file_outline.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "repo": nullable_string_schema("Repo root or repo basename when disambiguating within a multi-repo scope."),
@@ -1641,46 +1670,14 @@ fn prepare_edit_target_schema() -> Map<String, Value> {
             "lineHint": {
                 "type": ["integer", "null"],
                 "format": "uint64",
-                "description": "1-based line hint used to narrow the live edit window."
+                "description": "1-based line hint used to narrow a known edit location."
             },
-            "query": nullable_string_schema("Exact literal text used to narrow the edit target."),
+            "query": nullable_string_schema("Exact literal text used to narrow a known edit target."),
             "occurrence": {
                 "type": ["integer", "null"],
                 "format": "uint",
                 "minimum": 1,
-                "description": "1-based occurrence selector for repeated literal matches."
-            },
-            "beforeLines": {
-                "type": "integer",
-                "format": "uint",
-                "minimum": 0,
-                "maximum": 32,
-                "default": 3,
-                "description": "Extra lines before the target window."
-            },
-            "afterLines": {
-                "type": "integer",
-                "format": "uint",
-                "minimum": 0,
-                "maximum": 64,
-                "default": 8,
-                "description": "Extra lines after the target window."
-            },
-            "maxLines": {
-                "type": "integer",
-                "format": "uint",
-                "minimum": 1,
-                "maximum": 200,
-                "default": 60,
-                "description": "Hard cap for returned content lines."
-            },
-            "anchorCount": {
-                "type": "integer",
-                "format": "uint",
-                "minimum": 1,
-                "maximum": 3,
-                "default": 2,
-                "description": "Maximum number of unique patch anchors to return."
+                "description": "1-based occurrence selector for repeated literal matches when the exact occurrence is already known."
             }
         }
     })
@@ -1791,9 +1788,9 @@ mod tests {
     use crate::engine::splitter::SplitterKind;
     use crate::engine::symbols::OutlineNode;
     use crate::engine::{
-        AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetStatus, FileOutlineMatch,
-        FileOutlineResponse, PrepareEditTargetResponse, SearchHit, SearchPlanSummary,
-        SearchResponse, TextSearchHit, TextSearchResponse,
+        AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode,
+        EditTargetStatus, FileOutlineMatch, FileOutlineResponse, PrepareEditTargetResponse,
+        SearchHit, SearchPlanSummary, SearchResponse, TextSearchHit, TextSearchResponse,
     };
     use serde_json::{Value, to_value};
 
@@ -1906,11 +1903,45 @@ mod tests {
             .and_then(|tool| tool.description.as_deref())
             .unwrap_or_default();
 
-        assert!(search_code.contains("Broader code discovery"));
+        assert!(search_code.contains("Snippets are discovery hints"));
         assert!(search_symbols.contains("definition name"));
-        assert!(search_text.contains("instead of narrow shell grep"));
-        assert!(prepare_edit_target.contains("instead of sed/bat/cat"));
+        assert!(search_text.contains("instead of shell rg"));
+        assert!(prepare_edit_target.contains("Final pre-patch step only"));
         assert!(list_scopes.contains("Preferred first call"));
+    }
+
+    #[test]
+    fn tool_list_orders_navigation_before_prepare_edit() {
+        let tools = tool_list();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        let search_symbols = names
+            .iter()
+            .position(|name| *name == "search_symbols")
+            .expect("search_symbols missing");
+        let search_code = names
+            .iter()
+            .position(|name| *name == "search_code")
+            .expect("search_code missing");
+        let search_text = names
+            .iter()
+            .position(|name| *name == "search_text")
+            .expect("search_text missing");
+        let outline = names
+            .iter()
+            .position(|name| *name == "get_file_outline")
+            .expect("get_file_outline missing");
+        let prepare = names
+            .iter()
+            .position(|name| *name == "prepare_edit_target")
+            .expect("prepare_edit_target missing");
+
+        assert!(search_symbols < search_code);
+        assert!(search_code < search_text);
+        assert!(search_text < outline);
+        assert!(outline < prepare);
     }
 
     #[test]
@@ -1938,12 +1969,18 @@ mod tests {
             schema["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Use search_symbols first")
+                .contains("Treat snippets as discovery hints")
         );
         assert!(schema["properties"].get("path").is_none());
         assert_eq!(
             schema["properties"]["snippetChars"]["default"].as_u64(),
             Some(360)
+        );
+        assert!(
+            schema["properties"]["includeContent"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("authoritative follow-up")
         );
     }
 
@@ -1988,14 +2025,22 @@ mod tests {
             search_text["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("replacement for narrow rg/grep")
+                .contains("replacement for narrow shell rg")
+        );
+        assert_eq!(
+            search_text["properties"]["contextLines"]["default"].as_u64(),
+            Some(1)
         );
         assert!(
             prepare["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("instead of raw file reads")
+                .contains("Final pre-patch step only")
         );
+        assert!(prepare["properties"].get("beforeLines").is_none());
+        assert!(prepare["properties"].get("afterLines").is_none());
+        assert!(prepare["properties"].get("maxLines").is_none());
+        assert!(prepare["properties"].get("anchorCount").is_none());
         assert!(
             list_scopes["description"]
                 .as_str()
@@ -2003,8 +2048,9 @@ mod tests {
                 .contains("Lists configured scopes")
         );
         assert!(SERVER_INSTRUCTIONS.contains("search_symbols for exact definitions"));
-        assert!(SERVER_INSTRUCTIONS.contains("search_text instead of shell grep"));
-        assert!(SERVER_INSTRUCTIONS.contains("prepare_edit_target instead of raw file reads"));
+        assert!(SERVER_INSTRUCTIONS.contains("search_text for exact literals"));
+        assert!(SERVER_INSTRUCTIONS.contains("instead of shell rg"));
+        assert!(SERVER_INSTRUCTIONS.contains("final pre-patch step"));
     }
 
     #[test]
@@ -2057,6 +2103,8 @@ mod tests {
             candidates: Vec::new(),
             symbol_start_line: None,
             symbol_end_line: None,
+            reason_code: None,
+            suggested_next_tool: None,
         };
 
         let json = to_value(compact_prepare_edit_target_response(&response)).unwrap();
@@ -2069,6 +2117,39 @@ mod tests {
         assert!(json.get("unindexed").is_none());
         assert!(json.get("truncated").is_none());
         assert_eq!(json["anchors"][0]["text"], "fn build() {");
+    }
+
+    #[test]
+    fn compact_prepare_edit_target_response_keeps_guidance_for_non_ready_states() {
+        let response = PrepareEditTargetResponse {
+            status: EditTargetStatus::NeedsNarrowing,
+            repo: Some("/tmp/repo".to_string()),
+            repo_label: Some("repo".to_string()),
+            relative_path: Some("src/lib.rs".to_string()),
+            start_line: None,
+            end_line: None,
+            content: None,
+            anchors: Vec::new(),
+            anchor_quality: None,
+            resolution_type: Some(EditResolutionType::Symbol),
+            file_hash: Some("abc".to_string()),
+            indexed: Some(true),
+            stale: Some(false),
+            indexed_at: Some("2026-01-01T00:00:00Z".to_string()),
+            indexed_file_hash: Some("abc".to_string()),
+            symbol_id: Some("sym_123".to_string()),
+            truncated: Some(true),
+            candidates: Vec::new(),
+            symbol_start_line: Some(10),
+            symbol_end_line: Some(80),
+            reason_code: Some(EditTargetReasonCode::LargeSymbol),
+            suggested_next_tool: Some("get_file_outline".to_string()),
+        };
+
+        let json = to_value(compact_prepare_edit_target_response(&response)).unwrap();
+        assert_eq!(json["reasonCode"], "large_symbol");
+        assert_eq!(json["suggestedNextTool"], "get_file_outline");
+        assert!(json.get("content").is_none());
     }
 
     #[test]

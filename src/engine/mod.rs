@@ -56,6 +56,10 @@ const LIVE_FILE_CACHE_LIMIT: usize = 64;
 const SEARCH_TEXT_SHORTLIST_LIMIT: usize = 64;
 const SEARCH_TEXT_FALLBACK_MAX_FILES: usize = 64;
 const SEARCH_TEXT_PREVIEW_CHARS: usize = 180;
+const PREPARE_READY_MAX_LINES: usize = 32;
+const PREPARE_AMBIGUOUS_PREVIEW_CHARS: usize = 120;
+const PREPARE_AMBIGUOUS_PREVIEW_BEFORE_LINES: u64 = 1;
+const PREPARE_AMBIGUOUS_PREVIEW_AFTER_LINES: u64 = 1;
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -295,6 +299,10 @@ pub struct PrepareEditTargetResponse {
     pub symbol_start_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<EditTargetReasonCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_next_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -304,6 +312,15 @@ pub enum EditTargetStatus {
     Ambiguous,
     NeedsNarrowing,
     NotFound,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EditTargetReasonCode {
+    WindowTooBroad,
+    LargeSymbol,
+    MultipleMatches,
+    WeakAnchors,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1590,6 +1607,8 @@ impl Engine {
                 candidates: Vec::new(),
                 symbol_start_line: None,
                 symbol_end_line: None,
+                reason_code: None,
+                suggested_next_tool: None,
             });
         };
 
@@ -1615,6 +1634,8 @@ impl Engine {
                 candidates: Vec::new(),
                 symbol_start_line: None,
                 symbol_end_line: None,
+                reason_code: None,
+                suggested_next_tool: None,
             });
         };
 
@@ -1662,7 +1683,7 @@ impl Engine {
         }
 
         let symbol_lines = span_line_count(resolved.symbol.start_line, resolved.symbol.end_line);
-        if symbol_lines <= request.max_lines as u64 {
+        if symbol_lines <= PREPARE_READY_MAX_LINES as u64 {
             return self
                 .build_ready_prepare_response(
                     ReadyEditTarget {
@@ -1681,63 +1702,14 @@ impl Engine {
                 .await;
         }
 
-        if let Some(line_hint) = request.line_hint {
-            let (start_line, end_line, truncated) = bounded_window(
-                snapshot.total_lines(),
-                line_hint.clamp(resolved.symbol.start_line, resolved.symbol.end_line),
-                line_hint.clamp(resolved.symbol.start_line, resolved.symbol.end_line),
-                request.before_lines,
-                request.after_lines,
-                request.max_lines,
-            );
-            return self
-                .build_ready_prepare_response(
-                    ReadyEditTarget {
-                        snapshot,
-                        start_line,
-                        end_line,
-                        resolution_type: EditResolutionType::LineHint,
-                        symbol_id: Some(resolved.symbol.symbol_id.clone()),
-                        indexed_metadata,
-                        truncated: truncated
-                            || start_line != resolved.symbol.start_line
-                            || end_line != resolved.symbol.end_line,
-                        symbol_signature_line: Some(resolved.symbol.start_line),
-                        query: None,
-                    },
-                    request,
-                )
-                .await;
-        }
-
-        let header_end = (resolved.symbol.start_line + request.max_lines as u64 - 1)
-            .min(resolved.symbol.end_line)
-            .min(snapshot.total_lines());
-        let content = snapshot
-            .slice_lines(resolved.symbol.start_line, header_end)
-            .map(ToString::to_string);
-        Ok(PrepareEditTargetResponse {
-            status: EditTargetStatus::NeedsNarrowing,
-            repo: Some(resolved.repo.display().to_string()),
-            repo_label: Some(repo_basename(&resolved.repo.display().to_string())),
-            relative_path: Some(resolved.symbol.relative_path.clone()),
-            start_line: Some(resolved.symbol.start_line),
-            end_line: Some(header_end),
-            content,
-            anchors: Vec::new(),
-            anchor_quality: None,
-            resolution_type: Some(EditResolutionType::Symbol),
-            file_hash: Some(snapshot.file_hash.clone()),
-            indexed: Some(true),
-            stale: Some(snapshot.file_hash != resolved.symbol.file_hash),
-            indexed_at: Some(resolved.symbol.indexed_at.clone()),
-            indexed_file_hash: Some(resolved.symbol.file_hash.clone()),
-            symbol_id: Some(resolved.symbol.symbol_id.clone()),
-            truncated: Some(true),
-            candidates: Vec::new(),
-            symbol_start_line: Some(resolved.symbol.start_line),
-            symbol_end_line: Some(resolved.symbol.end_line),
-        })
+        Ok(self.build_large_symbol_prepare_response(
+            &snapshot,
+            &indexed_metadata,
+            Some(resolved.symbol.symbol_id.clone()),
+            Some(EditResolutionType::Symbol),
+            resolved.symbol.start_line,
+            resolved.symbol.end_line,
+        ))
     }
 
     async fn prepare_file_edit_target(
@@ -1797,7 +1769,7 @@ impl Engine {
                 .await?;
             if let Some(symbol) = narrowest_covering_symbol(&file_symbols, line_hint) {
                 let symbol_lines = span_line_count(symbol.start_line, symbol.end_line);
-                if symbol_lines <= request.max_lines as u64 {
+                if symbol_lines <= PREPARE_READY_MAX_LINES as u64 {
                     candidates.push(ReadyEditTarget {
                         snapshot: snapshot.clone(),
                         start_line: symbol.start_line,
@@ -1810,27 +1782,14 @@ impl Engine {
                         query: None,
                     });
                 } else {
-                    let (start_line, end_line, truncated) = bounded_window(
-                        snapshot.total_lines(),
-                        line_hint,
-                        line_hint,
-                        request.before_lines,
-                        request.after_lines,
-                        request.max_lines,
-                    );
-                    candidates.push(ReadyEditTarget {
-                        snapshot: snapshot.clone(),
-                        start_line,
-                        end_line,
-                        resolution_type: EditResolutionType::LineHint,
-                        symbol_id: Some(symbol.symbol_id.clone()),
-                        indexed_metadata,
-                        truncated: truncated
-                            || start_line != symbol.start_line
-                            || end_line != symbol.end_line,
-                        symbol_signature_line: Some(symbol.start_line),
-                        query: None,
-                    });
+                    return Ok(self.build_large_symbol_prepare_response(
+                        &snapshot,
+                        &indexed_metadata,
+                        Some(symbol.symbol_id.clone()),
+                        Some(EditResolutionType::LineHint),
+                        symbol.start_line,
+                        symbol.end_line,
+                    ));
                 }
             } else {
                 let (start_line, end_line, truncated) = bounded_window(
@@ -1898,6 +1857,8 @@ impl Engine {
                 .collect(),
             symbol_start_line: None,
             symbol_end_line: None,
+            reason_code: Some(EditTargetReasonCode::MultipleMatches),
+            suggested_next_tool: Some("prepare_edit_target".to_string()),
         })
     }
 
@@ -1919,6 +1880,23 @@ impl Engine {
             ready.query.as_deref(),
             ready.symbol_signature_line,
         );
+        if let Some((reason_code, suggested_next_tool)) =
+            ready_target_reason(ready.start_line, ready.end_line, &anchors)
+        {
+            return Ok(self.build_needs_narrowing_prepare_response(
+                &ready.snapshot,
+                &ready.indexed_metadata,
+                ready.symbol_id,
+                Some(ready.resolution_type),
+                Some(ready.start_line),
+                Some(ready.end_line),
+                Some(reason_code),
+                Some(suggested_next_tool.to_string()),
+                None,
+                None,
+                Some(ready.truncated),
+            ));
+        }
         let anchor_quality = if anchors.iter().any(|anchor| anchor.unique_in_file) {
             AnchorQuality::Strong
         } else {
@@ -1951,7 +1929,80 @@ impl Engine {
             candidates: Vec::new(),
             symbol_start_line: None,
             symbol_end_line: None,
+            reason_code: None,
+            suggested_next_tool: None,
         })
+    }
+
+    fn build_large_symbol_prepare_response(
+        &self,
+        snapshot: &Arc<LiveFileSnapshot>,
+        indexed_metadata: &IndexedFileMetadata,
+        symbol_id: Option<String>,
+        resolution_type: Option<EditResolutionType>,
+        symbol_start_line: u64,
+        symbol_end_line: u64,
+    ) -> PrepareEditTargetResponse {
+        self.build_needs_narrowing_prepare_response(
+            snapshot,
+            indexed_metadata,
+            symbol_id,
+            resolution_type,
+            None,
+            None,
+            Some(EditTargetReasonCode::LargeSymbol),
+            Some("get_file_outline".to_string()),
+            Some(symbol_start_line),
+            Some(symbol_end_line),
+            Some(true),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "prepare-edit narrowing responses need to bundle guidance plus optional symbol and span metadata"
+    )]
+    fn build_needs_narrowing_prepare_response(
+        &self,
+        snapshot: &Arc<LiveFileSnapshot>,
+        indexed_metadata: &IndexedFileMetadata,
+        symbol_id: Option<String>,
+        resolution_type: Option<EditResolutionType>,
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+        reason_code: Option<EditTargetReasonCode>,
+        suggested_next_tool: Option<String>,
+        symbol_start_line: Option<u64>,
+        symbol_end_line: Option<u64>,
+        truncated: Option<bool>,
+    ) -> PrepareEditTargetResponse {
+        PrepareEditTargetResponse {
+            status: EditTargetStatus::NeedsNarrowing,
+            repo: Some(snapshot.repo.display().to_string()),
+            repo_label: Some(repo_basename(&snapshot.repo.display().to_string())),
+            relative_path: Some(snapshot.relative_path.clone()),
+            start_line,
+            end_line,
+            content: None,
+            anchors: Vec::new(),
+            anchor_quality: None,
+            resolution_type,
+            file_hash: Some(snapshot.file_hash.clone()),
+            indexed: Some(indexed_metadata.indexed_file_hash.is_some()),
+            stale: indexed_metadata
+                .indexed_file_hash
+                .as_deref()
+                .map(|hash| hash != snapshot.file_hash),
+            indexed_at: indexed_metadata.indexed_at.clone(),
+            indexed_file_hash: indexed_metadata.indexed_file_hash.clone(),
+            symbol_id,
+            truncated,
+            candidates: Vec::new(),
+            symbol_start_line,
+            symbol_end_line,
+            reason_code,
+            suggested_next_tool,
+        }
     }
 
     async fn load_live_file(
@@ -2163,17 +2214,17 @@ impl Engine {
         repo: &Path,
         snapshot: &Arc<LiveFileSnapshot>,
         matches: Vec<TextMatch>,
-        request: &PrepareEditTargetRequest,
+        _request: &PrepareEditTargetRequest,
     ) -> PrepareEditTargetResponse {
         let candidates = matches
             .into_iter()
             .map(|matched| {
                 let preview_start = matched
                     .start_line
-                    .saturating_sub(request.before_lines as u64)
+                    .saturating_sub(PREPARE_AMBIGUOUS_PREVIEW_BEFORE_LINES)
                     .max(1);
-                let preview_end =
-                    (matched.end_line + request.after_lines as u64).min(snapshot.total_lines());
+                let preview_end = (matched.end_line + PREPARE_AMBIGUOUS_PREVIEW_AFTER_LINES)
+                    .min(snapshot.total_lines());
                 EditTargetCandidate {
                     repo: repo.display().to_string(),
                     repo_label: repo_basename(&repo.display().to_string()),
@@ -2182,7 +2233,7 @@ impl Engine {
                     end_line: matched.end_line,
                     preview: snapshot
                         .slice_lines(preview_start, preview_end)
-                        .map(|text| compact_preview(text, SEARCH_TEXT_PREVIEW_CHARS))
+                        .map(|text| compact_preview(text, PREPARE_AMBIGUOUS_PREVIEW_CHARS))
                         .unwrap_or_default(),
                 }
             })
@@ -2208,6 +2259,8 @@ impl Engine {
             candidates,
             symbol_start_line: None,
             symbol_end_line: None,
+            reason_code: Some(EditTargetReasonCode::MultipleMatches),
+            suggested_next_tool: Some("prepare_edit_target".to_string()),
         }
     }
 
@@ -4848,6 +4901,8 @@ fn not_found_prepare_response(
         candidates: Vec::new(),
         symbol_start_line: None,
         symbol_end_line: None,
+        reason_code: None,
+        suggested_next_tool: None,
     }
 }
 
@@ -4873,11 +4928,27 @@ fn not_found_prepare_response_for_file(file: &str) -> PrepareEditTargetResponse 
         candidates: Vec::new(),
         symbol_start_line: None,
         symbol_end_line: None,
+        reason_code: None,
+        suggested_next_tool: None,
     }
 }
 
 fn span_line_count(start_line: u64, end_line: u64) -> u64 {
     end_line.saturating_sub(start_line).saturating_add(1)
+}
+
+fn ready_target_reason(
+    start_line: u64,
+    end_line: u64,
+    anchors: &[EditTargetAnchor],
+) -> Option<(EditTargetReasonCode, &'static str)> {
+    if span_line_count(start_line, end_line) > PREPARE_READY_MAX_LINES as u64 {
+        return Some((EditTargetReasonCode::WindowTooBroad, "search_text"));
+    }
+    if !anchors.iter().any(|anchor| anchor.unique_in_file) {
+        return Some((EditTargetReasonCode::WeakAnchors, "search_text"));
+    }
+    None
 }
 
 fn bounded_window(
@@ -5231,15 +5302,16 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, EditTargetAnchor, IndexCompletionStatus, IndexCoverage,
-        LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode, SearchRequest,
-        TextMatch, bounded_window, build_chunk_context_snippet, build_root_hash, chunk_id,
-        classify_query, collect_live_candidate_files, collection_name, diff_files,
+        CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, IndexCompletionStatus,
+        IndexCoverage, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode,
+        SearchRequest, TextMatch, bounded_window, build_chunk_context_snippet, build_root_hash,
+        chunk_id, classify_query, collect_live_candidate_files, collection_name, diff_files,
         expected_vector_collections, hash_text_like_file, index_status_for_coverage,
         is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
-        plan_search, removed_repo_index_result, run_low_priority_blocking, scan_repo,
-        select_edit_anchors, select_text_match, stale_vector_collections, symbol_collection_name,
-        validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
+        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking,
+        scan_repo, select_edit_anchors, select_text_match, stale_vector_collections,
+        symbol_collection_name, validate_absolute_repo_path, vector_flush_needed,
+        vector_release_needed,
     };
     use crate::config::SearchConfig;
     use crate::engine::live_files::LiveFileStore;
@@ -5357,6 +5429,40 @@ mod tests {
         assert!(anchors.iter().any(|anchor: &EditTargetAnchor| {
             anchor.text.contains("build_value") && anchor.unique_in_file
         }));
+    }
+
+    #[test]
+    fn ready_target_reason_requires_narrow_windows() {
+        let anchors = vec![EditTargetAnchor {
+            line: 100,
+            text:
+                "let exact_key = download_client_item_identity(client_id, download_client_item_id);"
+                    .to_string(),
+            unique_in_file: true,
+        }];
+
+        assert_eq!(
+            ready_target_reason(100, 164, &anchors),
+            Some((EditTargetReasonCode::WindowTooBroad, "search_text"))
+        );
+        assert_eq!(
+            ready_target_reason(1001, 1097, &anchors),
+            Some((EditTargetReasonCode::WindowTooBroad, "search_text"))
+        );
+    }
+
+    #[test]
+    fn ready_target_reason_requires_unique_anchors() {
+        let anchors = vec![EditTargetAnchor {
+            line: 42,
+            text: "}".to_string(),
+            unique_in_file: false,
+        }];
+
+        assert_eq!(
+            ready_target_reason(40, 44, &anchors),
+            Some((EditTargetReasonCode::WeakAnchors, "search_text"))
+        );
     }
 
     #[test]

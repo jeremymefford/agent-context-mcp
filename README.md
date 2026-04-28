@@ -294,11 +294,11 @@ Current tools:
 
 - `list_scopes`
 - `index_codebase`
-- `search_code`
 - `search_symbols`
+- `search_code`
 - `search_text`
-- `prepare_edit_target`
 - `get_file_outline`
+- `prepare_edit_target`
 - `explain_search`
 - `clear_index`
 - `get_indexing_status`
@@ -307,11 +307,11 @@ Preferred routing:
 
 - use `list_scopes` first in an unfamiliar workspace
 - use `search_symbols` first for exact definition lookup
-- use `search_text` for exact literal matches inside a known file or bounded repo-relative tree instead of narrow `rg` or `grep`
-- use `prepare_edit_target` immediately before editing instead of raw file reads so the patch is anchored on live file content
-- use `get_file_outline` once the target file is known
-- use `search_code` for broader semantic or hybrid discovery
-- fall back to shell search only for regex-heavy cases, unindexed files, or MCP outages
+- use `search_code` for broader semantic or hybrid discovery; treat returned snippets as discovery hints, not authoritative reads
+- use `search_text` for exact strings, identifiers, test names, and log lines inside a known file or bounded repo-relative tree instead of narrow `rg`
+- use `get_file_outline` once the target file is known and you need structure rather than broad file reads
+- use `prepare_edit_target` only when the exact patch location is already known; it is the final pre-patch step, not an overview or header-scanning tool
+- fall back to shell `rg` / `sed` / `bat` only for regex-heavy cases, unindexed files, or MCP outages
 
 ## Example Agent Workflow
 
@@ -322,8 +322,8 @@ Typical flow for a code-assistant task:
 3. `search_code` for broader behavior or semantic discovery
 4. `search_text` when a known file or subtree needs exact literal confirmation
 5. `get_file_outline` on the chosen file
-6. `prepare_edit_target` immediately before editing
-7. read and edit the exact files that the search results identified
+6. `prepare_edit_target` only after the exact patch location is known
+7. use shell reads only if regex is required or MCP exact inspection is unavailable
 
 ## CLI Commands
 
