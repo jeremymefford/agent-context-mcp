@@ -60,6 +60,7 @@ const PREPARE_READY_MAX_LINES: usize = 32;
 const PREPARE_AMBIGUOUS_PREVIEW_CHARS: usize = 120;
 const PREPARE_AMBIGUOUS_PREVIEW_BEFORE_LINES: u64 = 1;
 const PREPARE_AMBIGUOUS_PREVIEW_AFTER_LINES: u64 = 1;
+const EXPLICIT_REFRESH_MAX_FILE_PREPARE_PARALLELISM: usize = 8;
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -598,6 +599,17 @@ struct PendingSymbolIndexReplacement {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedRepoFile {
+    relative_path: String,
+    basename: String,
+    extension: String,
+    indexed_at: String,
+    file_hash: String,
+    chunks: Vec<CodeChunk>,
+    symbols: Vec<IndexedSymbol>,
+}
+
+#[derive(Debug, Clone)]
 struct FileFreshnessProbe {
     repo: PathBuf,
     relative_path: String,
@@ -732,6 +744,37 @@ struct SymbolFusionConfig<'a> {
 struct IndexCollections<'a> {
     chunk: &'a str,
     symbol: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessFilesPlan<'a> {
+    repo: &'a Path,
+    repo_key: &'a str,
+    collections: IndexCollections<'a>,
+    splitter: SplitterKind,
+    total_files: usize,
+    mode: IndexExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexExecutionMode {
+    Standard,
+    ExplicitRefresh,
+}
+
+impl IndexExecutionMode {
+    fn file_prepare_parallelism(self) -> usize {
+        match self {
+            Self::Standard => 1,
+            Self::ExplicitRefresh => std::thread::available_parallelism()
+                .map(|count| {
+                    count
+                        .get()
+                        .clamp(2, EXPLICIT_REFRESH_MAX_FILE_PREPARE_PARALLELISM)
+                })
+                .unwrap_or(4),
+        }
+    }
 }
 
 impl ProgressTracker {
@@ -924,6 +967,45 @@ impl Engine {
         custom_extensions: &[String],
         ignore_patterns: &[String],
     ) -> Result<ScopeIndexResult> {
+        self.index_scope_with_mode(
+            scope,
+            force,
+            splitter,
+            custom_extensions,
+            ignore_patterns,
+            IndexExecutionMode::Standard,
+        )
+        .await
+    }
+
+    pub async fn index_scope_explicit_refresh(
+        &self,
+        scope: ResolvedScope,
+        force: bool,
+        splitter: SplitterKind,
+        custom_extensions: &[String],
+        ignore_patterns: &[String],
+    ) -> Result<ScopeIndexResult> {
+        self.index_scope_with_mode(
+            scope,
+            force,
+            splitter,
+            custom_extensions,
+            ignore_patterns,
+            IndexExecutionMode::ExplicitRefresh,
+        )
+        .await
+    }
+
+    async fn index_scope_with_mode(
+        &self,
+        scope: ResolvedScope,
+        force: bool,
+        splitter: SplitterKind,
+        custom_extensions: &[String],
+        ignore_patterns: &[String],
+        mode: IndexExecutionMode,
+    ) -> Result<ScopeIndexResult> {
         let mut results = Vec::new();
         let mut has_errors = false;
         let mut existing_repos = Vec::new();
@@ -957,7 +1039,14 @@ impl Engine {
 
         for repo in existing_repos {
             match self
-                .index_repo(&repo, force, splitter, custom_extensions, ignore_patterns)
+                .index_repo(
+                    &repo,
+                    force,
+                    splitter,
+                    custom_extensions,
+                    ignore_patterns,
+                    mode,
+                )
                 .await
             {
                 Ok(result) => {
@@ -2528,7 +2617,14 @@ impl Engine {
 
             if fingerprint_changed(Some(&existing), &fingerprint) {
                 let result = self
-                    .index_repo(&repo, false, SplitterKind::Ast, &[], &[])
+                    .index_repo(
+                        &repo,
+                        false,
+                        SplitterKind::Ast,
+                        &[],
+                        &[],
+                        IndexExecutionMode::Standard,
+                    )
                     .await?;
                 refreshed.push(result);
             } else {
@@ -2573,6 +2669,7 @@ impl Engine {
         splitter: SplitterKind,
         custom_extensions: &[String],
         ignore_patterns: &[String],
+        mode: IndexExecutionMode,
     ) -> Result<RepoIndexResult> {
         validate_absolute_repo_path(repo)?;
         if !repo.exists() {
@@ -2666,15 +2763,18 @@ impl Engine {
                 let files = current_files.values().cloned().collect::<Vec<_>>();
                 let processing = self
                     .process_files(
-                        repo,
-                        &repo_key,
-                        IndexCollections {
-                            chunk: &collection_name,
-                            symbol: Some(&symbol_collection_name),
+                        ProcessFilesPlan {
+                            repo,
+                            repo_key: &repo_key,
+                            collections: IndexCollections {
+                                chunk: &collection_name,
+                                symbol: Some(&symbol_collection_name),
+                            },
+                            splitter,
+                            total_files: current_files.len(),
+                            mode,
                         },
                         &files,
-                        splitter,
-                        current_files.len(),
                     )
                     .await?;
                 let indexed_hashes = current_hashes
@@ -2775,16 +2875,19 @@ impl Engine {
                     .collect::<Vec<_>>();
                 let processing = self
                     .process_files(
-                        repo,
-                        &repo_key,
-                        IndexCollections {
-                            chunk: &collection_name,
-                            symbol: symbol_collection_ready
-                                .then_some(symbol_collection_name.as_str()),
+                        ProcessFilesPlan {
+                            repo,
+                            repo_key: &repo_key,
+                            collections: IndexCollections {
+                                chunk: &collection_name,
+                                symbol: symbol_collection_ready
+                                    .then_some(symbol_collection_name.as_str()),
+                            },
+                            splitter,
+                            total_files: to_index.len(),
+                            mode,
                         },
                         &to_index,
-                        splitter,
-                        to_index.len(),
                     )
                     .await?;
                 let mut persisted_hashes = previous_hashes
@@ -3455,12 +3558,8 @@ impl Engine {
 
     async fn process_files(
         &self,
-        repo: &Path,
-        repo_key: &str,
-        collections: IndexCollections<'_>,
+        plan: ProcessFilesPlan<'_>,
         files: &[RepoFile],
-        splitter: SplitterKind,
-        total_files: usize,
     ) -> Result<ProcessFilesResult> {
         let mut pending_chunks = Vec::new();
         let mut pending_symbols = Vec::new();
@@ -3471,47 +3570,39 @@ impl Engine {
         let mut status = IndexCompletionStatus::Completed;
         let mut progress_tracker = ProgressTracker::new();
 
-        for file in files {
-            let Some(text) = read_utf8_file(&file.absolute_path).await? else {
+        let repo_path = plan.repo.to_path_buf();
+        let repo_key_owned = plan.repo_key.to_string();
+        let work_items = files.to_vec();
+        let mut prepared_files = futures::stream::iter(work_items.into_iter().map(|file| {
+            let engine = self.clone();
+            let repo = repo_path.clone();
+            let repo_key = repo_key_owned.clone();
+            async move {
+                engine
+                    .prepare_repo_file(&repo, &repo_key, file, plan.splitter)
+                    .await
+            }
+        }))
+        .buffer_unordered(plan.mode.file_prepare_parallelism());
+
+        while let Some(prepared) = prepared_files.next().await {
+            let Some(prepared) = prepared? else {
                 continue;
             };
-            let relative_path = file
-                .absolute_path
-                .strip_prefix(repo)
-                .unwrap_or(file.absolute_path.as_path())
-                .display()
-                .to_string()
-                .replace('\\', "/");
-            let basename = basename_for_path(&relative_path);
-            let extension = file
-                .absolute_path
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| format!(".{value}"))
-                .unwrap_or_default();
-            let chunks = split_text(&file.absolute_path, &text, splitter)?;
-            let chunk_count = chunks.len() as u64;
+            let chunk_count = prepared.chunks.len() as u64;
             if total_chunks + chunk_count > CHUNK_LIMIT as u64 {
                 status = IndexCompletionStatus::LimitReached;
                 break;
             }
-            let indexed_at = crate::snapshot::timestamp();
-            let symbols = extract_symbols(
-                repo_key,
-                &relative_path,
-                &file.absolute_path,
-                &text,
-                &indexed_at,
-                &file.hash,
-            )?;
-            self.write_file_symbols(repo_key, &relative_path, &symbols)
+            self.write_file_symbols(plan.repo_key, &prepared.relative_path, &prepared.symbols)
                 .await?;
-            let symbol_index_docs = symbols
+            let symbol_index_docs = prepared
+                .symbols
                 .iter()
                 .map(|symbol| SymbolIndexDoc {
                     symbol_id: symbol.symbol_id.clone(),
                     relative_path: symbol.relative_path.clone(),
-                    basename: basename.clone(),
+                    basename: prepared.basename.clone(),
                     name: symbol.name.clone(),
                     kind: symbol.kind.clone(),
                     container: symbol.container.clone(),
@@ -3523,60 +3614,64 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
             pending_symbol_index_replacements.push(PendingSymbolIndexReplacement {
-                relative_path: relative_path.clone(),
+                relative_path: prepared.relative_path.clone(),
                 documents: symbol_index_docs,
             });
             if pending_symbol_index_replacements.len() >= SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE {
-                self.flush_symbol_index_replacements(repo, &mut pending_symbol_index_replacements)
-                    .await?;
+                self.flush_symbol_index_replacements(
+                    plan.repo,
+                    &mut pending_symbol_index_replacements,
+                )
+                .await?;
             }
-            if collections.symbol.is_some() {
-                pending_symbols.extend(symbols.iter().cloned().map(|symbol| {
+            if plan.collections.symbol.is_some() {
+                pending_symbols.extend(prepared.symbols.iter().cloned().map(|symbol| {
                     PendingSymbolDocument {
                         symbol,
-                        basename: basename.clone(),
-                        extension: extension.clone(),
+                        basename: prepared.basename.clone(),
+                        extension: prepared.extension.clone(),
                     }
                 }));
                 if pending_symbols.len() >= EMBEDDING_BATCH_SIZE {
-                    self.flush_symbol_documents(collections.symbol, &mut pending_symbols)
+                    self.flush_symbol_documents(plan.collections.symbol, &mut pending_symbols)
                         .await?;
                 }
             }
 
-            for chunk in chunks {
+            for chunk in prepared.chunks {
                 pending_chunks.push(PendingChunk {
                     chunk,
-                    indexed_at: indexed_at.clone(),
-                    file_hash: file.hash.clone(),
+                    indexed_at: prepared.indexed_at.clone(),
+                    file_hash: prepared.file_hash.clone(),
                 });
                 if pending_chunks.len() >= EMBEDDING_BATCH_SIZE {
-                    self.flush_chunks(repo, collections.chunk, &mut pending_chunks)
+                    self.flush_chunks(plan.repo, plan.collections.chunk, &mut pending_chunks)
                         .await?;
                 }
             }
 
-            indexed_paths.insert(relative_path);
+            indexed_paths.insert(prepared.relative_path);
             processed_files += 1;
             total_chunks += chunk_count;
-            if total_files > 0 {
-                let progress = (processed_files as f64 / total_files as f64) * 100.0;
+            if plan.total_files > 0 {
+                let progress = (processed_files as f64 / plan.total_files as f64) * 100.0;
                 if progress_tracker.should_persist(progress) {
-                    self.record_indexing_progress(repo_key, progress).await?;
+                    self.record_indexing_progress(plan.repo_key, progress)
+                        .await?;
                 }
             }
         }
 
         if !pending_chunks.is_empty() {
-            self.flush_chunks(repo, collections.chunk, &mut pending_chunks)
+            self.flush_chunks(plan.repo, plan.collections.chunk, &mut pending_chunks)
                 .await?;
         }
         if !pending_symbols.is_empty() {
-            self.flush_symbol_documents(collections.symbol, &mut pending_symbols)
+            self.flush_symbol_documents(plan.collections.symbol, &mut pending_symbols)
                 .await?;
         }
         if !pending_symbol_index_replacements.is_empty() {
-            self.flush_symbol_index_replacements(repo, &mut pending_symbol_index_replacements)
+            self.flush_symbol_index_replacements(plan.repo, &mut pending_symbol_index_replacements)
                 .await?;
         }
 
@@ -3585,6 +3680,65 @@ impl Engine {
             processed_files,
             status,
         })
+    }
+
+    async fn prepare_repo_file(
+        &self,
+        repo: &Path,
+        repo_key: &str,
+        file: RepoFile,
+        splitter: SplitterKind,
+    ) -> Result<Option<PreparedRepoFile>> {
+        let Some(text) = read_utf8_file(&file.absolute_path).await? else {
+            return Ok(None);
+        };
+        let relative_path = file
+            .absolute_path
+            .strip_prefix(repo)
+            .unwrap_or(file.absolute_path.as_path())
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let basename = basename_for_path(&relative_path);
+        let extension = file
+            .absolute_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default();
+        let indexed_at = crate::snapshot::timestamp();
+
+        let absolute_path = file.absolute_path.clone();
+        let file_hash = file.hash.clone();
+        let repo_key = repo_key.to_string();
+        let relative_path_for_task = relative_path.clone();
+        let indexed_at_for_task = indexed_at.clone();
+        let text_for_task = text;
+        let file_hash_for_task = file_hash.clone();
+        let (chunks, symbols) = tokio::task::spawn_blocking(move || {
+            let chunks = split_text(&absolute_path, &text_for_task, splitter)?;
+            let symbols = extract_symbols(
+                &repo_key,
+                &relative_path_for_task,
+                &absolute_path,
+                &text_for_task,
+                &indexed_at_for_task,
+                &file_hash_for_task,
+            )?;
+            Ok::<_, anyhow::Error>((chunks, symbols))
+        })
+        .await
+        .context("joining file preparation task")??;
+
+        Ok(Some(PreparedRepoFile {
+            relative_path,
+            basename,
+            extension,
+            indexed_at,
+            file_hash,
+            chunks,
+            symbols,
+        }))
     }
 
     async fn flush_chunks(
@@ -5366,9 +5520,9 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 mod tests {
     use super::{
         CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, IndexCompletionStatus,
-        IndexCoverage, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode,
-        SearchRequest, TextMatch, TextSearchScopeRequest, bounded_window,
-        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
+        IndexCoverage, IndexExecutionMode, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot,
+        SearchBudgets, SearchMode, SearchRequest, TextMatch, TextSearchScopeRequest,
+        bounded_window, build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
         collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
         hash_text_like_file, index_status_for_coverage, is_agent_context_vector_collection,
         live_file_exists, narrowest_covering_symbol, plan_search, ready_target_reason,
@@ -5603,6 +5757,12 @@ mod tests {
         assert!(search_text_scans_live_repo(&repo_wide));
         assert!(!search_text_scans_live_repo(&file_scoped));
         assert!(!search_text_scans_live_repo(&subtree_scoped));
+    }
+
+    #[test]
+    fn explicit_refresh_uses_parallel_file_preparation() {
+        assert_eq!(IndexExecutionMode::Standard.file_prepare_parallelism(), 1);
+        assert!(IndexExecutionMode::ExplicitRefresh.file_prepare_parallelism() >= 2);
     }
 
     #[test]
