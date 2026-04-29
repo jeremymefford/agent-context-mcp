@@ -43,6 +43,21 @@ The storage and indexing details matter, but they are implementation details. Th
 
 That accuracy point matters. In larger repositories, the failure mode is usually not that an agent finds nothing. It is that the agent finds one plausible path, misses the real one, and then starts editing or building around an incomplete mental model of the codebase. Better semantic, lexical, and symbol search reduces that drift and makes it much more likely that the agent works on the code that already exists instead of creating a second, parallel path.
 
+## Language Support
+
+`agent-context` does not support every language equally. Today, the practical support tiers are:
+
+- **Strong support**: Rust, TypeScript, TSX, JavaScript, JSX, Python, Go, Java
+- **Supported with more conservative symbol extraction**: C, C++, C#, Kotlin, PHP, Ruby, Swift, Scala
+- **Content-only support**: Markdown
+
+What that means in practice:
+
+- All listed languages are indexed for code search and lexical retrieval.
+- Strong-support languages are the ones with the highest confidence for symbol search and outlines.
+- The conservative tier is still searchable, but symbol extraction is more best-effort and intentionally guarded to avoid poisoning refreshes on ambiguous syntax or generated code.
+- Markdown is useful for semantic and lexical retrieval, but it is not presented as a symbol language.
+
 ## How It Works
 
 ### High-level architecture
