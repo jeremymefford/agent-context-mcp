@@ -413,6 +413,7 @@ pub struct SymbolSearchScopeRequest {
 
 #[derive(Debug, Clone)]
 pub struct TextSearchScopeRequest {
+    pub repo: Option<String>,
     pub query: String,
     pub limit: usize,
     pub path_prefix: Option<String>,
@@ -1338,11 +1339,12 @@ impl Engine {
         scope: ResolvedScope,
         request: TextSearchScopeRequest,
     ) -> Result<TextSearchResponse> {
+        let scope = self.narrow_scope_to_repo(scope, request.repo.as_deref())?;
         if request.query.trim().is_empty() {
             bail!("search_text requires a non-empty `query`");
         }
-        if request.file.is_none() && request.path_prefix.is_none() {
-            bail!("search_text requires `file` or `pathPrefix`");
+        if !text_search_has_bounded_target(&scope, &request) {
+            bail!("search_text requires `file`, `pathPrefix`, or a repo-bounded scope");
         }
         let _request_permit = self.acquire_request_budget().await?;
         let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
@@ -1533,6 +1535,22 @@ impl Engine {
             return Ok(vec![normalize_relative_path(file)]);
         }
 
+        if search_text_scans_live_repo(request) {
+            let language = request.language.clone();
+            let extension_filter = request.extension_filter.clone();
+            let repo_path = repo.to_path_buf();
+            return self
+                .run_search_lexical_blocking("search_text_repo_candidates", move || {
+                    collect_live_candidate_files(
+                        &repo_path,
+                        None,
+                        language.as_deref(),
+                        &extension_filter,
+                    )
+                })
+                .await;
+        }
+
         let lexical_hits = self
             .run_search_lexical_blocking("search_text_shortlist", {
                 let repo_path = repo.to_path_buf();
@@ -1573,10 +1591,37 @@ impl Engine {
                 )
             })
             .await?;
-        if fallback.len() <= SEARCH_TEXT_FALLBACK_MAX_FILES {
+        if request.path_prefix.is_none() || fallback.len() <= SEARCH_TEXT_FALLBACK_MAX_FILES {
             return Ok(fallback);
         }
         Ok(Vec::new())
+    }
+
+    fn narrow_scope_to_repo(
+        &self,
+        scope: ResolvedScope,
+        repo: Option<&str>,
+    ) -> Result<ResolvedScope> {
+        let Some(repo) = repo.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(scope);
+        };
+
+        let repo_scope = self.inner.config.resolve_mcp_scope(Some(repo), None)?;
+        let repo_path = repo_scope
+            .repos
+            .into_iter()
+            .next()
+            .context("repo scope resolved without repos")?;
+        if !scope.repos.iter().any(|candidate| candidate == &repo_path) {
+            bail!("repo `{repo}` is not part of scope `{}`", scope.id);
+        }
+
+        Ok(ResolvedScope {
+            kind: ScopeKind::Repo,
+            id: repo_path.display().to_string(),
+            label: repo_scope.label,
+            repos: vec![repo_path],
+        })
     }
 
     async fn prepare_symbol_edit_target(
@@ -4753,6 +4798,14 @@ fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
     builder.build().context("building ignore matcher")
 }
 
+fn text_search_has_bounded_target(scope: &ResolvedScope, request: &TextSearchScopeRequest) -> bool {
+    request.file.is_some() || request.path_prefix.is_some() || scope.repos.len() == 1
+}
+
+fn search_text_scans_live_repo(request: &TextSearchScopeRequest) -> bool {
+    request.file.is_none() && request.path_prefix.is_none()
+}
+
 fn collect_live_candidate_files(
     repo: &Path,
     path_prefix: Option<&str>,
@@ -4761,17 +4814,20 @@ fn collect_live_candidate_files(
 ) -> Result<Vec<String>> {
     let normalized_prefix = path_prefix
         .map(normalize_relative_path)
-        .filter(|prefix| !prefix.is_empty())
-        .context("search_text fallback requires `pathPrefix`")?;
-    let prefix_path = repo.join(&normalized_prefix);
-    let walk_root = if prefix_path.is_dir() {
-        prefix_path
+        .filter(|prefix| !prefix.is_empty());
+    let walk_root = if let Some(prefix) = normalized_prefix.as_deref() {
+        let prefix_path = repo.join(prefix);
+        if prefix_path.is_dir() {
+            prefix_path
+        } else {
+            prefix_path
+                .parent()
+                .filter(|parent| parent.is_dir())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| repo.to_path_buf())
+        }
     } else {
-        prefix_path
-            .parent()
-            .filter(|parent| parent.is_dir())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| repo.to_path_buf())
+        repo.to_path_buf()
     };
 
     let mut files = Vec::new();
@@ -4800,7 +4856,7 @@ fn collect_live_candidate_files(
             continue;
         };
         let relative_path = relative_path.display().to_string().replace('\\', "/");
-        if !relative_path.starts_with(&normalized_prefix) {
+        if !path_matches_prefix(&relative_path, normalized_prefix.as_deref()) {
             continue;
         }
         if !path_matches_live_filters(&relative_path, language, extension_filter) {
@@ -4815,6 +4871,13 @@ fn collect_live_candidate_files(
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+fn path_matches_prefix(relative_path: &str, prefix: Option<&str>) -> bool {
+    match prefix {
+        None => true,
+        Some(prefix) => relative_path == prefix || relative_path.starts_with(&format!("{prefix}/")),
+    }
 }
 
 fn live_file_exists(repo: &Path, relative_path: &str) -> Result<bool> {
@@ -5304,16 +5367,17 @@ mod tests {
     use super::{
         CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, IndexCompletionStatus,
         IndexCoverage, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, SearchBudgets, SearchMode,
-        SearchRequest, TextMatch, bounded_window, build_chunk_context_snippet, build_root_hash,
-        chunk_id, classify_query, collect_live_candidate_files, collection_name, diff_files,
-        expected_vector_collections, hash_text_like_file, index_status_for_coverage,
-        is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
-        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking,
-        scan_repo, select_edit_anchors, select_text_match, stale_vector_collections,
-        symbol_collection_name, validate_absolute_repo_path, vector_flush_needed,
-        vector_release_needed,
+        SearchRequest, TextMatch, TextSearchScopeRequest, bounded_window,
+        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
+        collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
+        hash_text_like_file, index_status_for_coverage, is_agent_context_vector_collection,
+        live_file_exists, narrowest_covering_symbol, plan_search, ready_target_reason,
+        removed_repo_index_result, run_low_priority_blocking, scan_repo,
+        search_text_scans_live_repo, select_edit_anchors, select_text_match,
+        stale_vector_collections, symbol_collection_name, text_search_has_bounded_target,
+        validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
     };
-    use crate::config::SearchConfig;
+    use crate::config::{ResolvedScope, ScopeKind, SearchConfig};
     use crate::engine::live_files::LiveFileStore;
     use crate::engine::symbols::IndexedSymbol;
     use std::collections::BTreeMap;
@@ -5466,6 +5530,82 @@ mod tests {
     }
 
     #[test]
+    fn text_search_bounded_target_allows_repo_scopes_without_prefix() {
+        let scope = ResolvedScope {
+            kind: ScopeKind::Repo,
+            id: "/tmp/repo".to_string(),
+            label: "repo".to_string(),
+            repos: vec![PathBuf::from("/tmp/repo")],
+        };
+        let request = TextSearchScopeRequest {
+            repo: None,
+            query: "needle".to_string(),
+            limit: 10,
+            path_prefix: None,
+            language: None,
+            file: None,
+            extension_filter: Vec::new(),
+            case_sensitive: true,
+            whole_word: false,
+            context_lines: 1,
+        };
+
+        assert!(text_search_has_bounded_target(&scope, &request));
+    }
+
+    #[test]
+    fn text_search_bounded_target_requires_hint_for_group_scope() {
+        let scope = ResolvedScope {
+            kind: ScopeKind::Group,
+            id: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            repos: vec![PathBuf::from("/tmp/repo-a"), PathBuf::from("/tmp/repo-b")],
+        };
+        let request = TextSearchScopeRequest {
+            repo: None,
+            query: "needle".to_string(),
+            limit: 10,
+            path_prefix: None,
+            language: None,
+            file: None,
+            extension_filter: Vec::new(),
+            case_sensitive: true,
+            whole_word: false,
+            context_lines: 1,
+        };
+
+        assert!(!text_search_has_bounded_target(&scope, &request));
+    }
+
+    #[test]
+    fn repo_bounded_text_search_scans_live_repo() {
+        let repo_wide = TextSearchScopeRequest {
+            repo: None,
+            query: "needle".to_string(),
+            limit: 10,
+            path_prefix: None,
+            language: None,
+            file: None,
+            extension_filter: Vec::new(),
+            case_sensitive: true,
+            whole_word: false,
+            context_lines: 1,
+        };
+        let file_scoped = TextSearchScopeRequest {
+            file: Some("src/lib.rs".to_string()),
+            ..repo_wide.clone()
+        };
+        let subtree_scoped = TextSearchScopeRequest {
+            path_prefix: Some("src".to_string()),
+            ..repo_wide.clone()
+        };
+
+        assert!(search_text_scans_live_repo(&repo_wide));
+        assert!(!search_text_scans_live_repo(&file_scoped));
+        assert!(!search_text_scans_live_repo(&subtree_scoped));
+    }
+
+    #[test]
     fn collect_live_candidate_files_respects_prefix_and_language() {
         let repo = temp_dir("candidates-repo");
         let prefix = repo.join("src").join("pipeline");
@@ -5473,15 +5613,29 @@ mod tests {
         fs::write(prefix.join("worker.rs"), "fn build_worker() {}\n").unwrap();
         fs::write(prefix.join("worker.py"), "def build_worker():\n    pass\n").unwrap();
         fs::write(repo.join("src").join("other.rs"), "fn other() {}\n").unwrap();
+        fs::write(
+            repo.join("src").join("pipeline-two.rs"),
+            "fn other_pipeline() {}\n",
+        )
+        .unwrap();
 
         let rust_only =
             collect_live_candidate_files(&repo, Some("src/pipeline"), Some("rust"), &[]).unwrap();
         let explicit_python =
             collect_live_candidate_files(&repo, Some("src/pipeline"), None, &[String::from(".py")])
                 .unwrap();
+        let repo_wide = collect_live_candidate_files(&repo, None, Some("rust"), &[]).unwrap();
 
         assert_eq!(rust_only, vec!["src/pipeline/worker.rs".to_string()]);
         assert_eq!(explicit_python, vec!["src/pipeline/worker.py".to_string()]);
+        assert_eq!(
+            repo_wide,
+            vec![
+                "src/other.rs".to_string(),
+                "src/pipeline-two.rs".to_string(),
+                "src/pipeline/worker.rs".to_string(),
+            ]
+        );
     }
 
     #[test]

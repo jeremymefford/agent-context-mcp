@@ -126,6 +126,8 @@ struct SearchTextArgs {
     scope: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
     query: String,
     #[serde(default = "default_text_search_limit")]
     limit: usize,
@@ -182,8 +184,14 @@ struct FileOutlineArgs {
     #[serde(default)]
     path: Option<String>,
     file: String,
+    #[serde(default)]
+    detail: Option<String>,
     #[serde(default = "default_outline_depth")]
     max_depth: usize,
+    #[serde(default = "default_outline_max_nodes")]
+    max_nodes: usize,
+    #[serde(default = "default_outline_top_level_limit")]
+    top_level_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -375,6 +383,56 @@ struct CompactEditTargetCandidate {
     preview: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutlineDetail {
+    Summary,
+    Compact,
+    Full,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactFileOutlineResponse {
+    scope: String,
+    label: String,
+    file: String,
+    matches: Vec<CompactFileOutlineMatch>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactFileOutlineMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    repo_label: String,
+    relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    stale: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+    returned_node_count: usize,
+    total_node_count: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    remaining_node_count: usize,
+    symbols: Vec<CompactOutlineNode>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactOutlineNode {
+    symbol_id: String,
+    name: String,
+    kind: String,
+    start_line: u64,
+    end_line: u64,
+    #[serde(skip_serializing_if = "is_false")]
+    has_children: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<CompactOutlineNode>,
+}
+
 pub async fn serve(
     config: &Config,
     listen: &str,
@@ -436,7 +494,7 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code for broader discovery; its snippets are discovery hints, not authoritative reads. Use search_text for exact literals, identifiers, test names, and log lines in a known file or subtree instead of shell rg. Use get_file_outline for file structure once the file is known. Use prepare_edit_target only when the exact patch location is already known; it is the final pre-patch step, not a general reader or overview tool. If prepare_edit_target returns needsNarrowing or ambiguous, go back to search_text or get_file_outline. Fall back to shell rg/sed/bat only when regex is required or MCP exact inspection is unavailable. scope defaults to the configured default group.";
+const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code for broader discovery; its snippets are discovery hints, not authoritative reads. Use search_text for exact literals, identifiers, test names, and log lines in a known repo, file, or subtree instead of shell rg. Use get_file_outline for compact file structure once the file is known. Use prepare_edit_target only when the exact patch location is already known; it is the final pre-patch step, not a general reader or overview tool. If prepare_edit_target returns needsNarrowing or ambiguous, go back to search_text or get_file_outline. Fall back to shell rg/sed/bat only when regex is required or MCP exact inspection is unavailable. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
@@ -460,13 +518,13 @@ pub fn tool_list() -> Vec<Tool> {
         ),
         build_tool(
             "search_text",
-            "Exact literal confirmation inside a known file or pathPrefix. Use this instead of shell rg for identifiers, test names, log lines, and exact strings once discovery is done.",
+            "Exact literal confirmation inside a known repo, file, or pathPrefix. Use this instead of shell rg for identifiers, test names, log lines, and exact strings once discovery is done.",
             true,
             search_text_schema(),
         ),
         build_tool(
             "get_file_outline",
-            "Return the indexed symbol outline for a known repo-relative file. Use this for structure instead of broad file reads.",
+            "Return a compact indexed symbol outline summary for a known repo-relative file. Use this for structure instead of broad file reads.",
             true,
             get_file_outline_schema(),
         ),
@@ -694,6 +752,7 @@ impl ServerHandler for NativeServer {
                         .search_text_scope(
                             scope,
                             TextSearchScopeRequest {
+                                repo: normalize_optional_string(&args.repo),
                                 query: args.query,
                                 limit: args.limit.clamp(1, 50),
                                 path_prefix: normalize_optional_path(&args.path_prefix),
@@ -750,12 +809,22 @@ impl ServerHandler for NativeServer {
                         .config()
                         .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
+                    let detail =
+                        parse_outline_detail(args.detail.as_deref()).map_err(invalid_params)?;
                     let result = self
                         .engine
                         .get_file_outline(scope, &args.file)
                         .await
                         .map_err(internal_error)?;
-                    let result = compact_outline_response(result, args.max_depth.clamp(1, 16));
+                    let result = compact_outline_response(
+                        result,
+                        OutlineCompactionOptions {
+                            detail,
+                            max_depth: args.max_depth.clamp(1, 16),
+                            max_nodes: args.max_nodes.clamp(1, 512),
+                            top_level_limit: args.top_level_limit.clamp(1, 256),
+                        },
+                    );
                     Ok(tool_success(
                         render_outline_summary_text(&result),
                         serde_json::to_value(result).ok(),
@@ -1134,7 +1203,7 @@ fn reason_code_label(reason: EditTargetReasonCode) -> &'static str {
     }
 }
 
-fn render_outline_summary_text(result: &FileOutlineResponse) -> String {
+fn render_outline_summary_text(result: &CompactFileOutlineResponse) -> String {
     let mut lines = vec![format!("Scope: {} file={}", result.label, result.file)];
     if result.matches.is_empty() {
         lines.push("No indexed outline.".to_string());
@@ -1142,10 +1211,12 @@ fn render_outline_summary_text(result: &FileOutlineResponse) -> String {
     }
     for entry in &result.matches {
         lines.push(format!(
-            "{} :: {} symbols={}",
+            "{} :: {} nodes={}/{} truncated={}",
             entry.repo_label,
             entry.relative_path,
-            count_outline_nodes(&entry.symbols)
+            entry.returned_node_count,
+            entry.total_node_count,
+            entry.truncated
         ));
     }
     lines.join("\n")
@@ -1285,34 +1356,116 @@ fn compact_prepare_edit_target_response(
     }
 }
 
-fn compact_outline_response(
-    mut result: FileOutlineResponse,
+#[derive(Debug, Clone, Copy)]
+struct OutlineCompactionOptions {
+    detail: OutlineDetail,
     max_depth: usize,
-) -> FileOutlineResponse {
-    for entry in &mut result.matches {
-        entry.symbols = prune_outline_nodes(&entry.symbols, max_depth);
-    }
-    result
+    max_nodes: usize,
+    top_level_limit: usize,
 }
 
-fn prune_outline_nodes(nodes: &[OutlineNode], max_depth: usize) -> Vec<OutlineNode> {
-    nodes
-        .iter()
-        .map(|node| OutlineNode {
+#[derive(Debug)]
+struct OutlineBudget {
+    remaining_nodes: usize,
+    truncated: bool,
+}
+
+fn compact_outline_response(
+    result: FileOutlineResponse,
+    options: OutlineCompactionOptions,
+) -> CompactFileOutlineResponse {
+    let include_repo = result.matches.len() > 1;
+    CompactFileOutlineResponse {
+        scope: result.scope,
+        label: result.label,
+        file: result.file,
+        matches: result
+            .matches
+            .into_iter()
+            .map(|entry| {
+                let total_node_count = count_outline_nodes(&entry.symbols);
+                let mut budget = OutlineBudget {
+                    remaining_nodes: options.max_nodes.max(1),
+                    truncated: false,
+                };
+                let symbols = compact_outline_nodes(&entry.symbols, options, 1, true, &mut budget);
+                let returned_node_count = count_compact_outline_nodes(&symbols);
+                let remaining_node_count = total_node_count.saturating_sub(returned_node_count);
+                CompactFileOutlineMatch {
+                    repo: include_repo.then_some(entry.repo),
+                    repo_label: entry.repo_label,
+                    relative_path: entry.relative_path,
+                    language: entry.language,
+                    stale: entry.stale,
+                    truncated: budget.truncated || remaining_node_count > 0,
+                    returned_node_count,
+                    total_node_count,
+                    remaining_node_count,
+                    symbols,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn compact_outline_nodes(
+    nodes: &[OutlineNode],
+    options: OutlineCompactionOptions,
+    depth: usize,
+    is_top_level: bool,
+    budget: &mut OutlineBudget,
+) -> Vec<CompactOutlineNode> {
+    let limit = if is_top_level {
+        options.top_level_limit.max(1)
+    } else {
+        usize::MAX
+    };
+    if nodes.len() > limit {
+        budget.truncated = true;
+    }
+
+    let mut compact = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if index >= limit {
+            break;
+        }
+        if budget.remaining_nodes == 0 {
+            budget.truncated = true;
+            break;
+        }
+        budget.remaining_nodes -= 1;
+
+        let has_children = !node.children.is_empty();
+        let children = if should_descend_outline(options, depth) && has_children {
+            compact_outline_nodes(&node.children, options, depth + 1, false, budget)
+        } else {
+            Vec::new()
+        };
+        compact.push(CompactOutlineNode {
             symbol_id: node.symbol_id.clone(),
             name: node.name.clone(),
             kind: node.kind.clone(),
-            container: node.container.clone(),
-            language: node.language.clone(),
             start_line: node.start_line,
             end_line: node.end_line,
-            children: if max_depth <= 1 {
-                Vec::new()
-            } else {
-                prune_outline_nodes(&node.children, max_depth - 1)
-            },
-        })
-        .collect()
+            has_children,
+            children,
+        });
+    }
+    compact
+}
+
+fn should_descend_outline(options: OutlineCompactionOptions, depth: usize) -> bool {
+    match options.detail {
+        OutlineDetail::Summary => false,
+        OutlineDetail::Compact | OutlineDetail::Full => depth < options.max_depth,
+    }
+}
+
+fn count_compact_outline_nodes(nodes: &[CompactOutlineNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| 1 + count_compact_outline_nodes(&node.children))
+        .sum()
 }
 
 fn count_outline_nodes(nodes: &[OutlineNode]) -> usize {
@@ -1328,6 +1481,10 @@ fn round_score(value: f64) -> f64 {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn invalid_params(error: anyhow::Error) -> McpError {
@@ -1368,6 +1525,14 @@ fn default_snippet_chars() -> usize {
 
 fn default_outline_depth() -> usize {
     2
+}
+
+fn default_outline_max_nodes() -> usize {
+    64
+}
+
+fn default_outline_top_level_limit() -> usize {
+    32
 }
 
 fn default_before_lines() -> usize {
@@ -1431,6 +1596,21 @@ fn parse_search_mode(value: Option<&str>) -> Result<SearchMode> {
         "path" => Ok(SearchMode::Path),
         other => anyhow::bail!(
             "invalid mode `{other}`; must be one of `auto`, `semantic`, `hybrid`, `identifier`, or `path`"
+        ),
+    }
+}
+
+fn parse_outline_detail(detail: Option<&str>) -> Result<OutlineDetail> {
+    match detail
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("summary")
+    {
+        "summary" => Ok(OutlineDetail::Summary),
+        "compact" => Ok(OutlineDetail::Compact),
+        "full" => Ok(OutlineDetail::Full),
+        other => anyhow::bail!(
+            "invalid detail `{other}`; must be one of `summary`, `compact`, or `full`"
         ),
     }
 }
@@ -1606,9 +1786,10 @@ fn search_symbols_schema() -> Map<String, Value> {
 fn search_text_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Exact literal confirmation after discovery. Use when file or pathPrefix is already known. This is the MCP replacement for narrow shell rg when you need exact strings, identifiers, test names, or log lines.",
+        "description": "Exact literal confirmation after discovery. Use when the repo, file, or pathPrefix is already known. This is the MCP replacement for narrow shell rg when you need exact strings, identifiers, test names, or log lines.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "repo": nullable_string_schema("Absolute configured repo root to narrow a group scope to one repo."),
             "query": {
                 "type": "string",
                 "description": "Exact literal text to match. Regex is not supported."
@@ -1724,12 +1905,18 @@ fn explain_search_schema() -> Map<String, Value> {
 fn get_file_outline_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Return an indexed symbol outline for a known file.",
+        "description": "Return a compact indexed symbol outline summary for a known file. Defaults to a top-level summary and is not a full symbol dump.",
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "file": {
                 "type": "string",
                 "description": "Repo-relative file path."
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["summary", "compact", "full"],
+                "default": "summary",
+                "description": "Outline detail level. `summary` is top-level only, `compact` expands within a small budget, and `full` is opt-in but still capped."
             },
             "maxDepth": {
                 "type": "integer",
@@ -1737,7 +1924,23 @@ fn get_file_outline_schema() -> Map<String, Value> {
                 "minimum": 1,
                 "maximum": 16,
                 "default": 2,
-                "description": "Maximum outline tree depth."
+                "description": "Maximum outline tree depth for `compact` or `full` detail."
+            },
+            "maxNodes": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 512,
+                "default": 64,
+                "description": "Maximum outline nodes returned across the file."
+            },
+            "topLevelLimit": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 1,
+                "maximum": 256,
+                "default": 32,
+                "description": "Maximum top-level declarations returned before truncation."
             }
         },
         "required": ["file"]
@@ -1779,10 +1982,11 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_INSTRUCTIONS, SearchMode, compact_outline_response,
-        compact_prepare_edit_target_response, compact_search_response,
-        compact_text_search_response, default_limit, enforce_loopback_bind, list_scopes_schema,
-        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
+        OutlineCompactionOptions, OutlineDetail, SERVER_INSTRUCTIONS, SearchMode,
+        compact_outline_response, compact_prepare_edit_target_response, compact_search_response,
+        compact_text_search_response, default_limit, enforce_loopback_bind,
+        get_file_outline_schema, list_scopes_schema, listen_is_loopback,
+        normalize_extension_filter, parse_search_mode, parse_splitter_kind,
         prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
     };
     use crate::engine::splitter::SplitterKind;
@@ -2027,6 +2231,18 @@ mod tests {
                 .unwrap_or_default()
                 .contains("replacement for narrow shell rg")
         );
+        assert!(
+            search_text["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("repo, file, or pathPrefix")
+        );
+        assert!(
+            search_text["properties"]["repo"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("narrow a group scope")
+        );
         assert_eq!(
             search_text["properties"]["contextLines"]["default"].as_u64(),
             Some(1)
@@ -2037,6 +2253,12 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Final pre-patch step only")
         );
+        assert!(
+            search_text["properties"]["repo"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("narrow a group scope")
+        );
         assert!(prepare["properties"].get("beforeLines").is_none());
         assert!(prepare["properties"].get("afterLines").is_none());
         assert!(prepare["properties"].get("maxLines").is_none());
@@ -2046,6 +2268,19 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("Lists configured scopes")
+        );
+        let outline = Value::Object(get_file_outline_schema());
+        assert_eq!(
+            outline["properties"]["detail"]["default"].as_str(),
+            Some("summary")
+        );
+        assert_eq!(
+            outline["properties"]["maxNodes"]["default"].as_u64(),
+            Some(64)
+        );
+        assert_eq!(
+            outline["properties"]["topLevelLimit"]["default"].as_u64(),
+            Some(32)
         );
         assert!(SERVER_INSTRUCTIONS.contains("search_symbols for exact definitions"));
         assert!(SERVER_INSTRUCTIONS.contains("search_text for exact literals"));
@@ -2246,7 +2481,15 @@ mod tests {
             }],
         };
 
-        let compact = compact_outline_response(result, 2);
+        let compact = compact_outline_response(
+            result,
+            OutlineCompactionOptions {
+                detail: OutlineDetail::Compact,
+                max_depth: 2,
+                max_nodes: 64,
+                top_level_limit: 32,
+            },
+        );
 
         assert_eq!(compact.matches[0].symbols[0].children.len(), 1);
         assert!(
@@ -2254,5 +2497,170 @@ mod tests {
                 .children
                 .is_empty()
         );
+        assert_eq!(compact.matches[0].returned_node_count, 2);
+        assert_eq!(compact.matches[0].total_node_count, 3);
+        assert_eq!(compact.matches[0].remaining_node_count, 1);
+        assert!(compact.matches[0].truncated);
+    }
+
+    #[test]
+    fn compact_outline_response_defaults_to_summary_budget() {
+        let result = FileOutlineResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            file: "src/lib.rs".to_string(),
+            matches: vec![FileOutlineMatch {
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                indexed_at: Some("2026-01-01T00:00:00Z".to_string()),
+                stale: false,
+                symbols: vec![
+                    OutlineNode {
+                        symbol_id: "root".to_string(),
+                        name: "Root".to_string(),
+                        kind: "struct".to_string(),
+                        container: None,
+                        language: "rust".to_string(),
+                        start_line: 1,
+                        end_line: 20,
+                        children: vec![OutlineNode {
+                            symbol_id: "child".to_string(),
+                            name: "child".to_string(),
+                            kind: "method".to_string(),
+                            container: Some("Root".to_string()),
+                            language: "rust".to_string(),
+                            start_line: 5,
+                            end_line: 8,
+                            children: Vec::new(),
+                        }],
+                    },
+                    OutlineNode {
+                        symbol_id: "other".to_string(),
+                        name: "Other".to_string(),
+                        kind: "enum".to_string(),
+                        container: None,
+                        language: "rust".to_string(),
+                        start_line: 30,
+                        end_line: 40,
+                        children: Vec::new(),
+                    },
+                ],
+            }],
+        };
+
+        let compact = compact_outline_response(
+            result,
+            OutlineCompactionOptions {
+                detail: OutlineDetail::Summary,
+                max_depth: 2,
+                max_nodes: 64,
+                top_level_limit: 32,
+            },
+        );
+
+        let match_entry = &compact.matches[0];
+        assert!(match_entry.repo.is_none());
+        assert_eq!(match_entry.returned_node_count, 2);
+        assert_eq!(match_entry.total_node_count, 3);
+        assert_eq!(match_entry.remaining_node_count, 1);
+        assert!(match_entry.truncated);
+        assert!(match_entry.symbols[0].children.is_empty());
+        assert!(match_entry.symbols[0].has_children);
+    }
+
+    #[test]
+    fn compact_outline_response_caps_top_level_nodes() {
+        let symbols = (0..4)
+            .map(|index| OutlineNode {
+                symbol_id: format!("sym_{index}"),
+                name: format!("Item{index}"),
+                kind: "function".to_string(),
+                container: None,
+                language: "rust".to_string(),
+                start_line: index + 1,
+                end_line: index + 1,
+                children: Vec::new(),
+            })
+            .collect();
+        let result = FileOutlineResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            file: "src/lib.rs".to_string(),
+            matches: vec![FileOutlineMatch {
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                indexed_at: None,
+                stale: false,
+                symbols,
+            }],
+        };
+
+        let compact = compact_outline_response(
+            result,
+            OutlineCompactionOptions {
+                detail: OutlineDetail::Summary,
+                max_depth: 2,
+                max_nodes: 64,
+                top_level_limit: 2,
+            },
+        );
+
+        assert_eq!(compact.matches[0].symbols.len(), 2);
+        assert_eq!(compact.matches[0].returned_node_count, 2);
+        assert_eq!(compact.matches[0].total_node_count, 4);
+        assert_eq!(compact.matches[0].remaining_node_count, 2);
+        assert!(compact.matches[0].truncated);
+    }
+
+    #[test]
+    fn compact_outline_response_includes_repo_when_multiple_matches_exist() {
+        let match_entry = FileOutlineMatch {
+            repo: "/tmp/repo-a".to_string(),
+            repo_label: "repo-a".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            language: Some("rust".to_string()),
+            indexed_at: None,
+            stale: false,
+            symbols: vec![OutlineNode {
+                symbol_id: "root".to_string(),
+                name: "Root".to_string(),
+                kind: "struct".to_string(),
+                container: None,
+                language: "rust".to_string(),
+                start_line: 1,
+                end_line: 10,
+                children: Vec::new(),
+            }],
+        };
+        let result = FileOutlineResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            file: "src/lib.rs".to_string(),
+            matches: vec![
+                match_entry.clone(),
+                FileOutlineMatch {
+                    repo: "/tmp/repo-b".to_string(),
+                    repo_label: "repo-b".to_string(),
+                    ..match_entry
+                },
+            ],
+        };
+
+        let compact = compact_outline_response(
+            result,
+            OutlineCompactionOptions {
+                detail: OutlineDetail::Summary,
+                max_depth: 2,
+                max_nodes: 64,
+                top_level_limit: 32,
+            },
+        );
+
+        assert_eq!(compact.matches[0].repo.as_deref(), Some("/tmp/repo-a"));
+        assert_eq!(compact.matches[1].repo.as_deref(), Some("/tmp/repo-b"));
     }
 }

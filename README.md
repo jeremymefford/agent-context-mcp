@@ -28,7 +28,7 @@ They are complementary more than competitive. If you want long-term agent memory
 
 - **Semantic search** for natural-language queries like `find the GraphQL schema builder`.
 - **Symbol search** for exact definitions like `build_schema`, `KeyStore`, or `SessionManager`.
-- **Exact text search** for literal strings inside a known file or bounded subtree when an agent needs precise confirmation instead of another ranked search.
+- **Exact text search** for literal strings inside a known repo, file, or bounded subtree when an agent needs precise confirmation instead of another ranked search.
 - **Edit-target preparation** that returns live-file exact content, bounded edit windows, and unique patch anchors immediately before editing.
 - **File outlines** so an agent can inspect structure without scanning entire files.
 - **Hybrid ranking** so exact identifiers, paths, and semantic matches work in one search flow.
@@ -298,7 +298,7 @@ Use the agent-context MCP as the first step for repository discovery and code se
 - Use search_symbols for exact definition lookup when the symbol name is known or suspected.
 - Use search_code for broader semantic or hybrid discovery.
 - Treat search_code snippets as discovery hints, not authoritative reads.
-- Use search_text for exact strings, identifiers, test names, and log lines once the file or subtree is known.
+- Use search_text for exact strings, identifiers, test names, and log lines once the repo, file, or subtree is known.
 - Use get_file_outline when the file is known and you need structure.
 - Use prepare_edit_target only immediately before patching a known location.
 - Do not use prepare_edit_target for broad reading, overview, or header scanning.
@@ -341,7 +341,7 @@ Preferred routing:
 - use `list_scopes` first in an unfamiliar workspace
 - use `search_symbols` first for exact definition lookup
 - use `search_code` for broader semantic or hybrid discovery; treat returned snippets as discovery hints, not authoritative reads
-- use `search_text` for exact strings, identifiers, test names, and log lines inside a known file or bounded repo-relative tree instead of narrow `rg`
+- use `search_text` for exact strings, identifiers, test names, and log lines inside a known repo, known file, or bounded repo-relative tree instead of narrow `rg`
 - use `get_file_outline` once the target file is known and you need structure rather than broad file reads
 - use `prepare_edit_target` only when the exact patch location is already known; it is the final pre-patch step, not an overview or header-scanning tool
 - fall back to shell `rg` / `sed` / `bat` only for regex-heavy cases, unindexed files, or MCP outages
@@ -353,7 +353,7 @@ Typical flow for a code-assistant task:
 1. `list_scopes`
 2. `search_symbols` for an exact symbol if one is known
 3. `search_code` for broader behavior or semantic discovery
-4. `search_text` when a known file or subtree needs exact literal confirmation
+4. `search_text` when a known repo, file, or subtree needs exact literal confirmation
 5. `get_file_outline` on the chosen file
 6. `prepare_edit_target` only after the exact patch location is known
 7. use shell reads only if regex is required or MCP exact inspection is unavailable
