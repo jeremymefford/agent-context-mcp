@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
 use xxhash_rust::xxh3::xxh3_128;
@@ -381,7 +381,13 @@ impl SymbolStore {
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )
                 .context("preparing symbol insert")?;
+            let mut inserted_ids = BTreeSet::new();
             for symbol in symbols {
+                // Keep refreshes resilient if the extractor emits duplicate IDs
+                // for one file batch.
+                if !inserted_ids.insert(symbol.symbol_id.clone()) {
+                    continue;
+                }
                 statement
                     .execute(params![
                         symbol.symbol_id,
@@ -642,6 +648,9 @@ pub fn extract_symbols(
     let Some(config) = symbol_config(path) else {
         return Ok(Vec::new());
     };
+    if should_skip_symbol_extraction(path, text, &config) {
+        return Ok(Vec::new());
+    }
 
     let mut parser = Parser::new();
     parser
@@ -662,6 +671,7 @@ pub fn extract_symbols(
         file_hash,
     };
     collect_symbols(tree.root_node(), &context, &mut stack, &mut output)?;
+    dedupe_symbols_in_place(&mut output);
     Ok(output)
 }
 
@@ -721,6 +731,7 @@ fn collect_symbols(
         .iter()
         .find(|rule| rule.node_kind == node.kind())
         .map(|rule| rule.symbol_kind)
+        && should_index_symbol_node(node, context)
         && let Some(name) = extract_symbol_name(node, context.text)
     {
         let start_line = node.start_position().row as u64 + 1;
@@ -762,6 +773,64 @@ fn collect_symbols(
     }
 
     Ok(())
+}
+
+fn dedupe_symbols_in_place(symbols: &mut Vec<IndexedSymbol>) {
+    let mut seen = BTreeSet::new();
+    symbols.retain(|symbol| seen.insert(symbol.symbol_id.clone()));
+}
+
+fn should_skip_symbol_extraction(path: &Path, text: &str, config: &SymbolConfig) -> bool {
+    match config.language_name {
+        "javascript" | "typescript" => is_probably_minified_javascript_like(path, text),
+        _ => false,
+    }
+}
+
+fn is_probably_minified_javascript_like(path: &Path, text: &str) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !matches!(extension, "js" | "jsx" | "ts" | "tsx") {
+        return false;
+    }
+
+    let line_count = text.lines().take(21).count();
+    if line_count == 0 {
+        return false;
+    }
+
+    let longest_line = text.lines().map(str::len).max().unwrap_or_default();
+    (line_count <= 5 && longest_line >= 2_000) || (line_count <= 20 && longest_line >= 4_000)
+}
+
+fn should_index_symbol_node(node: Node<'_>, context: &SymbolExtractionContext<'_>) -> bool {
+    match context.config.language_name {
+        "cpp" => should_index_cpp_symbol_node(node),
+        _ => true,
+    }
+}
+
+fn should_index_cpp_symbol_node(node: Node<'_>) -> bool {
+    match node.kind() {
+        "struct_specifier" | "class_specifier" => {
+            node.child_by_field_name("body").is_some()
+                || has_named_child_kind(node, "field_declaration_list")
+        }
+        "enum_specifier" => {
+            node.child_by_field_name("body").is_some()
+                || has_named_child_kind(node, "enumerator_list")
+        }
+        _ => true,
+    }
+}
+
+fn has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.is_named())
+        .any(|child| child.kind() == kind)
 }
 
 fn extract_symbol_name(node: Node<'_>, text: &[u8]) -> Option<String> {
@@ -905,7 +974,7 @@ fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SymbolStore, build_outline, extract_symbols};
+    use super::{IndexedSymbol, SymbolStore, build_outline, extract_symbols};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1020,5 +1089,83 @@ mod tests {
         assert_eq!(right_symbol.unwrap().file_hash, "hash-b");
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn c_struct_references_are_not_indexed_as_definitions() {
+        let path = std::path::Path::new("spellfix.c");
+        let text = r#"struct spellfix1_row { int iScore; };
+static int spellfix1_row_compare(const void *A, const void *B){
+  const struct spellfix1_row *a = (const struct spellfix1_row*)A;
+  const struct spellfix1_row *b = (const struct spellfix1_row*)B;
+  return a->iScore - b->iScore;
+}
+"#;
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "spellfix.c",
+            path,
+            text,
+            "2026-01-01T00:00:00Z",
+            "hash-c",
+        )
+        .unwrap();
+
+        let spellfix_structs = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "spellfix1_row" && symbol.kind == "struct")
+            .collect::<Vec<_>>();
+        assert_eq!(spellfix_structs.len(), 1);
+        assert_eq!(spellfix_structs[0].start_line, 1);
+        assert_eq!(spellfix_structs[0].end_line, 1);
+    }
+
+    #[test]
+    fn replace_file_symbols_skips_duplicate_ids_in_same_batch() {
+        let db_path = temp_path("duplicates");
+        let store = SymbolStore::new(db_path.clone());
+        let symbol = IndexedSymbol {
+            symbol_id: "sym_duplicate".to_string(),
+            repo: "/tmp/repo".to_string(),
+            relative_path: "src/main.rs".to_string(),
+            name: "duplicate".to_string(),
+            kind: "function".to_string(),
+            container: None,
+            language: "rust".to_string(),
+            start_line: 10,
+            end_line: 10,
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            file_hash: "hash-1".to_string(),
+            parent_symbol_id: None,
+        };
+
+        store
+            .replace_file_symbols("/tmp/repo", "src/main.rs", &[symbol.clone(), symbol])
+            .unwrap();
+
+        let loaded = store.file_symbols("/tmp/repo", "src/main.rs").unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn minified_javascript_bundle_skips_symbol_extraction() {
+        let path = std::path::Path::new("bundle.min.js");
+        let text = format!(
+            "class A{{constructor(){{}}render(){{}}}}class B{{constructor(){{}}render(){{}}}}{}",
+            "x".repeat(4_100)
+        );
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "bundle.min.js",
+            path,
+            &text,
+            "2026-01-01T00:00:00Z",
+            "hash-js",
+        )
+        .unwrap();
+
+        assert!(symbols.is_empty());
     }
 }

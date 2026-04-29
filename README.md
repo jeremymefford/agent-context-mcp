@@ -272,7 +272,25 @@ Supported values:
 - `claude`
 - `copilot`
 
-### 8. Index your repos
+### 8. Give your agent the right instructions
+
+After the MCP is connected, add something like this to your global agent instructions or repo-local `AGENTS.md` / `CLAUDE.md`:
+
+```text
+Use the agent-context MCP as the first step for repository discovery and code search.
+
+- Call list_scopes first in an unfamiliar workspace.
+- Use search_symbols for exact definition lookup when the symbol name is known or suspected.
+- Use search_code for broader semantic or hybrid discovery.
+- Treat search_code snippets as discovery hints, not authoritative reads.
+- Use search_text for exact strings, identifiers, test names, and log lines once the file or subtree is known.
+- Use get_file_outline when the file is known and you need structure.
+- Use prepare_edit_target only immediately before patching a known location.
+- Do not use prepare_edit_target for broad reading, overview, or header scanning.
+- Fall back to shell rg, sed, or bat only for regex-heavy cases, unindexed files, or MCP outages.
+```
+
+### 9. Index your repos
 
 ```bash
 agent-context refresh-all
@@ -280,7 +298,7 @@ agent-context refresh-all
 agent-context reindex-all
 ```
 
-### 9. Install post-commit hooks
+### 10. Install post-commit hooks
 
 ```bash
 agent-context install-hook /absolute/path/to/repo
