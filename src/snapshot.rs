@@ -55,6 +55,14 @@ pub struct SnapshotEntry {
     pub index_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, rename = "embeddingProfile", skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
+    #[serde(
+        default,
+        rename = "embeddingFingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub embedding_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_updated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,9 +162,9 @@ impl SnapshotStore {
             if entry.status == "indexing" {
                 *entry = SnapshotEntry::failed(
                     reason.to_string(),
-                    entry
-                        .indexing_percentage
-                        .or(entry.last_attempted_percentage),
+                    entry.indexing_percentage.or(entry.last_attempted_percentage),
+                    entry.embedding_profile.clone(),
+                    entry.embedding_fingerprint.clone(),
                 );
                 healed += 1;
             }
@@ -176,6 +184,8 @@ impl SnapshotEntry {
         indexed_files: Option<u64>,
         total_chunks: Option<u64>,
         index_status: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
     ) -> Self {
         Self {
             status: "indexed".to_string(),
@@ -185,6 +195,8 @@ impl SnapshotEntry {
             last_attempted_percentage: None,
             index_status: Some(index_status.into()),
             error_message: None,
+            embedding_profile,
+            embedding_fingerprint,
             last_updated: Some(timestamp()),
             last_audit: None,
             last_head: None,
@@ -193,15 +205,22 @@ impl SnapshotEntry {
         }
     }
 
-    pub fn indexing(progress: f64) -> Self {
+    pub fn indexing(
+        progress: f64,
+        index_status: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) -> Self {
         Self {
             status: "indexing".to_string(),
             indexed_files: None,
             total_chunks: None,
             indexing_percentage: Some(progress),
             last_attempted_percentage: Some(progress),
-            index_status: Some("running".to_string()),
+            index_status: Some(index_status.into()),
             error_message: None,
+            embedding_profile,
+            embedding_fingerprint,
             last_updated: Some(timestamp()),
             last_audit: None,
             last_head: None,
@@ -210,7 +229,12 @@ impl SnapshotEntry {
         }
     }
 
-    pub fn failed(message: impl Into<String>, last_attempted_percentage: Option<f64>) -> Self {
+    pub fn failed(
+        message: impl Into<String>,
+        last_attempted_percentage: Option<f64>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) -> Self {
         Self {
             status: "indexfailed".to_string(),
             indexed_files: None,
@@ -219,6 +243,8 @@ impl SnapshotEntry {
             last_attempted_percentage,
             index_status: Some("failed".to_string()),
             error_message: Some(message.into()),
+            embedding_profile,
+            embedding_fingerprint,
             last_updated: Some(timestamp()),
             last_audit: None,
             last_head: None,
@@ -227,13 +253,13 @@ impl SnapshotEntry {
         }
     }
 
-    pub fn set_indexing_progress(&mut self, progress: f64) {
+    pub fn set_indexing_progress(&mut self, progress: f64, index_status: impl Into<String>) {
         self.status = "indexing".to_string();
         self.indexed_files = None;
         self.total_chunks = None;
         self.indexing_percentage = Some(progress);
         self.last_attempted_percentage = Some(progress);
-        self.index_status = Some("running".to_string());
+        self.index_status = Some(index_status.into());
         self.error_message = None;
         self.last_updated = Some(timestamp());
     }

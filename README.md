@@ -153,6 +153,8 @@ ls -l ~/Library/Application\ Support/agent-context/config.toml
 
 `agent-context` needs an embedding provider for semantic indexing and semantic search. Choose one of these:
 
+You can keep one global default profile, or define multiple named profiles and assign specific repos to a local or hosted provider.
+
 > [!WARNING]
 > If you choose a hosted provider, `agent-context` will send codebase content to that provider to generate embeddings. That means **Voyage** and **OpenAI** will receive text derived from the repositories you index. If that is not acceptable for your environment, use **Ollama** instead.
 
@@ -174,7 +176,14 @@ ls -l ~/Library/Application\ Support/agent-context/config.toml
 Recommended Homebrew service setup:
 
 ```toml
-[embedding.voyage]
+[embedding]
+default_profile = "hosted"
+
+[embedding.profiles.hosted]
+provider = "voyage"
+model = "voyage-code-3"
+
+[embedding.profiles.hosted.voyage]
 api_key_env = "VOYAGE_API_KEY"
 key_file = "~/Library/Application Support/agent-context/voyage_key"
 ```
@@ -191,6 +200,7 @@ chmod 600 ~/Library/Application\ Support/agent-context/voyage_key
 <summary>OpenAI</summary>
 
 - Best fit if you already use the OpenAI API and want hosted embeddings without adding another provider account.
+- Also works for OpenAI-compatible local servers such as LM Studio.
 - Start here:
   - embeddings guide: [OpenAI embeddings guide](https://platform.openai.com/docs/guides/embeddings)
   - API keys: [OpenAI API keys](https://platform.openai.com/settings/organization/api-keys)
@@ -201,10 +211,24 @@ chmod 600 ~/Library/Application\ Support/agent-context/voyage_key
 - Good default:
   - use one of the current `text-embedding-3` models and keep it stable once you start indexing
 
+LM Studio notes:
+
+- Use the `openai` provider with the LM Studio OpenAI-compatible server.
+- Set `base_url` to your LM Studio server URL, usually `http://127.0.0.1:1234/v1`.
+- Set `model` to the embedding model id exposed by LM Studio, not to a chat model id.
+- `agent-context` currently always sends a bearer token in `openai` mode, so configure `api_key_env` or `key_file` with a non-empty value and make sure your LM Studio server tolerates that header.
+
 Recommended Homebrew service setup:
 
 ```toml
-[embedding.openai]
+[embedding]
+default_profile = "hosted"
+
+[embedding.profiles.hosted]
+provider = "openai"
+model = "text-embedding-3-small"
+
+[embedding.profiles.hosted.openai]
 api_key_env = "OPENAI_API_KEY"
 key_file = "~/Library/Application Support/agent-context/openai_key"
 base_url = "https://api.openai.com/v1"
@@ -214,6 +238,21 @@ base_url = "https://api.openai.com/v1"
 mkdir -p ~/Library/Application\ Support/agent-context
 printf '%s\n' 'YOUR_OPENAI_KEY' > ~/Library/Application\ Support/agent-context/openai_key
 chmod 600 ~/Library/Application\ Support/agent-context/openai_key
+```
+
+Example LM Studio setup:
+
+```toml
+[embedding]
+default_profile = "local"
+
+[embedding.profiles.local]
+provider = "openai"
+model = "text-embedding-nomic-embed-text-v1.5"
+
+[embedding.profiles.local.openai]
+api_key_env = "LM_STUDIO_API_KEY"
+base_url = "http://127.0.0.1:1234/v1"
 ```
 
 </details>
@@ -368,6 +407,8 @@ Setup and repair:
 - `agent-context print-mcp-config --client codex|claude|copilot`
 - `agent-context prune-stale-vector-collections` (dry-run)
 - `agent-context prune-stale-vector-collections --apply`
+- `agent-context reset-local-state` (dry-run)
+- `agent-context reset-local-state --apply`
 - `agent-context release-vector-collections`
 
 Indexing and serving:
@@ -379,6 +420,8 @@ Indexing and serving:
 - `agent-context list-tools`
 - `agent-context serve --listen 127.0.0.1:8765 --config ~/Library/Application\ Support/agent-context/config.toml`
 
+`refresh-one` is enqueue-only. It returns quickly after handing the request to the local `agent-context serve` process, and repeated requests for a repo already pending or running are merged instead of triggering back-to-back scans. Use `--listen` if your local service is not on `127.0.0.1:8765`.
+
 ## Configuration
 
 The canonical config shape is:
@@ -389,11 +432,26 @@ index_root = "~/Library/Application Support/agent-context/index-v1"
 default_group = "workspace"
 
 [embedding]
-provider = "voyage" # or openai / ollama
+default_profile = "hosted"
+
+[embedding.profiles.hosted]
+provider = "voyage"
 model = "voyage-code-3"
 
-[embedding.voyage]
+[embedding.profiles.hosted.voyage]
 api_key_env = "VOYAGE_API_KEY"
+
+[embedding.profiles.local]
+provider = "openai"
+model = "text-embedding-nomic-embed-text-v1.5"
+
+[embedding.profiles.local.openai]
+api_key_env = "LM_STUDIO_API_KEY"
+base_url = "http://127.0.0.1:1234/v1"
+
+[[embedding.assignments]]
+repo = "/absolute/path/to/local-repo"
+profile = "local"
 
 [milvus]
 address = "127.0.0.1:19530"
@@ -413,7 +471,19 @@ id = "workspace"
 label = "Workspace"
 repos = [
   "/absolute/path/to/repo",
+  "/absolute/path/to/local-repo",
 ]
+```
+
+The legacy shorthand still works:
+
+```toml
+[embedding]
+provider = "voyage"
+model = "voyage-code-3"
+
+[embedding.voyage]
+api_key_env = "VOYAGE_API_KEY"
 ```
 
 See the full template in [config.example.toml](config.example.toml).
@@ -437,6 +507,7 @@ If an agent is performing installation or recovery:
 - run `doctor` before and after service installation
 - if `doctor` reports stale vector collections, run `prune-stale-vector-collections` first, then rerun with `--apply` after reviewing the names
 - if `doctor` reports too many loaded vector collections, run `release-vector-collections`; it unloads Milvus memory without deleting indexes
+- if a repo root was configured too high and indexing went broad, stop the service, fix the config, run `reset-local-state --apply`, then run `reindex-all`
 - use `print-mcp-config` instead of hand-writing client snippets
 - assume provider or model changes require `reindex-all`
 - prefer `install-hook` over manual hook editing

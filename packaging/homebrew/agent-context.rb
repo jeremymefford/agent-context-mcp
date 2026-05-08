@@ -36,8 +36,8 @@ class AgentContext < Formula
 
       Provider notes:
 
-        - Voyage: prefer embedding.voyage.key_file in config
-        - OpenAI: prefer embedding.openai.key_file in config
+        - Voyage: prefer embedding.profiles.<name>.voyage.key_file in config
+        - OpenAI: prefer embedding.profiles.<name>.openai.key_file in config
         - Ollama: no key required, but the Ollama server must be running
 
       Preferred local setup:

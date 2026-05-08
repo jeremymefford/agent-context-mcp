@@ -1,8 +1,9 @@
-use crate::config::{EmbeddingConfig, EmbeddingProvider};
+use crate::config::{EmbeddingConfig, EmbeddingProfileConfig, EmbeddingProvider};
 use anyhow::{Context, Result, bail};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
@@ -16,6 +17,17 @@ const MAX_RETRIES: usize = 4;
 pub struct EmbeddingClient {
     inner: Arc<EmbeddingInner>,
     dimension: Arc<OnceCell<usize>>,
+}
+
+#[derive(Clone)]
+pub struct EmbeddingRegistry {
+    clients: Arc<BTreeMap<String, EmbeddingRegistryEntry>>,
+}
+
+#[derive(Clone)]
+enum EmbeddingRegistryEntry {
+    Ready(EmbeddingClient),
+    Failed(String),
 }
 
 enum EmbeddingInner {
@@ -60,7 +72,7 @@ struct OllamaEmbedResponse {
 }
 
 impl EmbeddingClient {
-    pub async fn new(config: &EmbeddingConfig) -> Result<Self> {
+    pub async fn new(config: &EmbeddingProfileConfig) -> Result<Self> {
         let inner = match config.provider {
             EmbeddingProvider::Voyage => EmbeddingInner::Voyage(VoyageClient::new(
                 config.api_key()?.context("missing Voyage API key")?,
@@ -144,6 +156,55 @@ impl EmbeddingClient {
             .into_iter()
             .next()
             .context("embedding provider returned no vector for query")
+    }
+}
+
+impl EmbeddingRegistry {
+    pub async fn new(config: &EmbeddingConfig) -> Result<Self> {
+        let mut clients = BTreeMap::new();
+        for (name, profile) in config.profiles() {
+            let entry = match EmbeddingClient::new(profile).await {
+                Ok(client) => EmbeddingRegistryEntry::Ready(client),
+                Err(error) => EmbeddingRegistryEntry::Failed(error.to_string()),
+            };
+            clients.insert(name.clone(), entry);
+        }
+        Ok(Self {
+            clients: Arc::new(clients),
+        })
+    }
+
+    pub fn client(&self, profile_name: &str) -> Result<&EmbeddingClient> {
+        match self
+            .clients
+            .get(profile_name)
+            .with_context(|| format!("embedding profile `{profile_name}` is not initialized"))
+        ? {
+            EmbeddingRegistryEntry::Ready(client) => Ok(client),
+            EmbeddingRegistryEntry::Failed(error) => {
+                bail!("embedding profile `{profile_name}` is unavailable: {error}")
+            }
+        }
+    }
+
+    pub async fn dimension(&self, profile_name: &str) -> Result<usize> {
+        self.client(profile_name)?.dimension().await
+    }
+
+    pub async fn fingerprint(&self, profile_name: &str) -> Result<String> {
+        self.client(profile_name)?.fingerprint().await
+    }
+
+    pub async fn embed_documents(
+        &self,
+        profile_name: &str,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.client(profile_name)?.embed_documents(texts).await
+    }
+
+    pub async fn embed_query(&self, profile_name: &str, text: &str) -> Result<Vec<f32>> {
+        self.client(profile_name)?.embed_query(text).await
     }
 }
 

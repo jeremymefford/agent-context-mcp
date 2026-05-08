@@ -92,19 +92,19 @@ fn render_config(
     snapshot_path: &Path,
     index_root: &Path,
 ) -> String {
-    let embedding_block = match provider {
-        "voyage" => r#"[embedding.voyage]
+    let provider_block = match provider {
+        "voyage" => r#"[embedding.profiles.default.voyage]
 api_key_env = "VOYAGE_API_KEY"
 # key_file = "~/Library/Application Support/agent-context/voyage_key"
 "#
         .to_string(),
-        "openai" => r#"[embedding.openai]
+        "openai" => r#"[embedding.profiles.default.openai]
 api_key_env = "OPENAI_API_KEY"
 # key_file = "~/Library/Application Support/agent-context/openai_key"
 base_url = "https://api.openai.com/v1"
 "#
         .to_string(),
-        "ollama" => r#"[embedding.ollama]
+        "ollama" => r#"[embedding.profiles.default.ollama]
 base_url = "http://127.0.0.1:11434"
 "#
         .to_string(),
@@ -124,10 +124,27 @@ index_root = "{}"
 default_group = "{}"
 
 [embedding]
+default_profile = "default"
+
+[embedding.profiles.default]
 provider = "{}"
 model = "{}"
 
 {}
+# Example second profile for a local embedding server:
+# [embedding.profiles.local]
+# provider = "openai"
+# model = "text-embedding-nomic-embed-text-v1.5"
+#
+# [embedding.profiles.local.openai]
+# api_key_env = "LM_STUDIO_API_KEY"
+# base_url = "http://127.0.0.1:1234/v1"
+#
+# Example repo-specific assignment:
+# [[embedding.assignments]]
+# repo = "/absolute/path/to/local-repo"
+# profile = "local"
+
 [milvus]
 address = "127.0.0.1:19530"
 # token_env = "MILVUS_TOKEN"
@@ -154,7 +171,7 @@ repos = [
         group_id,
         provider,
         model,
-        embedding_block,
+        provider_block,
         group_id,
         repos_block
     )
@@ -179,8 +196,9 @@ mod tests {
             Path::new("/tmp/snapshot.json"),
             Path::new("/tmp/index-v1"),
         );
+        assert!(config.contains("default_profile = \"default\""));
         assert!(config.contains("provider = \"openai\""));
-        assert!(config.contains("[embedding.openai]"));
+        assert!(config.contains("[embedding.profiles.default.openai]"));
         assert!(config.contains("/tmp/repo"));
     }
 }

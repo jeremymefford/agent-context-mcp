@@ -3,20 +3,39 @@ index_root = "~/Library/Application Support/agent-context/index-v1"
 default_group = "workspace"
 
 [embedding]
+default_profile = "hosted"
+
+[embedding.profiles.hosted]
 provider = "voyage"
 model = "voyage-code-3"
 
-[embedding.voyage]
+[embedding.profiles.hosted.voyage]
 api_key_env = "VOYAGE_API_KEY"
 # key_file = "~/Library/Application Support/agent-context/voyage_key"
 
-[embedding.openai]
+[embedding.profiles.local]
+provider = "openai"
+model = "text-embedding-nomic-embed-text-v1.5"
+
+[embedding.profiles.local.openai]
 api_key_env = "OPENAI_API_KEY"
 # key_file = "~/Library/Application Support/agent-context/openai_key"
 base_url = "https://api.openai.com/v1"
+# For LM Studio, set:
+# api_key_env = "LM_STUDIO_API_KEY"
+# base_url = "http://127.0.0.1:1234/v1"
 
-[embedding.ollama]
+[embedding.profiles.ollama]
+provider = "ollama"
+model = "embeddinggemma"
+
+[embedding.profiles.ollama.ollama]
 base_url = "http://127.0.0.1:11434"
+
+# Assign specific repos to non-default profiles.
+# [[embedding.assignments]]
+# repo = "/absolute/path/to/repo"
+# profile = "local"
 
 [milvus]
 address = "127.0.0.1:19530"

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xxhash_rust::xxh3::Xxh3;
 
-use self::embedding::EmbeddingClient;
+use self::embedding::EmbeddingRegistry;
 use self::freshness::{
     AuditFingerprint, apply_fingerprint, fingerprint_changed, fingerprint_repo,
     merkle_snapshot_path,
@@ -75,7 +75,7 @@ struct EngineInner {
     config: Config,
     snapshot: SnapshotStore,
     milvus: MilvusClient,
-    embedding: EmbeddingClient,
+    embedding: EmbeddingRegistry,
     local_index: LocalIndexStore,
     live_files: LiveFileStore,
     symbol_store: SymbolStore,
@@ -490,6 +490,14 @@ pub struct RepoStatus {
     pub indexing_percentage: Option<f64>,
     pub last_attempted_percentage: Option<f64>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_embedding_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_embedding_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_mismatch_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -720,11 +728,17 @@ pub struct IndexIdentityStatus {
     pub compatible: bool,
     pub index_format_version: String,
     pub search_root_version: String,
-    pub configured_embedding_fingerprint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stored_embedding_fingerprint: Option<String>,
+    pub configured_embedding_fingerprints: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoEmbeddingIdentityStatus {
+    profile_name: String,
+    configured_fingerprint: Option<String>,
+    stored_fingerprint: Option<String>,
+    reason: Option<String>,
 }
 
 struct ProgressTracker {
@@ -750,6 +764,7 @@ struct IndexCollections<'a> {
 struct ProcessFilesPlan<'a> {
     repo: &'a Path,
     repo_key: &'a str,
+    profile_name: &'a str,
     collections: IndexCollections<'a>,
     splitter: SplitterKind,
     total_files: usize,
@@ -844,7 +859,7 @@ impl SearchBudgets {
 
 impl Engine {
     pub async fn new(config: &Config) -> Result<Self> {
-        let embedding = EmbeddingClient::new(&config.embedding).await?;
+        let embedding = EmbeddingRegistry::new(&config.embedding).await?;
         let milvus = MilvusClient::new(&config.milvus)?;
         Ok(Self {
             inner: Arc::new(EngineInner {
@@ -867,22 +882,66 @@ impl Engine {
         &self.inner.config
     }
 
-    pub async fn embedding_fingerprint(&self) -> Result<String> {
-        self.inner.embedding.fingerprint().await
+    fn embedding_profile_name_for_repo<'a>(&'a self, repo: &Path) -> Result<&'a str> {
+        self.inner.config.embedding.profile_name_for_repo(repo)
+    }
+
+    async fn embedding_fingerprint_for_repo(&self, repo: &Path) -> Result<String> {
+        let profile_name = self.embedding_profile_name_for_repo(repo)?;
+        self.inner.embedding.fingerprint(profile_name).await
+    }
+
+    async fn embedding_dimension_for_repo(&self, repo: &Path) -> Result<usize> {
+        let profile_name = self.embedding_profile_name_for_repo(repo)?;
+        self.inner.embedding.dimension(profile_name).await
+    }
+
+    async fn configured_embedding_fingerprints(&self) -> Result<BTreeMap<String, String>> {
+        let mut fingerprints = BTreeMap::new();
+        for profile_name in self.inner.config.embedding.profiles().map(|(name, _)| name) {
+            fingerprints.insert(
+                profile_name.clone(),
+                self.inner.embedding.fingerprint(profile_name).await?,
+            );
+        }
+        Ok(fingerprints)
+    }
+
+    async fn repo_embedding_identity_status(
+        &self,
+        snapshot: &Snapshot,
+        repo: &Path,
+    ) -> Result<RepoEmbeddingIdentityStatus> {
+        let repo_key = repo.display().to_string();
+        let entry = snapshot.codebases.get(&repo_key);
+        let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
+        let configured_fingerprint = self
+            .inner
+            .embedding
+            .fingerprint(&profile_name)
+            .await
+            .ok();
+        Ok(repo_embedding_identity_status_for_snapshot(
+            snapshot,
+            entry,
+            &profile_name,
+            configured_fingerprint,
+        ))
     }
 
     pub async fn healthcheck(&self) -> Result<()> {
         self.inner.milvus.healthcheck().await?;
-        let _ = self.embedding_fingerprint().await?;
+        let _ = self.configured_embedding_fingerprints().await?;
         Ok(())
     }
 
     pub async fn index_identity_status(&self) -> Result<IndexIdentityStatus> {
         let snapshot = self.inner.snapshot.read().await?;
-        let configured_embedding_fingerprint = self.embedding_fingerprint().await?;
+        let configured_embedding_fingerprints = self.configured_embedding_fingerprints().await?;
         Ok(index_identity_status_for_snapshot(
             &snapshot,
-            &configured_embedding_fingerprint,
+            self.inner.config.embedding.default_profile_name(),
+            &configured_embedding_fingerprints,
         ))
     }
 
@@ -947,12 +1006,14 @@ impl Engine {
     pub async fn mark_scope_indexing(&self, scope: &ResolvedScope) -> Result<()> {
         for repo in &scope.repos {
             let repo_key = repo.display().to_string();
+            let profile_name = self.embedding_profile_name_for_repo(repo).ok().map(str::to_string);
             self.inner
                 .snapshot
                 .update(|snapshot| {
-                    snapshot
-                        .codebases
-                        .insert(repo_key.clone(), SnapshotEntry::indexing(0.0));
+                    snapshot.codebases.insert(
+                        repo_key.clone(),
+                        SnapshotEntry::indexing(0.0, "queued", profile_name.clone(), None),
+                    );
                 })
                 .await?;
         }
@@ -978,6 +1039,7 @@ impl Engine {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn index_scope_explicit_refresh(
         &self,
         scope: ResolvedScope,
@@ -993,6 +1055,30 @@ impl Engine {
             custom_extensions,
             ignore_patterns,
             IndexExecutionMode::ExplicitRefresh,
+        )
+        .await
+    }
+
+    pub async fn index_scope_background(
+        &self,
+        scope: ResolvedScope,
+        force: bool,
+        explicit_refresh: bool,
+        splitter: SplitterKind,
+        custom_extensions: &[String],
+        ignore_patterns: &[String],
+    ) -> Result<ScopeIndexResult> {
+        self.index_scope_with_mode(
+            scope,
+            force,
+            splitter,
+            custom_extensions,
+            ignore_patterns,
+            if explicit_refresh {
+                IndexExecutionMode::ExplicitRefresh
+            } else {
+                IndexExecutionMode::Standard
+            },
         )
         .await
     }
@@ -1106,7 +1192,6 @@ impl Engine {
         scope: ResolvedScope,
         request: &SearchRequest,
     ) -> Result<SearchExplanation> {
-        self.ensure_index_identity(false).await?;
         let plan = plan_search(request);
         Ok(SearchExplanation {
             scope: scope.id,
@@ -1177,31 +1262,71 @@ impl Engine {
         scope: ResolvedScope,
         request: SearchRequest,
     ) -> Result<SearchResponse> {
-        self.ensure_index_identity(false).await?;
         let _request_permit = self.acquire_request_budget().await?;
         let plan = plan_search(&request);
-        let query_vector = if plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0 {
-            let _dense_permit = self.acquire_dense_budget().await?;
-            Some(Arc::new(
-                self.inner.embedding.embed_query(&request.query).await?,
-            ))
-        } else {
-            None
-        };
         let per_repo_limit = (request.limit.max(5) * 4).min(64);
         let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
         let filter_expression = build_extension_filter(&request.extension_filter);
         let snapshot = self.inner.snapshot.read().await?;
+        let scope_repos = scope.repos;
+        let mut blocked_repos = HashMap::new();
+        let mut query_vectors: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
 
-        let mut stream = futures::stream::iter(scope.repos.into_iter().map(|repo| {
+        for repo in &scope_repos {
+            let identity = self.repo_embedding_identity_status(&snapshot, repo).await?;
+            if let Some(reason) = identity.reason {
+                blocked_repos.insert(repo.display().to_string(), reason);
+            }
+        }
+
+        if plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0 {
+            let mut repos_by_profile: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for repo in &scope_repos {
+                let repo_key = repo.display().to_string();
+                if blocked_repos.contains_key(&repo_key) {
+                    continue;
+                }
+                let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
+                repos_by_profile.entry(profile_name).or_default().push(repo_key);
+            }
+
+            for (profile_name, repo_keys) in repos_by_profile {
+                let _dense_permit = self.acquire_dense_budget().await?;
+                match self.inner.embedding.embed_query(&profile_name, &request.query).await {
+                    Ok(vector) => {
+                        let vector = Arc::new(vector);
+                        for repo_key in repo_keys {
+                            query_vectors.insert(repo_key, vector.clone());
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        for repo_key in repo_keys {
+                            blocked_repos.insert(repo_key, message.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut stream = futures::stream::iter(scope_repos.into_iter().map(|repo| {
             let engine = self.clone();
             let request = request.clone();
             let plan = plan.clone();
-            let query_vector = query_vector.clone();
+            let query_vector = query_vectors.get(&repo.display().to_string()).cloned();
+            let repo_error = blocked_repos.get(&repo.display().to_string()).cloned();
             let filter_expression = filter_expression.clone();
             let entry = snapshot.codebases.get(&repo.display().to_string()).cloned();
             async move {
                 let repo_label = repo.display().to_string();
+                if let Some(error) = repo_error {
+                    return RepoSearchOutcome {
+                        repo: repo_label,
+                        stale: false,
+                        hits: Vec::new(),
+                        error: Some(error),
+                    };
+                }
                 let _repo_permit = match engine.acquire_repo_search_budget().await {
                     Ok(permit) => permit,
                     Err(error) => {
@@ -1290,7 +1415,6 @@ impl Engine {
         scope: ResolvedScope,
         request: SymbolSearchScopeRequest,
     ) -> Result<SymbolSearchResponse> {
-        self.ensure_index_identity(false).await?;
         let _request_permit = self.acquire_request_budget().await?;
         let flavor = classify_query(&request.query);
         let (lexical_share, semantic_share) = symbol_query_shares(flavor);
@@ -1301,28 +1425,70 @@ impl Engine {
         } else {
             HashMap::new()
         };
-        let any_symbol_collections = symbol_collection_presence.values().any(|exists| *exists);
-        let query_vector = if semantic_share > 0.0 && any_symbol_collections {
-            let _dense_permit = self.acquire_dense_budget().await?;
-            Some(Arc::new(
-                self.inner.embedding.embed_query(&request.query).await?,
-            ))
-        } else {
-            None
-        };
         let per_repo_limit = (request.limit.max(5) * 4).min(64);
         let snapshot = self.inner.snapshot.read().await?;
+        let mut blocked_repos = HashMap::new();
+        let mut query_vectors: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+
+        for repo in &scope_repos {
+            let identity = self.repo_embedding_identity_status(&snapshot, repo).await?;
+            if let Some(reason) = identity.reason {
+                blocked_repos.insert(repo.display().to_string(), reason);
+            }
+        }
+
+        let any_symbol_collections = symbol_collection_presence.values().any(|exists| *exists);
+        if semantic_share > 0.0 && any_symbol_collections {
+            let mut repos_by_profile: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for repo in &scope_repos {
+                let repo_key = repo.display().to_string();
+                if blocked_repos.contains_key(&repo_key) {
+                    continue;
+                }
+                if !symbol_collection_presence
+                    .get(&repo_key)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
+                repos_by_profile.entry(profile_name).or_default().push(repo_key);
+            }
+
+            for (profile_name, repo_keys) in repos_by_profile {
+                let _dense_permit = self.acquire_dense_budget().await?;
+                match self.inner.embedding.embed_query(&profile_name, &request.query).await {
+                    Ok(vector) => {
+                        let vector = Arc::new(vector);
+                        for repo_key in repo_keys {
+                            query_vectors.insert(repo_key, vector.clone());
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        for repo_key in repo_keys {
+                            blocked_repos.insert(repo_key, message.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         let mut stream = futures::stream::iter(scope_repos.into_iter().map(|repo| {
             let engine = self.clone();
             let request = request.clone();
-            let query_vector = query_vector.clone();
+            let query_vector = query_vectors.get(&repo.display().to_string()).cloned();
+            let repo_error = blocked_repos.get(&repo.display().to_string()).cloned();
             let entry = snapshot.codebases.get(&repo.display().to_string()).cloned();
             let symbol_collection_exists = symbol_collection_presence
                 .get(&repo.display().to_string())
                 .copied()
                 .unwrap_or(false);
             async move {
+                if let Some(error) = repo_error {
+                    return Err(anyhow::anyhow!("{}: {error}", repo.display()));
+                }
                 let _repo_permit = engine.acquire_repo_search_budget().await?;
                 let stale = engine
                     .repo_is_stale(&repo, entry.as_ref())
@@ -1508,7 +1674,6 @@ impl Engine {
         scope: ResolvedScope,
         file: &str,
     ) -> Result<FileOutlineResponse> {
-        self.ensure_index_identity(false).await?;
         let normalized_file = normalize_relative_path(file);
         let snapshot = self.inner.snapshot.read().await?;
         let mut matches = Vec::new();
@@ -2555,8 +2720,11 @@ impl Engine {
 
     pub async fn status_scope(&self, scope: ResolvedScope) -> Result<StatusReport> {
         let snapshot = self.inner.snapshot.read().await?;
-        let identity_status =
-            index_identity_status_for_snapshot(&snapshot, &self.embedding_fingerprint().await?);
+        let identity_status = index_identity_status_for_snapshot(
+            &snapshot,
+            self.inner.config.embedding.default_profile_name(),
+            &self.configured_embedding_fingerprints().await?,
+        );
         let mut repos = Vec::new();
         let mut indexed_files = 0u64;
         let mut total_chunks = 0u64;
@@ -2635,6 +2803,7 @@ impl Engine {
         Ok(refreshed)
     }
 
+    #[allow(dead_code)]
     async fn ensure_index_identity(&self, allow_rebuild: bool) -> Result<()> {
         let status = self.index_identity_status().await?;
         if status.compatible || allow_rebuild {
@@ -2649,14 +2818,19 @@ impl Engine {
         );
     }
 
+    #[allow(dead_code)]
     async fn persist_index_identity(&self) -> Result<()> {
-        let configured_embedding_fingerprint = self.embedding_fingerprint().await?;
+        let configured_embedding_fingerprints = self.configured_embedding_fingerprints().await?;
+        let default_profile = self.inner.config.embedding.default_profile_name().to_string();
+        let legacy_fingerprint = configured_embedding_fingerprints
+            .get(&default_profile)
+            .cloned();
         self.inner
             .snapshot
             .update(|snapshot| {
                 snapshot.index_format_version = INDEX_FORMAT_VERSION.to_string();
                 snapshot.search_root_version = SEARCH_ROOT_VERSION.to_string();
-                snapshot.embedding_fingerprint = Some(configured_embedding_fingerprint.clone());
+                snapshot.embedding_fingerprint = legacy_fingerprint.clone();
             })
             .await?;
         Ok(())
@@ -2677,12 +2851,30 @@ impl Engine {
         }
         validate_repo_path(repo)?;
         let repo_key = repo.display().to_string();
+        let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
+        let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await?;
+        let configured_embedding_dimension = self.embedding_dimension_for_repo(repo).await?;
+        let snapshot_before = self.inner.snapshot.read().await?;
+        let repo_identity =
+            repo_embedding_identity_status_for_snapshot(
+                &snapshot_before,
+                snapshot_before.codebases.get(&repo_key),
+                &profile_name,
+                Some(configured_embedding_fingerprint.clone()),
+            );
+        drop(snapshot_before);
         self.inner
             .snapshot
             .update(|snapshot| {
-                snapshot
-                    .codebases
-                    .insert(repo_key.clone(), SnapshotEntry::indexing(0.0));
+                snapshot.codebases.insert(
+                    repo_key.clone(),
+                    SnapshotEntry::indexing(
+                        0.0,
+                        "running",
+                        Some(profile_name.clone()),
+                        Some(configured_embedding_fingerprint.clone()),
+                    ),
+                );
             })
             .await?;
 
@@ -2711,7 +2903,7 @@ impl Engine {
             .milvus
             .refresh_collection_presence(&symbol_collection_name)
             .await?;
-        let previous_snapshot = if force || !collection_exists {
+        let previous_snapshot = if force || !collection_exists || repo_identity.reason.is_some() {
             None
         } else {
             load_merkle_snapshot(&merkle_path)
@@ -2748,7 +2940,7 @@ impl Engine {
                     .milvus
                     .create_hybrid_collection(
                         &collection_name,
-                        self.inner.embedding.dimension().await?,
+                        configured_embedding_dimension,
                         &format!("codebasePath:{}", repo.display()),
                     )
                     .await?;
@@ -2756,7 +2948,7 @@ impl Engine {
                     .milvus
                     .create_hybrid_collection(
                         &symbol_collection_name,
-                        self.inner.embedding.dimension().await?,
+                        configured_embedding_dimension,
                         &format!("symbolCodebasePath:{}", repo.display()),
                     )
                     .await?;
@@ -2766,6 +2958,7 @@ impl Engine {
                         ProcessFilesPlan {
                             repo,
                             repo_key: &repo_key,
+                            profile_name: &profile_name,
                             collections: IndexCollections {
                                 chunk: &collection_name,
                                 symbol: Some(&symbol_collection_name),
@@ -2810,7 +3003,7 @@ impl Engine {
                         .milvus
                         .create_hybrid_collection(
                             &symbol_collection_name,
-                            self.inner.embedding.dimension().await?,
+                            configured_embedding_dimension,
                             &format!("symbolCodebasePath:{}", repo.display()),
                         )
                         .await?;
@@ -2878,6 +3071,7 @@ impl Engine {
                         ProcessFilesPlan {
                             repo,
                             repo_key: &repo_key,
+                            profile_name: &profile_name,
                             collections: IndexCollections {
                                 chunk: &collection_name,
                                 symbol: symbol_collection_ready
@@ -2953,7 +3147,12 @@ impl Engine {
                                 });
                             snapshot.codebases.insert(
                                 repo_key.clone(),
-                                SnapshotEntry::failed(message.clone(), last_progress),
+                                SnapshotEntry::failed(
+                                    message.clone(),
+                                    last_progress,
+                                    Some(profile_name.clone()),
+                                    Some(configured_embedding_fingerprint.clone()),
+                                ),
                             );
                         })
                         .await?;
@@ -2975,11 +3174,20 @@ impl Engine {
                         let entry = snapshot
                             .codebases
                             .entry(repo_key.clone())
-                            .or_insert_with(|| SnapshotEntry::indexing(0.0));
+                            .or_insert_with(|| {
+                                SnapshotEntry::indexing(
+                                    0.0,
+                                    "running",
+                                    Some(profile_name.clone()),
+                                    Some(configured_embedding_fingerprint.clone()),
+                                )
+                            });
                         *entry = SnapshotEntry::indexed_with_status(
                             Some(coverage.indexed_files),
                             Some(coverage.total_chunks),
                             index_status.clone(),
+                            Some(profile_name.clone()),
+                            Some(configured_embedding_fingerprint.clone()),
                         );
                         if let Some(fingerprint) = &fingerprint {
                             apply_fingerprint(entry, fingerprint);
@@ -3009,7 +3217,12 @@ impl Engine {
                         });
                         snapshot.codebases.insert(
                             repo_key.clone(),
-                            SnapshotEntry::failed(message.clone(), last_progress),
+                            SnapshotEntry::failed(
+                                message.clone(),
+                                last_progress,
+                                Some(profile_name.clone()),
+                                Some(configured_embedding_fingerprint.clone()),
+                            ),
                         );
                     })
                     .await?;
@@ -3412,6 +3625,7 @@ impl Engine {
         let repo_key = repo.display().to_string();
         let collection_name = collection_name(repo);
         let entry = snapshot.codebases.get(&repo_key).cloned();
+        let identity = self.repo_embedding_identity_status(snapshot, repo).await?;
 
         if matches!(
             entry.as_ref().map(|value| value.status.as_str()),
@@ -3434,6 +3648,10 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
+                embedding_profile: Some(identity.profile_name),
+                configured_embedding_fingerprint: identity.configured_fingerprint,
+                stored_embedding_fingerprint: identity.stored_fingerprint,
+                embedding_mismatch_reason: identity.reason,
             });
         }
 
@@ -3449,6 +3667,10 @@ impl Engine {
                 indexing_percentage: entry.indexing_percentage,
                 last_attempted_percentage: entry.last_attempted_percentage,
                 error_message: entry.error_message,
+                embedding_profile: entry.embedding_profile.or(Some(identity.profile_name)),
+                configured_embedding_fingerprint: identity.configured_fingerprint,
+                stored_embedding_fingerprint: identity.stored_fingerprint,
+                embedding_mismatch_reason: identity.reason,
             },
             None => RepoStatus {
                 repo: repo_key.clone(),
@@ -3461,6 +3683,10 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
+                embedding_profile: Some(identity.profile_name),
+                configured_embedding_fingerprint: identity.configured_fingerprint,
+                stored_embedding_fingerprint: identity.stored_fingerprint,
+                embedding_mismatch_reason: identity.reason,
             },
         })
     }
@@ -3489,6 +3715,19 @@ impl Engine {
         Ok(report.loaded_collections)
     }
 
+    pub async fn drop_vector_collections(&self, collections: &[String]) -> Result<Vec<String>> {
+        let mut dropped = Vec::new();
+        for collection in collections {
+            self.inner
+                .milvus
+                .drop_collection(collection)
+                .await
+                .with_context(|| format!("dropping Milvus collection {collection}"))?;
+            dropped.push(collection.clone());
+        }
+        Ok(dropped)
+    }
+
     async fn record_fingerprint(
         &self,
         repo_key: &str,
@@ -3505,15 +3744,31 @@ impl Engine {
         Ok(())
     }
 
-    async fn record_indexing_progress(&self, repo_key: &str, progress: f64) -> Result<()> {
+    async fn record_indexing_progress(
+        &self,
+        repo: &Path,
+        repo_key: &str,
+        progress: f64,
+    ) -> Result<()> {
+        let profile_name = self.embedding_profile_name_for_repo(repo).ok().map(str::to_string);
+        let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await.ok();
         self.inner
             .snapshot
             .update(|snapshot| {
                 let entry = snapshot
                     .codebases
                     .entry(repo_key.to_string())
-                    .or_insert_with(|| SnapshotEntry::indexing(progress));
-                entry.set_indexing_progress(progress);
+                    .or_insert_with(|| {
+                        SnapshotEntry::indexing(
+                            progress,
+                            "running",
+                            profile_name.clone(),
+                            configured_embedding_fingerprint.clone(),
+                        )
+                    });
+                entry.embedding_profile = profile_name.clone();
+                entry.embedding_fingerprint = configured_embedding_fingerprint.clone();
+                entry.set_indexing_progress(progress, "running");
             })
             .await?;
         Ok(())
@@ -3633,7 +3888,11 @@ impl Engine {
                     }
                 }));
                 if pending_symbols.len() >= EMBEDDING_BATCH_SIZE {
-                    self.flush_symbol_documents(plan.collections.symbol, &mut pending_symbols)
+                    self.flush_symbol_documents(
+                        plan.profile_name,
+                        plan.collections.symbol,
+                        &mut pending_symbols,
+                    )
                         .await?;
                 }
             }
@@ -3645,7 +3904,12 @@ impl Engine {
                     file_hash: prepared.file_hash.clone(),
                 });
                 if pending_chunks.len() >= EMBEDDING_BATCH_SIZE {
-                    self.flush_chunks(plan.repo, plan.collections.chunk, &mut pending_chunks)
+                    self.flush_chunks(
+                        plan.repo,
+                        plan.profile_name,
+                        plan.collections.chunk,
+                        &mut pending_chunks,
+                    )
                         .await?;
                 }
             }
@@ -3656,18 +3920,27 @@ impl Engine {
             if plan.total_files > 0 {
                 let progress = (processed_files as f64 / plan.total_files as f64) * 100.0;
                 if progress_tracker.should_persist(progress) {
-                    self.record_indexing_progress(plan.repo_key, progress)
+                    self.record_indexing_progress(plan.repo, plan.repo_key, progress)
                         .await?;
                 }
             }
         }
 
         if !pending_chunks.is_empty() {
-            self.flush_chunks(plan.repo, plan.collections.chunk, &mut pending_chunks)
+            self.flush_chunks(
+                plan.repo,
+                plan.profile_name,
+                plan.collections.chunk,
+                &mut pending_chunks,
+            )
                 .await?;
         }
         if !pending_symbols.is_empty() {
-            self.flush_symbol_documents(plan.collections.symbol, &mut pending_symbols)
+            self.flush_symbol_documents(
+                plan.profile_name,
+                plan.collections.symbol,
+                &mut pending_symbols,
+            )
                 .await?;
         }
         if !pending_symbol_index_replacements.is_empty() {
@@ -3744,6 +4017,7 @@ impl Engine {
     async fn flush_chunks(
         &self,
         repo: &Path,
+        profile_name: &str,
         collection_name: &str,
         pending_chunks: &mut Vec<PendingChunk>,
     ) -> Result<()> {
@@ -3756,7 +4030,11 @@ impl Engine {
             .iter()
             .map(|chunk| chunk.chunk.content.clone())
             .collect::<Vec<_>>();
-        let embeddings = self.inner.embedding.embed_documents(&contents).await?;
+        let embeddings = self
+            .inner
+            .embedding
+            .embed_documents(profile_name, &contents)
+            .await?;
 
         let documents = chunks
             .into_iter()
@@ -3838,6 +4116,7 @@ impl Engine {
 
     async fn flush_symbol_documents(
         &self,
+        profile_name: &str,
         symbol_collection_name: Option<&str>,
         pending_symbols: &mut Vec<PendingSymbolDocument>,
     ) -> Result<()> {
@@ -3855,7 +4134,11 @@ impl Engine {
             .iter()
             .map(|pending| symbol_semantic_text(&pending.symbol))
             .collect::<Vec<_>>();
-        let embeddings = self.inner.embedding.embed_documents(&contents).await?;
+        let embeddings = self
+            .inner
+            .embedding
+            .embed_documents(profile_name, &contents)
+            .await?;
 
         let documents = symbols
             .into_iter()
@@ -4775,9 +5058,9 @@ fn normalize_relative_path(path: &str) -> String {
 
 fn index_identity_status_for_snapshot(
     snapshot: &Snapshot,
-    configured_embedding_fingerprint: &str,
+    default_profile_name: &str,
+    configured_embedding_fingerprints: &BTreeMap<String, String>,
 ) -> IndexIdentityStatus {
-    let stored_embedding_fingerprint = snapshot.embedding_fingerprint.clone();
     let mut reason = None;
 
     if snapshot.index_format_version != INDEX_FORMAT_VERSION {
@@ -4790,11 +5073,17 @@ fn index_identity_status_for_snapshot(
             "search root version mismatch: local state is `{}`, expected `{}`.",
             snapshot.search_root_version, SEARCH_ROOT_VERSION
         ));
-    } else if let Some(stored) = stored_embedding_fingerprint.as_deref()
-        && stored != configured_embedding_fingerprint
+    } else if let Some(stored) = snapshot.embedding_fingerprint.as_deref()
+        && configured_embedding_fingerprints
+            .get(default_profile_name)
+            .is_some_and(|configured| configured != stored)
     {
         reason = Some(format!(
-            "embedding fingerprint mismatch: local state is `{stored}`, current config is `{configured_embedding_fingerprint}`."
+            "legacy embedding fingerprint mismatch: local state is `{stored}`, current default profile `{default_profile_name}` is `{}`.",
+            configured_embedding_fingerprints
+                .get(default_profile_name)
+                .cloned()
+                .unwrap_or_default()
         ));
     }
 
@@ -4802,8 +5091,52 @@ fn index_identity_status_for_snapshot(
         compatible: reason.is_none(),
         index_format_version: snapshot.index_format_version.clone(),
         search_root_version: snapshot.search_root_version.clone(),
-        configured_embedding_fingerprint: configured_embedding_fingerprint.to_string(),
-        stored_embedding_fingerprint,
+        configured_embedding_fingerprints: configured_embedding_fingerprints.clone(),
+        reason,
+    }
+}
+
+fn repo_embedding_identity_status_for_snapshot(
+    snapshot: &Snapshot,
+    entry: Option<&SnapshotEntry>,
+    configured_profile_name: &str,
+    configured_fingerprint: Option<String>,
+) -> RepoEmbeddingIdentityStatus {
+    let stored_profile = entry
+        .and_then(|value| value.embedding_profile.clone())
+        .unwrap_or_else(|| configured_profile_name.to_string());
+    let stored_fingerprint = entry
+        .and_then(|value| value.embedding_fingerprint.clone())
+        .or_else(|| snapshot.embedding_fingerprint.clone());
+    let mut reason = None;
+
+    if snapshot.index_format_version != INDEX_FORMAT_VERSION {
+        reason = Some(format!(
+            "index format version mismatch: local state is `{}`, expected `{}`.",
+            snapshot.index_format_version, INDEX_FORMAT_VERSION
+        ));
+    } else if snapshot.search_root_version != SEARCH_ROOT_VERSION {
+        reason = Some(format!(
+            "search root version mismatch: local state is `{}`, expected `{}`.",
+            snapshot.search_root_version, SEARCH_ROOT_VERSION
+        ));
+    } else if stored_profile != configured_profile_name {
+        reason = Some(format!(
+            "embedding profile mismatch: local state is `{stored_profile}`, current config is `{configured_profile_name}`."
+        ));
+    } else if let (Some(stored), Some(configured)) =
+        (stored_fingerprint.as_deref(), configured_fingerprint.as_deref())
+        && stored != configured
+    {
+        reason = Some(format!(
+            "embedding fingerprint mismatch: local state is `{stored}`, current config is `{configured}`."
+        ));
+    }
+
+    RepoEmbeddingIdentityStatus {
+        profile_name: configured_profile_name.to_string(),
+        configured_fingerprint,
+        stored_fingerprint,
         reason,
     }
 }
@@ -5524,9 +5857,9 @@ mod tests {
         SearchBudgets, SearchMode, SearchRequest, TextMatch, TextSearchScopeRequest,
         bounded_window, build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
         collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
-        hash_text_like_file, index_status_for_coverage, is_agent_context_vector_collection,
-        live_file_exists, narrowest_covering_symbol, plan_search, ready_target_reason,
-        removed_repo_index_result, run_low_priority_blocking, scan_repo,
+        hash_text_like_file, index_identity_status_for_snapshot, index_status_for_coverage,
+        is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
+        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking, scan_repo,
         search_text_scans_live_repo, select_edit_anchors, select_text_match,
         stale_vector_collections, symbol_collection_name, text_search_has_bounded_target,
         validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
@@ -5534,6 +5867,7 @@ mod tests {
     use crate::config::{ResolvedScope, ScopeKind, SearchConfig};
     use crate::engine::live_files::LiveFileStore;
     use crate::engine::symbols::IndexedSymbol;
+    use crate::snapshot::Snapshot;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -6013,6 +6347,52 @@ mod tests {
         };
 
         assert!(snapshot.is_compatible());
+    }
+
+    #[test]
+    fn identity_status_uses_actual_default_profile_for_legacy_fingerprint() {
+        let snapshot = Snapshot {
+            format_version: "v3".to_string(),
+            index_format_version: "v1".to_string(),
+            search_root_version: "v1".to_string(),
+            embedding_fingerprint: Some("hosted-fingerprint".to_string()),
+            ..Snapshot::default()
+        };
+        let configured = BTreeMap::from([
+            ("aaa-local".to_string(), "local-fingerprint".to_string()),
+            ("zzz-hosted".to_string(), "hosted-fingerprint".to_string()),
+        ]);
+
+        let status =
+            index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
+
+        assert!(status.compatible);
+        assert!(status.reason.is_none());
+    }
+
+    #[test]
+    fn identity_status_mismatch_mentions_default_profile() {
+        let snapshot = Snapshot {
+            format_version: "v3".to_string(),
+            index_format_version: "v1".to_string(),
+            search_root_version: "v1".to_string(),
+            embedding_fingerprint: Some("old-fingerprint".to_string()),
+            ..Snapshot::default()
+        };
+        let configured = BTreeMap::from([
+            ("aaa-local".to_string(), "local-fingerprint".to_string()),
+            ("zzz-hosted".to_string(), "hosted-fingerprint".to_string()),
+        ]);
+
+        let status =
+            index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
+
+        assert!(!status.compatible);
+        assert!(status
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("zzz-hosted"));
     }
 
     #[test]

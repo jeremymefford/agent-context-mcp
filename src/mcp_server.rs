@@ -9,7 +9,12 @@ use crate::engine::{
     render_clear_text, render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    body::Bytes,
+    http::StatusCode,
+    routing::{get, post},
+};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
@@ -26,9 +31,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -38,7 +44,24 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct NativeServer {
     engine: Engine,
-    active_repos: Arc<Mutex<HashSet<String>>>,
+    index_coordinator: Arc<Mutex<IndexCoordinatorState>>,
+}
+
+#[derive(Default)]
+struct IndexCoordinatorState {
+    pending: BTreeMap<String, PendingIndexRequest>,
+    running: HashSet<String>,
+    worker_active: bool,
+}
+
+#[derive(Clone)]
+struct PendingIndexRequest {
+    repo: PathBuf,
+    force: bool,
+    explicit_refresh: bool,
+    splitter: SplitterKind,
+    custom_extensions: Vec<String>,
+    ignore_patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -201,8 +224,25 @@ struct IndexLaunchResult {
     label: String,
     started: bool,
     force: bool,
-    started_repos: Vec<String>,
-    already_indexing: Vec<String>,
+    queued_repos: Vec<String>,
+    merged_repos: Vec<String>,
+    already_running: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueueRefreshRequest {
+    path: String,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    repos: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -445,7 +485,7 @@ pub async fn serve(
         .await?;
     let server = NativeServer {
         engine,
-        active_repos: Arc::new(Mutex::new(HashSet::new())),
+        index_coordinator: Arc::new(Mutex::new(IndexCoordinatorState::default())),
     };
     let cancellation = CancellationToken::new();
 
@@ -478,6 +518,13 @@ pub async fn serve(
 
     let router = Router::new()
         .route("/health", get(health))
+        .route(
+            "/enqueue-refresh",
+            post({
+                let server = server.clone();
+                move |payload| enqueue_refresh(server.clone(), payload)
+            }),
+        )
         .nest_service("/mcp", service);
 
     let listener = TcpListener::bind(listen)
@@ -569,6 +616,66 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn enqueue_refresh(
+    server: NativeServer,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let payload: EnqueueRefreshRequest = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({ "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+
+    let scope = if payload.repos.is_empty() {
+        match server.engine.config().resolve_scope(None, Some(&payload.path)) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error.to_string() }).to_string(),
+                );
+            }
+        }
+    } else {
+        let repos = payload
+            .repos
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        ResolvedScope {
+            kind: match payload.kind.as_deref() {
+                Some("repo") if repos.len() == 1 => crate::config::ScopeKind::Repo,
+                _ => crate::config::ScopeKind::Group,
+            },
+            id: payload.scope.unwrap_or_else(|| payload.path.clone()),
+            label: payload.label.unwrap_or_else(|| payload.path.clone()),
+            repos,
+        }
+    };
+
+    match server
+        .enqueue_scope_indexing(
+            scope,
+            payload.force,
+            true,
+            SplitterKind::Ast,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(result) => (StatusCode::OK, json!(result).to_string()),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": error.to_string() }).to_string(),
+        ),
+    }
+}
+
 fn enforce_loopback_bind(listen: &str, allow_remote_unauthenticated: bool) -> Result<()> {
     if allow_remote_unauthenticated || listen_is_loopback(listen) {
         return Ok(());
@@ -652,9 +759,10 @@ impl ServerHandler for NativeServer {
                         .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
                         .map_err(invalid_params)?;
                     let result = self
-                        .start_background_indexing(
+                        .enqueue_scope_indexing(
                             scope,
                             args.force,
+                            false,
                             splitter,
                             args.custom_extensions,
                             args.ignore_patterns,
@@ -931,84 +1039,150 @@ impl NativeServer {
         }
     }
 
-    async fn start_background_indexing(
+    async fn enqueue_scope_indexing(
         &self,
         scope: ResolvedScope,
         force: bool,
+        explicit_refresh: bool,
         splitter: SplitterKind,
         custom_extensions: Vec<String>,
         ignore_patterns: Vec<String>,
     ) -> Result<IndexLaunchResult> {
-        let mut active_repos = self.active_repos.lock().await;
-        let mut started_repos = Vec::new();
-        let mut already_indexing = Vec::new();
-        let mut runnable_repos = Vec::new();
+        let mut coordinator = self.index_coordinator.lock().await;
+        let mut queued_repos = Vec::new();
+        let mut merged_repos = Vec::new();
+        let mut already_running = Vec::new();
 
-        for repo in scope.repos {
+        for repo in &scope.repos {
             let repo_key = repo.display().to_string();
-            if active_repos.contains(&repo_key) {
-                already_indexing.push(repo_key);
+            if coordinator.running.contains(&repo_key) {
+                already_running.push(repo_key);
+            } else if let Some(existing) = coordinator.pending.get_mut(&repo_key) {
+                existing.force |= force;
+                existing.explicit_refresh |= explicit_refresh;
+                if !custom_extensions.is_empty() {
+                    existing.custom_extensions = custom_extensions.clone();
+                }
+                if !ignore_patterns.is_empty() {
+                    existing.ignore_patterns = ignore_patterns.clone();
+                }
+                merged_repos.push(repo_key);
             } else {
-                active_repos.insert(repo_key.clone());
-                started_repos.push(repo_key);
-                runnable_repos.push(repo);
+                coordinator.pending.insert(
+                    repo_key.clone(),
+                    PendingIndexRequest {
+                        repo: repo.clone(),
+                        force,
+                        explicit_refresh,
+                        splitter,
+                        custom_extensions: custom_extensions.clone(),
+                        ignore_patterns: ignore_patterns.clone(),
+                    },
+                );
+                queued_repos.push(repo_key);
             }
         }
-        drop(active_repos);
+        let should_start_worker = !coordinator.worker_active && !coordinator.pending.is_empty();
+        if should_start_worker {
+            coordinator.worker_active = true;
+        }
+        drop(coordinator);
 
-        if runnable_repos.is_empty() {
+        if !queued_repos.is_empty() {
+            let queued_scope = ResolvedScope {
+                kind: scope.kind.clone(),
+                id: scope.id.clone(),
+                label: scope.label.clone(),
+                repos: scope
+                    .repos
+                    .iter()
+                    .filter(|repo| queued_repos.contains(&repo.display().to_string()))
+                    .cloned()
+                    .collect(),
+            };
+            if let Err(error) = self.engine.mark_scope_indexing(&queued_scope).await {
+                let mut coordinator = self.index_coordinator.lock().await;
+                for repo_key in &queued_repos {
+                    coordinator.pending.remove(repo_key);
+                }
+                if coordinator.pending.is_empty() && coordinator.running.is_empty() {
+                    coordinator.worker_active = false;
+                }
+                return Err(error);
+            }
+        }
+
+        if should_start_worker {
+            let server = self.clone();
+            tokio::spawn(async move {
+                server.run_background_index_worker().await;
+            });
+        }
+
+        if queued_repos.is_empty() && merged_repos.is_empty() {
             return Ok(IndexLaunchResult {
                 scope: scope.id,
                 label: scope.label,
                 started: false,
                 force,
-                started_repos,
-                already_indexing,
+                queued_repos,
+                merged_repos,
+                already_running,
             });
         }
-
-        let runnable_scope = ResolvedScope {
-            kind: scope.kind,
-            id: scope.id.clone(),
-            label: scope.label.clone(),
-            repos: runnable_repos,
-        };
-        if let Err(error) = self.engine.mark_scope_indexing(&runnable_scope).await {
-            let mut active_repos = self.active_repos.lock().await;
-            for repo_key in &started_repos {
-                active_repos.remove(repo_key);
-            }
-            return Err(error);
-        }
-
-        let engine = self.engine.clone();
-        let active_repos = self.active_repos.clone();
-        let completion_repos = started_repos.clone();
-        tokio::spawn(async move {
-            let _ = engine
-                .index_scope(
-                    runnable_scope,
-                    force,
-                    splitter,
-                    &custom_extensions,
-                    &ignore_patterns,
-                )
-                .await;
-
-            let mut active_repos = active_repos.lock().await;
-            for repo_key in completion_repos {
-                active_repos.remove(&repo_key);
-            }
-        });
 
         Ok(IndexLaunchResult {
             scope: scope.id,
             label: scope.label,
-            started: true,
+            started: should_start_worker,
             force,
-            started_repos,
-            already_indexing,
+            queued_repos,
+            merged_repos,
+            already_running,
         })
+    }
+
+    async fn run_background_index_worker(&self) {
+        loop {
+            let next = {
+                let mut coordinator = self.index_coordinator.lock().await;
+                let Some(repo_key) = coordinator.pending.keys().next().cloned() else {
+                    coordinator.worker_active = false;
+                    return;
+                };
+                let request = coordinator.pending.remove(&repo_key).expect("pending repo exists");
+                coordinator.running.insert(repo_key.clone());
+                (repo_key, request)
+            };
+
+            let (repo_key, request) = next;
+            let label = request
+                .repo
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| repo_key.clone());
+            let scope = ResolvedScope {
+                kind: crate::config::ScopeKind::Repo,
+                id: repo_key.clone(),
+                label,
+                repos: vec![request.repo.clone()],
+            };
+
+            let _ = self
+                .engine
+                .index_scope_background(
+                    scope,
+                    request.force,
+                    request.explicit_refresh,
+                    request.splitter,
+                    &request.custom_extensions,
+                    &request.ignore_patterns,
+                )
+                .await;
+
+            let mut coordinator = self.index_coordinator.lock().await;
+            coordinator.running.remove(&repo_key);
+        }
     }
 }
 
@@ -1052,21 +1226,23 @@ fn render_index_launch_text(result: &IndexLaunchResult) -> String {
     let mut lines = vec![format!("Scope: {}", result.label)];
     if result.started {
         lines.push(format!(
-            "Started background indexing for {} repo(s). force={}",
-            result.started_repos.len(),
+            "Started background indexing worker. force={}",
             result.force
         ));
     } else {
-        lines.push("No new background indexing jobs started.".to_string());
+        lines.push("Background indexing request accepted without starting a new worker.".to_string());
     }
 
-    if !result.started_repos.is_empty() {
-        lines.push(format!("Started: {}", result.started_repos.join(", ")));
+    if !result.queued_repos.is_empty() {
+        lines.push(format!("Queued: {}", result.queued_repos.join(", ")));
     }
-    if !result.already_indexing.is_empty() {
+    if !result.merged_repos.is_empty() {
+        lines.push(format!("Merged: {}", result.merged_repos.join(", ")));
+    }
+    if !result.already_running.is_empty() {
         lines.push(format!(
-            "Already indexing: {}",
-            result.already_indexing.join(", ")
+            "Already running: {}",
+            result.already_running.join(", ")
         ));
     }
 

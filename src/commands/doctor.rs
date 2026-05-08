@@ -13,28 +13,26 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
 
     print_check("config", true, config.config_path.display().to_string());
 
-    match config.embedding.api_key() {
-        Ok(Some(_)) => print_check(
-            "embedding credentials",
-            true,
-            format!(
-                "provider={} model={}",
-                config.embedding.provider_name(),
-                config.embedding.model
+    for (profile_name, profile) in config.embedding.profiles() {
+        match profile.api_key() {
+            Ok(Some(_)) | Ok(None) => print_check(
+                "embedding profile",
+                true,
+                format!(
+                    "profile={} provider={} model={}",
+                    profile_name,
+                    profile.provider_name(),
+                    profile.model
+                ),
             ),
-        ),
-        Ok(None) => print_check(
-            "embedding credentials",
-            true,
-            format!(
-                "provider={} model={}",
-                config.embedding.provider_name(),
-                config.embedding.model
-            ),
-        ),
-        Err(error) => {
-            failures += 1;
-            print_check("embedding credentials", false, error.to_string());
+            Err(error) => {
+                failures += 1;
+                print_check(
+                    "embedding profile",
+                    false,
+                    format!("profile={profile_name} {error}"),
+                );
+            }
         }
     }
 
@@ -91,10 +89,10 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
             "index identity",
             true,
             format!(
-                "format={} searchRoot={} embedding={}",
+                "format={} searchRoot={} profiles={}",
                 status.index_format_version,
                 status.search_root_version,
-                status.configured_embedding_fingerprint
+                status.configured_embedding_fingerprints.len()
             ),
         ),
         Ok(status) => {
@@ -118,6 +116,7 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
             let failed_repos = failed_index_repos(&report);
             let indexing_repos = indexing_repos(&report);
             let not_indexed_repos = not_indexed_repos(&report);
+            let mismatched_repos = embedding_mismatch_repos(&report);
             if failed_repos.is_empty() {
                 print_check(
                     "index coverage",
@@ -162,6 +161,15 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
                         not_indexed_repos.len(),
                         format_repo_status_list(&not_indexed_repos)
                     ),
+                );
+            }
+
+            if !mismatched_repos.is_empty() {
+                failures += 1;
+                print_check(
+                    "embedding mismatches",
+                    false,
+                    format_repo_mismatch_list(&mismatched_repos),
                 );
             }
         }
@@ -350,6 +358,14 @@ fn not_indexed_repos(report: &StatusReport) -> Vec<&RepoStatus> {
         .collect()
 }
 
+fn embedding_mismatch_repos(report: &StatusReport) -> Vec<&RepoStatus> {
+    report
+        .repos
+        .iter()
+        .filter(|repo| repo.embedding_mismatch_reason.is_some())
+        .collect()
+}
+
 fn format_failed_index_repos(repos: &[&RepoStatus]) -> String {
     format!(
         "{} repo(s) have failed indexes: {}; recover with `agent-context refresh-one --force <repo>`",
@@ -378,6 +394,35 @@ fn format_repo_status_list(repos: &[&RepoStatus]) -> String {
             }
             detail.push_str(&format!(" repo={}", repo.repo));
             detail
+        })
+        .collect::<Vec<_>>();
+    if repos.len() > MAX_REPOS {
+        names.push(format!("... and {} more", repos.len() - MAX_REPOS));
+    }
+    names.join("; ")
+}
+
+fn format_repo_mismatch_list(repos: &[&RepoStatus]) -> String {
+    const MAX_REPOS: usize = 5;
+    let mut names = repos
+        .iter()
+        .take(MAX_REPOS)
+        .map(|repo| {
+            format!(
+                "{} profile={} configured={} stored={} reason={} repo={}",
+                repo.repo_label,
+                repo.embedding_profile.as_deref().unwrap_or("unknown"),
+                repo.configured_embedding_fingerprint
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                repo.stored_embedding_fingerprint
+                    .as_deref()
+                    .unwrap_or("missing"),
+                repo.embedding_mismatch_reason
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                repo.repo
+            )
         })
         .collect::<Vec<_>>();
     if repos.len() > MAX_REPOS {
@@ -415,6 +460,10 @@ mod tests {
             indexing_percentage: None,
             last_attempted_percentage: None,
             error_message: None,
+            embedding_profile: None,
+            configured_embedding_fingerprint: None,
+            stored_embedding_fingerprint: None,
+            embedding_mismatch_reason: None,
         }
     }
 

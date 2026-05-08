@@ -6,6 +6,7 @@ mod snapshot;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use commands::support::DEFAULT_LISTEN;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -62,6 +63,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
+    /// Dry-run or apply a full reset of local agent-context state for this config
+    ResetLocalState {
+        /// Actually remove local state and drop agent-context vector collections
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
     /// Release loaded agent-context Milvus collections without deleting indexes
     ReleaseVectorCollections,
     /// Incrementally refresh a single codebase or group
@@ -69,6 +76,9 @@ enum Command {
         /// Clear and fully reindex this repo or group
         #[arg(long)]
         force: bool,
+        /// Local service bind address for enqueue-only refresh handoff
+        #[arg(long, default_value = DEFAULT_LISTEN)]
+        listen: String,
         /// Absolute path to a repo or configured group id
         path: String,
     },
@@ -133,13 +143,22 @@ async fn main() -> Result<()> {
             let cfg = load_config(cli.config.as_deref())?;
             commands::prune_stale_vector_collections::run(&cfg, apply).await
         }
+        Command::ResetLocalState { apply } => {
+            let cfg = load_config(cli.config.as_deref())?;
+            commands::reset_local_state::run(&cfg, apply).await
+        }
         Command::ReleaseVectorCollections => {
             let cfg = load_config(cli.config.as_deref())?;
             commands::release_vector_collections::run(&cfg).await
         }
-        Command::RefreshOne { force, path } => {
-            let cfg = load_config(cli.config.as_deref())?;
-            commands::refresh_one::run(&cfg, &path, force).await
+        Command::RefreshOne { force, listen, path } => {
+            let resolved_scope = if cli.config.is_some() || !looks_like_absolute_repo_scope(&path) {
+                let cfg = load_config(cli.config.as_deref())?;
+                Some(cfg.resolve_scope(None, Some(&path))?)
+            } else {
+                None
+            };
+            commands::refresh_one::run(&path, force, Some(&listen), resolved_scope.as_ref()).await
         }
         Command::RefreshAll => {
             let cfg = load_config(cli.config.as_deref())?;
@@ -169,4 +188,8 @@ fn load_config(path: Option<&std::path::Path>) -> Result<config::Config> {
         Some(path) => config::Config::load_from_path(path),
         None => config::Config::load(),
     }
+}
+
+fn looks_like_absolute_repo_scope(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with("~/")
 }

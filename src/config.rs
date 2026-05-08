@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_PATH: &str = "~/Library/Application Support/agent-context/config.toml";
@@ -17,6 +17,7 @@ const DEFAULT_OLLAMA_MODEL: &str = "embeddinggemma";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MILVUS_DATABASE: &str = "";
+const DEFAULT_EMBEDDING_PROFILE: &str = "default";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -41,11 +42,25 @@ pub enum EmbeddingProvider {
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
+    pub default_profile: String,
+    pub profiles: BTreeMap<String, EmbeddingProfileConfig>,
+    pub assignments: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingProfileConfig {
     pub provider: EmbeddingProvider,
     pub model: String,
     pub voyage: VoyageProviderConfig,
     pub openai: OpenAiProviderConfig,
     pub ollama: OllamaProviderConfig,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingAssignment {
+    pub repo: String,
+    pub profile: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +188,12 @@ struct RawConfig {
 #[derive(Debug, Deserialize, Default)]
 struct RawEmbeddingConfig {
     #[serde(default)]
+    default_profile: Option<String>,
+    #[serde(default)]
+    profiles: Option<BTreeMap<String, RawEmbeddingProfileConfig>>,
+    #[serde(default)]
+    assignments: Option<Vec<RawEmbeddingAssignment>>,
+    #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -182,6 +203,26 @@ struct RawEmbeddingConfig {
     openai: Option<RawOpenAiProviderConfig>,
     #[serde(default)]
     ollama: Option<RawOllamaProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawEmbeddingProfileConfig {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    voyage: Option<RawVoyageProviderConfig>,
+    #[serde(default)]
+    openai: Option<RawOpenAiProviderConfig>,
+    #[serde(default)]
+    ollama: Option<RawOllamaProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RawEmbeddingAssignment {
+    repo: String,
+    profile: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -259,14 +300,12 @@ impl Config {
         let legacy_index_root = expand_path(LEGACY_INDEX_ROOT)?;
         let using_legacy_layout = config_path == legacy_config_path;
 
-        let embedding = build_embedding_config(&raw, config_dir)?;
-
         let milvus = MilvusConfig {
             address: raw
                 .milvus
                 .as_ref()
                 .and_then(|value| value.address.clone())
-                .or(raw.milvus_address)
+                .or(raw.milvus_address.clone())
                 .context("missing `milvus.address` or legacy `milvus_address` in config")?,
             token_env: raw
                 .milvus
@@ -276,22 +315,22 @@ impl Config {
                 .milvus
                 .as_ref()
                 .and_then(|value| value.token.clone())
-                .or(raw.milvus_token),
+                .or(raw.milvus_token.clone()),
             username: raw
                 .milvus
                 .as_ref()
                 .and_then(|value| value.username.clone())
-                .or(raw.milvus_username),
+                .or(raw.milvus_username.clone()),
             password: raw
                 .milvus
                 .as_ref()
                 .and_then(|value| value.password.clone())
-                .or(raw.milvus_password),
+                .or(raw.milvus_password.clone()),
             database: raw
                 .milvus
                 .as_ref()
                 .and_then(|value| value.database.clone())
-                .or(raw.milvus_database)
+                .or(raw.milvus_database.clone())
                 .unwrap_or_else(|| DEFAULT_MILVUS_DATABASE.to_string()),
         };
 
@@ -328,10 +367,10 @@ impl Config {
                 .unwrap_or_else(|| index_root.join("merkle"))
         };
 
-        let freshness = raw.freshness.unwrap_or_default();
+        let freshness = raw.freshness.clone().unwrap_or_default();
         let search = build_search_config(raw.search.as_ref(), &freshness)?;
 
-        let mut groups = if let Some(mut groups) = raw.groups {
+        let mut groups = if let Some(mut groups) = raw.groups.clone() {
             for group in &mut groups {
                 group.repos = group
                     .repos
@@ -344,7 +383,7 @@ impl Config {
             }
             groups
         } else {
-            let repos = raw.projects.unwrap_or_default();
+            let repos = raw.projects.clone().unwrap_or_default();
             if repos.is_empty() {
                 bail!("config defines no groups and no legacy `projects` list");
             }
@@ -367,7 +406,7 @@ impl Config {
 
         validate_groups(&groups)?;
 
-        let default_group = raw.default_group.unwrap_or_else(|| {
+        let default_group = raw.default_group.clone().unwrap_or_else(|| {
             groups
                 .first()
                 .map(|group| group.id.clone())
@@ -377,6 +416,8 @@ impl Config {
         if !groups.iter().any(|group| group.id == default_group) {
             bail!("default_group `{default_group}` does not match any configured group");
         }
+
+        let embedding = build_embedding_config(&raw, config_dir, &groups)?;
 
         Ok(Self {
             config_path: config_path.to_path_buf(),
@@ -492,6 +533,36 @@ impl Config {
 }
 
 impl EmbeddingConfig {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn default_profile_name(&self) -> &str {
+        &self.default_profile
+    }
+
+    pub fn profiles(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&String, &EmbeddingProfileConfig)> {
+        self.profiles.iter()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn profile(&self, name: &str) -> Result<&EmbeddingProfileConfig> {
+        self.profiles
+            .get(name)
+            .with_context(|| format!("unknown embedding profile `{name}`"))
+    }
+
+    pub fn profile_name_for_repo<'a>(&'a self, repo: &Path) -> Result<&'a str> {
+        let repo_key = clean_path(repo).display().to_string();
+        Ok(self
+            .assignments
+            .get(&repo_key)
+            .map(String::as_str)
+            .unwrap_or(self.default_profile.as_str()))
+    }
+
+}
+
+impl EmbeddingProfileConfig {
     pub fn provider_name(&self) -> &'static str {
         match self.provider {
             EmbeddingProvider::Voyage => "voyage",
@@ -576,22 +647,98 @@ impl MilvusConfig {
     }
 }
 
-fn build_embedding_config(raw: &RawConfig, config_dir: &Path) -> Result<EmbeddingConfig> {
+fn build_embedding_config(
+    raw: &RawConfig,
+    config_dir: &Path,
+    groups: &[GroupConfig],
+) -> Result<EmbeddingConfig> {
+    let configured_repos = groups
+        .iter()
+        .flat_map(|group| group.repos.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let raw_embedding = raw.embedding.as_ref();
+    let raw_profiles = raw_embedding.and_then(|value| value.profiles.as_ref());
+
+    if let Some(raw_profiles) = raw_profiles {
+        if raw_profiles.is_empty() {
+            bail!("embedding.profiles must not be empty");
+        }
+
+        let mut profiles = BTreeMap::new();
+        for (name, profile) in raw_profiles {
+            validate_embedding_profile_name(name)?;
+            let rendered = build_embedding_profile_config(profile, config_dir)?;
+            profiles.insert(name.clone(), rendered);
+        }
+
+        let default_profile = raw_embedding
+            .and_then(|value| value.default_profile.clone())
+            .or_else(|| {
+                (profiles.len() == 1)
+                    .then(|| profiles.keys().next().cloned())
+                    .flatten()
+            })
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_PROFILE.to_string());
+
+        if !profiles.contains_key(&default_profile) {
+            bail!("embedding.default_profile `{default_profile}` does not match any configured embedding profile");
+        }
+
+        let mut assignments = BTreeMap::new();
+        if let Some(raw_assignments) = raw_embedding.and_then(|value| value.assignments.as_ref()) {
+            for assignment in raw_assignments {
+                let profile = assignment.profile.trim();
+                if profile.is_empty() {
+                    bail!("embedding assignment profile must not be empty");
+                }
+                if !profiles.contains_key(profile) {
+                    bail!(
+                        "embedding assignment for `{}` references unknown profile `{profile}`",
+                        assignment.repo
+                    );
+                }
+                let repo = normalize_path_from(&assignment.repo, config_dir)?
+                    .display()
+                    .to_string();
+                if !configured_repos.contains(&repo) {
+                    bail!("embedding assignment repo `{repo}` is not present in any configured group");
+                }
+                if assignments.insert(repo.clone(), profile.to_string()).is_some() {
+                    bail!("duplicate embedding assignment for repo `{repo}`");
+                }
+            }
+        }
+
+        return Ok(EmbeddingConfig {
+            default_profile,
+            profiles,
+            assignments,
+        });
+    }
+
+    let legacy_profile = build_legacy_embedding_profile(raw, config_dir)?;
+    let profiles = BTreeMap::from([(DEFAULT_EMBEDDING_PROFILE.to_string(), legacy_profile)]);
+    Ok(EmbeddingConfig {
+        default_profile: DEFAULT_EMBEDDING_PROFILE.to_string(),
+        profiles,
+        assignments: BTreeMap::new(),
+    })
+}
+
+fn build_legacy_embedding_profile(raw: &RawConfig, config_dir: &Path) -> Result<EmbeddingProfileConfig> {
     let provider = parse_provider(
         raw.embedding
             .as_ref()
             .and_then(|value| value.provider.as_deref())
             .unwrap_or("voyage"),
     )?;
-
     let model = raw
         .embedding
         .as_ref()
         .and_then(|value| value.model.clone())
         .or(raw.voyage.as_ref().and_then(|value| value.model.clone()))
         .or(raw.embedding_model.clone())
-        .unwrap_or_else(|| EmbeddingConfig::default_model_for(&provider).to_string());
-
+        .unwrap_or_else(|| EmbeddingProfileConfig::default_model_for(&provider).to_string());
     let voyage = VoyageProviderConfig {
         api_key_env: raw
             .embedding
@@ -612,7 +759,6 @@ fn build_embedding_config(raw: &RawConfig, config_dir: &Path) -> Result<Embeddin
             .map(|path| expand_path_from(path, config_dir))
             .transpose()?,
     };
-
     let openai = OpenAiProviderConfig {
         api_key_env: raw
             .embedding
@@ -634,7 +780,6 @@ fn build_embedding_config(raw: &RawConfig, config_dir: &Path) -> Result<Embeddin
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
     };
-
     let ollama = OllamaProviderConfig {
         base_url: raw
             .embedding
@@ -644,13 +789,92 @@ fn build_embedding_config(raw: &RawConfig, config_dir: &Path) -> Result<Embeddin
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
     };
 
-    Ok(EmbeddingConfig {
+    Ok(EmbeddingProfileConfig {
         provider,
         model,
         voyage,
         openai,
         ollama,
     })
+}
+
+fn build_embedding_profile_config(
+    raw: &RawEmbeddingProfileConfig,
+    config_dir: &Path,
+) -> Result<EmbeddingProfileConfig> {
+    let provider = parse_provider(
+        raw.provider
+            .as_deref()
+            .context("embedding profile is missing `provider`")?,
+    )?;
+    let model = raw
+        .model
+        .clone()
+        .unwrap_or_else(|| EmbeddingProfileConfig::default_model_for(&provider).to_string());
+    let voyage = VoyageProviderConfig {
+        api_key_env: raw
+            .voyage
+            .as_ref()
+            .and_then(|value| value.api_key_env.clone())
+            .unwrap_or_else(|| "VOYAGE_API_KEY".to_string()),
+        key_file: raw
+            .voyage
+            .as_ref()
+            .and_then(|value| value.key_file.as_deref())
+            .map(|path| expand_path_from(path, config_dir))
+            .transpose()?,
+    };
+    let openai = OpenAiProviderConfig {
+        api_key_env: raw
+            .openai
+            .as_ref()
+            .and_then(|value| value.api_key_env.clone())
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+        key_file: raw
+            .openai
+            .as_ref()
+            .and_then(|value| value.key_file.as_deref())
+            .map(|path| expand_path_from(path, config_dir))
+            .transpose()?,
+        base_url: raw
+            .openai
+            .as_ref()
+            .and_then(|value| value.base_url.clone())
+            .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+    };
+    let ollama = OllamaProviderConfig {
+        base_url: raw
+            .ollama
+            .as_ref()
+            .and_then(|value| value.base_url.clone())
+            .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+    };
+
+    Ok(EmbeddingProfileConfig {
+        provider,
+        model,
+        voyage,
+        openai,
+        ollama,
+    })
+}
+
+fn validate_embedding_profile_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("embedding profile names must not be empty");
+    }
+    if trimmed.starts_with('.')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('~')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        bail!(
+            "embedding profile `{name}` is invalid; use a simple identifier without path-like prefixes or separators"
+        );
+    }
+    Ok(())
 }
 
 fn parse_provider(value: &str) -> Result<EmbeddingProvider> {
@@ -922,9 +1146,13 @@ mod tests {
         );
 
         let config = Config::load_from_path(&config_path).unwrap();
+        let profile = config
+            .embedding
+            .profile(config.embedding.default_profile_name())
+            .unwrap();
 
         assert_eq!(
-            config.embedding.voyage.key_file,
+            profile.voyage.key_file,
             Some(root.join("keys/voyage_key"))
         );
         assert_eq!(config.snapshot_path, root.join("state/snapshot.json"));
@@ -963,14 +1191,18 @@ mod tests {
         );
 
         let config = Config::load_from_path(&config_path).unwrap();
-        assert_eq!(config.embedding.provider, EmbeddingProvider::OpenAi);
-        assert_eq!(config.embedding.model, "text-embedding-3-large");
-        assert_eq!(config.embedding.openai.api_key_env, "OPENAI_SECRET");
+        let profile = config
+            .embedding
+            .profile(config.embedding.default_profile_name())
+            .unwrap();
+        assert_eq!(profile.provider, EmbeddingProvider::OpenAi);
+        assert_eq!(profile.model, "text-embedding-3-large");
+        assert_eq!(profile.openai.api_key_env, "OPENAI_SECRET");
         assert_eq!(
-            config.embedding.openai.key_file,
+            profile.openai.key_file,
             Some(dir.join("keys/openai_key"))
         );
-        assert_eq!(config.embedding.openai.base_url, "https://example.com/v1");
+        assert_eq!(profile.openai.base_url, "https://example.com/v1");
     }
 
     #[test]
@@ -996,8 +1228,182 @@ mod tests {
         );
 
         let config = Config::load_from_path(&config_path).unwrap();
-        assert_eq!(config.embedding.provider, EmbeddingProvider::Ollama);
-        assert_eq!(config.embedding.ollama.base_url, "http://localhost:11434");
+        let profile = config
+            .embedding
+            .profile(config.embedding.default_profile_name())
+            .unwrap();
+        assert_eq!(profile.provider, EmbeddingProvider::Ollama);
+        assert_eq!(profile.ollama.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn parses_named_embedding_profiles_and_assignments() {
+        let dir = temp_dir("named-profiles");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+                model = "voyage-code-3"
+
+                [embedding.profiles.local]
+                provider = "ollama"
+                model = "nomic-embed"
+
+                [embedding.profiles.local.ollama]
+                base_url = "http://127.0.0.1:11435"
+
+                [[embedding.assignments]]
+                repo = "./repos/local-app"
+                profile = "local"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["./repos/hosted-app", "./repos/local-app"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        let hosted_repo = dir.join("repos/hosted-app");
+        let local_repo = dir.join("repos/local-app");
+
+        assert_eq!(config.embedding.default_profile_name(), "hosted");
+        assert_eq!(
+            config.embedding.profile_name_for_repo(&hosted_repo).unwrap(),
+            "hosted"
+        );
+        assert_eq!(
+            config.embedding.profile_name_for_repo(&local_repo).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            config.embedding.profile("local").unwrap().ollama.base_url,
+            "http://127.0.0.1:11435"
+        );
+    }
+
+    #[test]
+    fn legacy_embedding_config_normalizes_to_default_profile() {
+        let dir = temp_dir("legacy-profile");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "ollama"
+                model = "embeddinggemma"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert_eq!(config.embedding.default_profile_name(), "default");
+        assert_eq!(config.embedding.profiles().len(), 1);
+        let profile = config.embedding.profile("default").unwrap();
+        assert_eq!(profile.provider, EmbeddingProvider::Ollama);
+        assert_eq!(profile.model, "embeddinggemma");
+    }
+
+    #[test]
+    fn rejects_assignment_to_unknown_profile() {
+        let dir = temp_dir("unknown-assignment-profile");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+
+                [[embedding.assignments]]
+                repo = "/tmp/a"
+                profile = "missing"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let error = Config::load_from_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("unknown profile"));
+    }
+
+    #[test]
+    fn rejects_assignment_to_unconfigured_repo() {
+        let dir = temp_dir("unknown-assignment-repo");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+
+                [[embedding.assignments]]
+                repo = "/tmp/not-configured"
+                profile = "hosted"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let error = Config::load_from_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("is not present in any configured group"));
+    }
+
+    #[test]
+    fn rejects_duplicate_embedding_assignments() {
+        let dir = temp_dir("duplicate-assignments");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+
+                [[embedding.assignments]]
+                repo = "/tmp/a"
+                profile = "hosted"
+
+                [[embedding.assignments]]
+                repo = "/tmp/a"
+                profile = "hosted"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let error = Config::load_from_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("duplicate embedding assignment"));
     }
 
     #[test]
@@ -1226,7 +1632,8 @@ mod tests {
         );
 
         let config = Config::load_from_path(&config_path).unwrap();
-        let error = config.embedding.api_key().unwrap_err();
+        let profile = config.embedding.profile("default").unwrap();
+        let error = profile.api_key().unwrap_err();
         assert!(error.to_string().contains("permissions are too open"));
     }
 }
