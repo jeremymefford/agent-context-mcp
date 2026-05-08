@@ -125,6 +125,10 @@ brew install jeremymefford/agent-context-mcp/agent-context
 agent-context --help
 ```
 
+Release binaries and local `aarch64-apple-darwin` source builds target M1+
+Apple Silicon hardware with `target-cpu=apple-m1`, so crates like
+`xxhash-rust` can take their accelerated ARM code paths automatically.
+
 ### 2. Start Milvus
 
 ```bash

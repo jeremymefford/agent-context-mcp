@@ -1,0 +1,4 @@
+[target.aarch64-apple-darwin]
+# Target M1+ Apple Silicon hardware so all dependencies benefit from
+# Apple-specific codegen when we ship the arm64 macOS binary.
+rustflags = ["-C", "target-cpu=apple-m1"]
