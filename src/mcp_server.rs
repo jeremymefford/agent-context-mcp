@@ -3,10 +3,10 @@ use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
     EditTargetAnchor, EditTargetReasonCode, EditTargetStatus, Engine, FileOutlineResponse,
-    PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError, SearchMode,
-    SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchResponse,
-    SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest, render_clear_text,
-    render_search_explanation_text, render_status_text,
+    PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError, SearchHit, SearchMode,
+    SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchHit, SymbolSearchResponse,
+    SymbolSearchScopeRequest, TextSearchHit, TextSearchResponse, TextSearchScopeRequest,
+    render_clear_text, render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -139,6 +139,8 @@ struct SearchSymbolsArgs {
     #[serde(default)]
     container: Option<String>,
     #[serde(default)]
+    include_symbol_id: bool,
+    #[serde(default)]
     include_diagnostics: bool,
 }
 
@@ -183,6 +185,12 @@ struct PrepareEditTargetArgs {
     file: Option<String>,
     #[serde(default)]
     symbol_id: Option<String>,
+    #[serde(default)]
+    symbol_name: Option<String>,
+    #[serde(default)]
+    symbol_kind: Option<String>,
+    #[serde(default)]
+    symbol_container: Option<String>,
     #[serde(default)]
     line_hint: Option<u64>,
     #[serde(default)]
@@ -284,7 +292,8 @@ struct CompactSearchResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactSearchHit {
-    repo_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_label: Option<String>,
     relative_path: String,
     line: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -314,8 +323,10 @@ struct CompactSymbolSearchResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactSymbolHit {
-    symbol_id: String,
-    repo_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_label: Option<String>,
     relative_path: String,
     name: String,
     kind: String,
@@ -343,7 +354,8 @@ struct CompactTextSearchResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactTextSearchHit {
-    repo_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_label: Option<String>,
     relative_path: String,
     line: u64,
     preview: String,
@@ -562,10 +574,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn enqueue_refresh(
-    server: NativeServer,
-    body: Bytes,
-) -> (StatusCode, String) {
+async fn enqueue_refresh(server: NativeServer, body: Bytes) -> (StatusCode, String) {
     let payload: EnqueueRefreshRequest = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -577,7 +586,11 @@ async fn enqueue_refresh(
     };
 
     let scope = if payload.repos.is_empty() {
-        match server.engine.config().resolve_scope(None, Some(&payload.path)) {
+        match server
+            .engine
+            .config()
+            .resolve_scope(None, Some(&payload.path))
+        {
             Ok(scope) => scope,
             Err(error) => {
                 return (
@@ -587,11 +600,7 @@ async fn enqueue_refresh(
             }
         }
     } else {
-        let repos = payload
-            .repos
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
+        let repos = payload.repos.iter().map(PathBuf::from).collect::<Vec<_>>();
         ResolvedScope {
             kind: match payload.kind.as_deref() {
                 Some("repo") if repos.len() == 1 => crate::config::ScopeKind::Repo,
@@ -787,6 +796,7 @@ impl ServerHandler for NativeServer {
                         render_symbol_search_summary_text(&result),
                         serde_json::to_value(compact_symbol_search_response(
                             &result,
+                            args.include_symbol_id,
                             args.include_diagnostics,
                         ))
                         .ok(),
@@ -840,6 +850,9 @@ impl ServerHandler for NativeServer {
                                 repo: normalize_optional_string(&args.repo),
                                 file: normalize_optional_path(&args.file),
                                 symbol_id: normalize_optional_string(&args.symbol_id),
+                                symbol_name: normalize_optional_string(&args.symbol_name),
+                                symbol_kind: normalize_optional_kind(&args.symbol_kind),
+                                symbol_container: normalize_optional_string(&args.symbol_container),
                                 line_hint: args.line_hint,
                                 query: args.query.filter(|value| !value.is_empty()),
                                 occurrence: args.occurrence,
@@ -1096,7 +1109,10 @@ impl NativeServer {
                     coordinator.worker_active = false;
                     return;
                 };
-                let request = coordinator.pending.remove(&repo_key).expect("pending repo exists");
+                let request = coordinator
+                    .pending
+                    .remove(&repo_key)
+                    .expect("pending repo exists");
                 coordinator.running.insert(repo_key.clone());
                 (repo_key, request)
             };
@@ -1176,7 +1192,9 @@ fn render_index_launch_text(result: &IndexLaunchResult) -> String {
             result.force
         ));
     } else {
-        lines.push("Background indexing request accepted without starting a new worker.".to_string());
+        lines.push(
+            "Background indexing request accepted without starting a new worker.".to_string(),
+        );
     }
 
     if !result.queued_repos.is_empty() {
@@ -1212,15 +1230,19 @@ fn render_list_scopes_text(result: &ListScopesResult) -> String {
 }
 
 fn render_search_summary_text(result: &SearchResponse) -> String {
-    let mut lines = vec![format!("hits={} partial={}", result.hits.len(), result.partial)];
+    let mut lines = vec![format!(
+        "hits={} partial={}",
+        result.hits.len(),
+        result.partial
+    )];
+    let include_repo_label = search_hits_span_multiple_repos(&result.hits);
     for (index, hit) in result.hits.iter().enumerate() {
-        lines.push(format!(
-            "{}. {} :: {}:{}",
-            index + 1,
-            hit.repo_label,
-            hit.relative_path,
-            hit.start_line
-        ));
+        let location = format!("{}:{}", hit.relative_path, hit.start_line);
+        if include_repo_label {
+            lines.push(format!("{}. {} :: {}", index + 1, hit.repo_label, location));
+        } else {
+            lines.push(format!("{}. {}", index + 1, location));
+        }
     }
     for error in &result.repo_errors {
         lines.push(format!("ERR {}: {}", error.repo, error.error));
@@ -1229,17 +1251,32 @@ fn render_search_summary_text(result: &SearchResponse) -> String {
 }
 
 fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
-    let mut lines = vec![format!("symbols={} partial={}", result.hits.len(), result.partial)];
+    let mut lines = vec![format!(
+        "symbols={} partial={}",
+        result.hits.len(),
+        result.partial
+    )];
+    let include_repo_label = symbol_hits_span_multiple_repos(&result.hits);
     for (index, hit) in result.hits.iter().enumerate() {
-        lines.push(format!(
-            "{}. {} :: {}:{} {} {}",
-            index + 1,
-            hit.repo_label,
-            hit.relative_path,
-            hit.start_line,
-            hit.kind,
-            hit.name
-        ));
+        let location = format!("{}:{}", hit.relative_path, hit.start_line);
+        if include_repo_label {
+            lines.push(format!(
+                "{}. {} :: {} {} {}",
+                index + 1,
+                hit.repo_label,
+                location,
+                hit.kind,
+                hit.name
+            ));
+        } else {
+            lines.push(format!(
+                "{}. {} {} {}",
+                index + 1,
+                location,
+                hit.kind,
+                hit.name
+            ));
+        }
     }
     for error in &result.repo_errors {
         lines.push(format!("ERR {}: {}", error.repo, error.error));
@@ -1248,7 +1285,11 @@ fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
 }
 
 fn render_text_search_summary_text(result: &TextSearchResponse) -> String {
-    let mut lines = vec![format!("hits={} partial={}", result.hits.len(), result.partial)];
+    let mut lines = vec![format!(
+        "hits={} partial={}",
+        result.hits.len(),
+        result.partial
+    )];
     if result.hits.is_empty() {
         lines.push("No exact literal hits.".to_string());
     }
@@ -1326,6 +1367,7 @@ fn compact_search_response(
     result: &SearchResponse,
     include_diagnostics: bool,
 ) -> CompactSearchResponse {
+    let include_repo_label = search_hits_span_multiple_repos(&result.hits);
     CompactSearchResponse {
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
@@ -1334,7 +1376,7 @@ fn compact_search_response(
             .hits
             .iter()
             .map(|hit| CompactSearchHit {
-                repo_label: hit.repo_label.clone(),
+                repo_label: include_repo_label.then(|| hit.repo_label.clone()),
                 relative_path: hit.relative_path.clone(),
                 line: hit.start_line,
                 content: hit.content.clone(),
@@ -1358,8 +1400,10 @@ fn compact_search_response(
 
 fn compact_symbol_search_response(
     result: &SymbolSearchResponse,
+    include_symbol_id: bool,
     include_diagnostics: bool,
 ) -> CompactSymbolSearchResponse {
+    let include_repo_label = symbol_hits_span_multiple_repos(&result.hits);
     CompactSymbolSearchResponse {
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
@@ -1367,8 +1411,8 @@ fn compact_symbol_search_response(
             .hits
             .iter()
             .map(|hit| CompactSymbolHit {
-                symbol_id: hit.symbol_id.clone(),
-                repo_label: hit.repo_label.clone(),
+                symbol_id: include_symbol_id.then(|| hit.symbol_id.clone()),
+                repo_label: include_repo_label.then(|| hit.repo_label.clone()),
                 relative_path: hit.relative_path.clone(),
                 name: hit.name.clone(),
                 kind: hit.kind.clone(),
@@ -1387,6 +1431,7 @@ fn compact_symbol_search_response(
 }
 
 fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearchResponse {
+    let include_repo_label = text_hits_span_multiple_repos(&result.hits);
     CompactTextSearchResponse {
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
@@ -1394,13 +1439,37 @@ fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearc
             .hits
             .iter()
             .map(|hit| CompactTextSearchHit {
-                repo_label: hit.repo_label.clone(),
+                repo_label: include_repo_label.then(|| hit.repo_label.clone()),
                 relative_path: hit.relative_path.clone(),
                 line: hit.start_line,
                 preview: hit.preview.clone(),
             })
             .collect(),
     }
+}
+
+fn search_hits_span_multiple_repos(hits: &[SearchHit]) -> bool {
+    hits.iter()
+        .map(|hit| hit.repo_label.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1
+}
+
+fn symbol_hits_span_multiple_repos(hits: &[SymbolSearchHit]) -> bool {
+    hits.iter()
+        .map(|hit| hit.repo_label.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1
+}
+
+fn text_hits_span_multiple_repos(hits: &[TextSearchHit]) -> bool {
+    hits.iter()
+        .map(|hit| hit.repo_label.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1
 }
 
 fn compact_prepare_edit_target_response(
@@ -1462,7 +1531,9 @@ fn compact_outline_response(
                 let symbols = compact_outline_nodes(&entry.symbols, options, 1, true, &mut budget);
                 CompactFileOutlineMatch {
                     repo: include_repo.then_some(entry.repo),
-                    truncated: budget.truncated || count_compact_outline_nodes(&symbols) < count_outline_nodes(&entry.symbols),
+                    truncated: budget.truncated
+                        || count_compact_outline_nodes(&symbols)
+                            < count_outline_nodes(&entry.symbols),
                     symbols,
                 }
             })
@@ -1825,6 +1896,11 @@ fn search_symbols_schema() -> Map<String, Value> {
             "language": nullable_string_schema("Normalized language filter."),
             "kind": nullable_string_schema("Symbol kind filter."),
             "container": nullable_string_schema("Container/module/class filter."),
+            "includeSymbolId": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include symbolId only when you plan to hand it directly to prepare_edit_target."
+            },
             "includeDiagnostics": {
                 "type": "boolean",
                 "default": false,
@@ -1901,12 +1977,15 @@ fn prepare_edit_target_schema() -> Map<String, Value> {
         "properties": {
             "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
             "repo": nullable_string_schema("Repo root or repo basename when disambiguating within a multi-repo scope."),
-            "file": nullable_string_schema("Repo-relative file path. Required if symbolId is not provided."),
+            "file": nullable_string_schema("Repo-relative file path. Required unless symbolId is provided. Also used with symbolName for symbol-based prep without carrying symbolId."),
             "symbolId": nullable_string_schema("Indexed symbol id to prepare for editing."),
+            "symbolName": nullable_string_schema("Symbol name from search_symbols when preparing by symbol without symbolId."),
+            "symbolKind": nullable_string_schema("Optional symbol kind from search_symbols to narrow symbolName matches."),
+            "symbolContainer": nullable_string_schema("Optional container/module/class from search_symbols to narrow symbolName matches."),
             "lineHint": {
                 "type": ["integer", "null"],
                 "format": "uint64",
-                "description": "1-based line hint used to narrow a known edit location."
+                "description": "1-based line hint used to narrow a known edit location or symbol result."
             },
             "query": nullable_string_schema("Exact literal text used to narrow a known edit target."),
             "occurrence": {
@@ -2039,8 +2118,8 @@ mod tests {
     use super::{
         OutlineCompactionOptions, OutlineDetail, SERVER_INSTRUCTIONS, SearchMode,
         compact_outline_response, compact_prepare_edit_target_response, compact_search_response,
-        compact_text_search_response, default_limit, enforce_loopback_bind,
-        get_file_outline_schema, list_scopes_schema, listen_is_loopback,
+        compact_symbol_search_response, compact_text_search_response, default_limit,
+        enforce_loopback_bind, get_file_outline_schema, list_scopes_schema, listen_is_loopback,
         normalize_extension_filter, parse_search_mode, parse_splitter_kind,
         prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
     };
@@ -2049,7 +2128,8 @@ mod tests {
     use crate::engine::{
         AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode,
         EditTargetStatus, FileOutlineMatch, FileOutlineResponse, PrepareEditTargetResponse,
-        SearchHit, SearchPlanSummary, SearchResponse, TextSearchHit, TextSearchResponse,
+        SearchHit, SearchPlanSummary, SearchResponse, SymbolSearchHit, SymbolSearchResponse,
+        TextSearchHit, TextSearchResponse,
     };
     use serde_json::{Value, to_value};
 
@@ -2280,6 +2360,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Definition name")
         );
+        assert_eq!(
+            search_symbols["properties"]["includeSymbolId"]["default"].as_bool(),
+            Some(false)
+        );
         assert!(
             search_text["description"]
                 .as_str()
@@ -2291,6 +2375,12 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("repo, file, or pathPrefix")
+        );
+        assert!(
+            prepare["properties"]["symbolName"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("search_symbols")
         );
         assert!(
             search_text["properties"]["repo"]["description"]
@@ -2367,7 +2457,42 @@ mod tests {
 
         let json = to_value(compact_text_search_response(&response)).unwrap();
         assert!(json["hits"][0].get("repo").is_none());
+        assert!(json["hits"][0].get("repoLabel").is_none());
         assert_eq!(json["hits"][0]["preview"], "fn build() {}");
+    }
+
+    #[test]
+    fn compact_text_search_response_keeps_repo_label_for_multi_repo_hits() {
+        let response = TextSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            hits: vec![
+                TextSearchHit {
+                    repo: "/tmp/repo-a".to_string(),
+                    repo_label: "repo-a".to_string(),
+                    relative_path: "src/lib.rs".to_string(),
+                    start_line: 10,
+                    end_line: 10,
+                    preview: "fn build() {}".to_string(),
+                    stale: false,
+                },
+                TextSearchHit {
+                    repo: "/tmp/repo-b".to_string(),
+                    repo_label: "repo-b".to_string(),
+                    relative_path: "src/main.rs".to_string(),
+                    start_line: 20,
+                    end_line: 20,
+                    preview: "fn main() {}".to_string(),
+                    stale: false,
+                },
+            ],
+        };
+
+        let json = to_value(compact_text_search_response(&response)).unwrap();
+        assert_eq!(json["hits"][0]["repoLabel"], "repo-a");
+        assert_eq!(json["hits"][1]["repoLabel"], "repo-b");
     }
 
     #[test]
@@ -2490,6 +2615,7 @@ mod tests {
 
         assert!(value.get("plan").is_none());
         assert!(value.get("repoErrors").is_none());
+        assert!(hit.get("repoLabel").is_none());
         assert!(hit.get("language").is_none());
         assert!(hit.get("matchType").is_none());
         assert!(hit.get("score").is_none());
@@ -2499,6 +2625,180 @@ mod tests {
         assert_eq!(hit["relativePath"].as_str(), Some("src/lib.rs"));
         assert_eq!(hit["line"].as_u64(), Some(10));
         assert_eq!(hit["content"].as_str(), Some("fn example() {}"));
+    }
+
+    #[test]
+    fn compact_search_response_keeps_repo_label_for_multi_repo_hits() {
+        let response = SearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            plan: SearchPlanSummary {
+                requested_mode: "auto".to_string(),
+                effective_mode: "hybrid".to_string(),
+                query_kind: "mixed".to_string(),
+                dense_weight: 1.0,
+                lexical_weight: 1.0,
+                symbol_weight: 1.0,
+                symbol_lexical_share: 0.5,
+                symbol_semantic_share: 0.5,
+                dedupe_by_file: true,
+            },
+            hits: vec![
+                SearchHit {
+                    repo: "/tmp/repo-a".to_string(),
+                    repo_label: "repo-a".to_string(),
+                    relative_path: "src/lib.rs".to_string(),
+                    start_line: 10,
+                    end_line: 12,
+                    language: "rust".to_string(),
+                    score: 0.42,
+                    match_type: "hybrid".to_string(),
+                    dense_score: Some(0.1),
+                    lexical_score: Some(0.2),
+                    symbol_score: Some(0.3),
+                    indexed_at: None,
+                    stale: false,
+                    content: "fn example() {}".to_string(),
+                },
+                SearchHit {
+                    repo: "/tmp/repo-b".to_string(),
+                    repo_label: "repo-b".to_string(),
+                    relative_path: "src/main.rs".to_string(),
+                    start_line: 20,
+                    end_line: 20,
+                    language: "rust".to_string(),
+                    score: 0.41,
+                    match_type: "hybrid".to_string(),
+                    dense_score: None,
+                    lexical_score: None,
+                    symbol_score: None,
+                    indexed_at: None,
+                    stale: false,
+                    content: "fn main() {}".to_string(),
+                },
+            ],
+        };
+
+        let value = to_value(compact_search_response(&response, false)).unwrap();
+        assert_eq!(value["hits"][0]["repoLabel"], "repo-a");
+        assert_eq!(value["hits"][1]["repoLabel"], "repo-b");
+    }
+
+    #[test]
+    fn compact_symbol_search_response_omits_repo_label_for_single_repo_hits() {
+        let response = SymbolSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            hits: vec![SymbolSearchHit {
+                symbol_id: "sym_123".to_string(),
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                name: "build".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                container: None,
+                start_line: 10,
+                end_line: 12,
+                score: 0.9,
+                lexical_score: Some(0.4),
+                semantic_score: Some(0.5),
+                indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                file_hash: "abc".to_string(),
+                stale: false,
+            }],
+        };
+
+        let value = to_value(compact_symbol_search_response(&response, false, false)).unwrap();
+        assert!(value["hits"][0].get("symbolId").is_none());
+        assert!(value["hits"][0].get("repoLabel").is_none());
+    }
+
+    #[test]
+    fn compact_symbol_search_response_keeps_repo_label_for_multi_repo_hits() {
+        let response = SymbolSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            hits: vec![
+                SymbolSearchHit {
+                    symbol_id: "sym_123".to_string(),
+                    repo: "/tmp/repo-a".to_string(),
+                    repo_label: "repo-a".to_string(),
+                    relative_path: "src/lib.rs".to_string(),
+                    name: "build".to_string(),
+                    kind: "function".to_string(),
+                    language: "rust".to_string(),
+                    container: None,
+                    start_line: 10,
+                    end_line: 12,
+                    score: 0.9,
+                    lexical_score: Some(0.4),
+                    semantic_score: Some(0.5),
+                    indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                    file_hash: "abc".to_string(),
+                    stale: false,
+                },
+                SymbolSearchHit {
+                    symbol_id: "sym_456".to_string(),
+                    repo: "/tmp/repo-b".to_string(),
+                    repo_label: "repo-b".to_string(),
+                    relative_path: "src/main.rs".to_string(),
+                    name: "main".to_string(),
+                    kind: "function".to_string(),
+                    language: "rust".to_string(),
+                    container: None,
+                    start_line: 20,
+                    end_line: 22,
+                    score: 0.8,
+                    lexical_score: Some(0.3),
+                    semantic_score: Some(0.5),
+                    indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                    file_hash: "def".to_string(),
+                    stale: false,
+                },
+            ],
+        };
+
+        let value = to_value(compact_symbol_search_response(&response, false, false)).unwrap();
+        assert_eq!(value["hits"][0]["repoLabel"], "repo-a");
+        assert_eq!(value["hits"][1]["repoLabel"], "repo-b");
+    }
+
+    #[test]
+    fn compact_symbol_search_response_includes_symbol_id_when_requested() {
+        let response = SymbolSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: false,
+            repo_errors: Vec::new(),
+            hits: vec![SymbolSearchHit {
+                symbol_id: "sym_123".to_string(),
+                repo: "/tmp/repo".to_string(),
+                repo_label: "repo".to_string(),
+                relative_path: "src/lib.rs".to_string(),
+                name: "build".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                container: None,
+                start_line: 10,
+                end_line: 12,
+                score: 0.9,
+                lexical_score: Some(0.4),
+                semantic_score: Some(0.5),
+                indexed_at: "2026-01-01T00:00:00Z".to_string(),
+                file_hash: "abc".to_string(),
+                stale: false,
+            }],
+        };
+
+        let value = to_value(compact_symbol_search_response(&response, true, false)).unwrap();
+        assert_eq!(value["hits"][0]["symbolId"], "sym_123");
     }
 
     #[test]

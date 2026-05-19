@@ -55,7 +55,11 @@ pub struct SnapshotEntry {
     pub index_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    #[serde(default, rename = "embeddingProfile", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "embeddingProfile",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub embedding_profile: Option<String>,
     #[serde(
         default,
@@ -162,7 +166,9 @@ impl SnapshotStore {
             if entry.status == "indexing" {
                 *entry = SnapshotEntry::failed(
                     reason.to_string(),
-                    entry.indexing_percentage.or(entry.last_attempted_percentage),
+                    entry
+                        .indexing_percentage
+                        .or(entry.last_attempted_percentage),
                     entry.embedding_profile.clone(),
                     entry.embedding_fingerprint.clone(),
                 );

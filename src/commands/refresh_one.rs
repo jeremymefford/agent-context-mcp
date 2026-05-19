@@ -78,7 +78,11 @@ pub async fn run(
     Ok(())
 }
 
-pub fn build_enqueue_request(path: &str, force: bool, scope: Option<&ResolvedScope>) -> serde_json::Value {
+pub fn build_enqueue_request(
+    path: &str,
+    force: bool,
+    scope: Option<&ResolvedScope>,
+) -> serde_json::Value {
     let mut payload = json!({
         "path": path,
         "force": force,

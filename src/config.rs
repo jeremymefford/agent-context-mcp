@@ -538,9 +538,7 @@ impl EmbeddingConfig {
         &self.default_profile
     }
 
-    pub fn profiles(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (&String, &EmbeddingProfileConfig)> {
+    pub fn profiles(&self) -> impl ExactSizeIterator<Item = (&String, &EmbeddingProfileConfig)> {
         self.profiles.iter()
     }
 
@@ -559,7 +557,6 @@ impl EmbeddingConfig {
             .map(String::as_str)
             .unwrap_or(self.default_profile.as_str()))
     }
-
 }
 
 impl EmbeddingProfileConfig {
@@ -681,7 +678,9 @@ fn build_embedding_config(
             .unwrap_or_else(|| DEFAULT_EMBEDDING_PROFILE.to_string());
 
         if !profiles.contains_key(&default_profile) {
-            bail!("embedding.default_profile `{default_profile}` does not match any configured embedding profile");
+            bail!(
+                "embedding.default_profile `{default_profile}` does not match any configured embedding profile"
+            );
         }
 
         let mut assignments = BTreeMap::new();
@@ -701,9 +700,14 @@ fn build_embedding_config(
                     .display()
                     .to_string();
                 if !configured_repos.contains(&repo) {
-                    bail!("embedding assignment repo `{repo}` is not present in any configured group");
+                    bail!(
+                        "embedding assignment repo `{repo}` is not present in any configured group"
+                    );
                 }
-                if assignments.insert(repo.clone(), profile.to_string()).is_some() {
+                if assignments
+                    .insert(repo.clone(), profile.to_string())
+                    .is_some()
+                {
                     bail!("duplicate embedding assignment for repo `{repo}`");
                 }
             }
@@ -725,7 +729,10 @@ fn build_embedding_config(
     })
 }
 
-fn build_legacy_embedding_profile(raw: &RawConfig, config_dir: &Path) -> Result<EmbeddingProfileConfig> {
+fn build_legacy_embedding_profile(
+    raw: &RawConfig,
+    config_dir: &Path,
+) -> Result<EmbeddingProfileConfig> {
     let provider = parse_provider(
         raw.embedding
             .as_ref()
@@ -1151,10 +1158,7 @@ mod tests {
             .profile(config.embedding.default_profile_name())
             .unwrap();
 
-        assert_eq!(
-            profile.voyage.key_file,
-            Some(root.join("keys/voyage_key"))
-        );
+        assert_eq!(profile.voyage.key_file, Some(root.join("keys/voyage_key")));
         assert_eq!(config.snapshot_path, root.join("state/snapshot.json"));
         assert_eq!(config.index_root, root.join("state/index-v1"));
         assert_eq!(config.merkle_dir, root.join("state/index-v1/merkle"));
@@ -1198,10 +1202,7 @@ mod tests {
         assert_eq!(profile.provider, EmbeddingProvider::OpenAi);
         assert_eq!(profile.model, "text-embedding-3-large");
         assert_eq!(profile.openai.api_key_env, "OPENAI_SECRET");
-        assert_eq!(
-            profile.openai.key_file,
-            Some(dir.join("keys/openai_key"))
-        );
+        assert_eq!(profile.openai.key_file, Some(dir.join("keys/openai_key")));
         assert_eq!(profile.openai.base_url, "https://example.com/v1");
     }
 
@@ -1275,7 +1276,10 @@ mod tests {
 
         assert_eq!(config.embedding.default_profile_name(), "hosted");
         assert_eq!(
-            config.embedding.profile_name_for_repo(&hosted_repo).unwrap(),
+            config
+                .embedding
+                .profile_name_for_repo(&hosted_repo)
+                .unwrap(),
             "hosted"
         );
         assert_eq!(
@@ -1370,7 +1374,11 @@ mod tests {
         );
 
         let error = Config::load_from_path(&config_path).unwrap_err();
-        assert!(error.to_string().contains("is not present in any configured group"));
+        assert!(
+            error
+                .to_string()
+                .contains("is not present in any configured group")
+        );
     }
 
     #[test]

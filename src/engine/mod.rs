@@ -431,6 +431,9 @@ pub struct PrepareEditTargetRequest {
     pub repo: Option<String>,
     pub file: Option<String>,
     pub symbol_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub symbol_container: Option<String>,
     pub line_hint: Option<u64>,
     pub query: Option<String>,
     pub occurrence: Option<usize>,
@@ -915,12 +918,7 @@ impl Engine {
         let repo_key = repo.display().to_string();
         let entry = snapshot.codebases.get(&repo_key);
         let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-        let configured_fingerprint = self
-            .inner
-            .embedding
-            .fingerprint(&profile_name)
-            .await
-            .ok();
+        let configured_fingerprint = self.inner.embedding.fingerprint(&profile_name).await.ok();
         Ok(repo_embedding_identity_status_for_snapshot(
             snapshot,
             entry,
@@ -1006,7 +1004,10 @@ impl Engine {
     pub async fn mark_scope_indexing(&self, scope: &ResolvedScope) -> Result<()> {
         for repo in &scope.repos {
             let repo_key = repo.display().to_string();
-            let profile_name = self.embedding_profile_name_for_repo(repo).ok().map(str::to_string);
+            let profile_name = self
+                .embedding_profile_name_for_repo(repo)
+                .ok()
+                .map(str::to_string);
             self.inner
                 .snapshot
                 .update(|snapshot| {
@@ -1287,12 +1288,20 @@ impl Engine {
                     continue;
                 }
                 let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-                repos_by_profile.entry(profile_name).or_default().push(repo_key);
+                repos_by_profile
+                    .entry(profile_name)
+                    .or_default()
+                    .push(repo_key);
             }
 
             for (profile_name, repo_keys) in repos_by_profile {
                 let _dense_permit = self.acquire_dense_budget().await?;
-                match self.inner.embedding.embed_query(&profile_name, &request.query).await {
+                match self
+                    .inner
+                    .embedding
+                    .embed_query(&profile_name, &request.query)
+                    .await
+                {
                     Ok(vector) => {
                         let vector = Arc::new(vector);
                         for repo_key in repo_keys {
@@ -1453,12 +1462,20 @@ impl Engine {
                     continue;
                 }
                 let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-                repos_by_profile.entry(profile_name).or_default().push(repo_key);
+                repos_by_profile
+                    .entry(profile_name)
+                    .or_default()
+                    .push(repo_key);
             }
 
             for (profile_name, repo_keys) in repos_by_profile {
                 let _dense_permit = self.acquire_dense_budget().await?;
-                match self.inner.embedding.embed_query(&profile_name, &request.query).await {
+                match self
+                    .inner
+                    .embedding
+                    .embed_query(&profile_name, &request.query)
+                    .await
+                {
                     Ok(vector) => {
                         let vector = Arc::new(vector);
                         for repo_key in repo_keys {
@@ -1654,17 +1671,30 @@ impl Engine {
         scope: ResolvedScope,
         request: PrepareEditTargetRequest,
     ) -> Result<PrepareEditTargetResponse> {
+        let has_symbol_locator = request
+            .symbol_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
         if request.symbol_id.is_none() && request.file.is_none() {
             bail!("prepare_edit_target requires `symbolId` or `file`");
         }
-        if request.file.is_some() && request.line_hint.is_none() && request.query.is_none() {
-            bail!("prepare_edit_target requires `lineHint` or `query` when `file` is provided");
+        if request.file.is_some()
+            && request.line_hint.is_none()
+            && request.query.is_none()
+            && !has_symbol_locator
+        {
+            bail!(
+                "prepare_edit_target requires `lineHint`, `query`, or `symbolName` when `file` is provided"
+            );
         }
         let _request_permit = self.acquire_request_budget().await?;
         if let Some(symbol_id) = &request.symbol_id {
             return self
                 .prepare_symbol_edit_target(scope, symbol_id, &request)
                 .await;
+        }
+        if has_symbol_locator {
+            return self.prepare_named_symbol_edit_target(scope, &request).await;
         }
         self.prepare_file_edit_target(scope, &request).await
     }
@@ -2009,6 +2039,91 @@ impl Engine {
             resolved.symbol.start_line,
             resolved.symbol.end_line,
         ))
+    }
+
+    async fn prepare_named_symbol_edit_target(
+        &self,
+        scope: ResolvedScope,
+        request: &PrepareEditTargetRequest,
+    ) -> Result<PrepareEditTargetResponse> {
+        let file = request
+            .file
+            .as_deref()
+            .map(normalize_relative_path)
+            .context("prepare_edit_target requires `file` when `symbolId` is not provided")?;
+        let symbol_name = request
+            .symbol_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("prepare_edit_target requires `symbolName` when resolving by symbol")?;
+        let repos = self.resolve_prepare_repos(&scope, request.repo.as_deref())?;
+        let mut resolved = Vec::new();
+
+        for repo in repos {
+            let symbols = self
+                .load_file_outline_symbols(&repo.display().to_string(), &file)
+                .await?;
+            let matches = symbols
+                .into_iter()
+                .filter(|symbol| symbol.name == symbol_name)
+                .filter(|symbol| {
+                    request
+                        .symbol_kind
+                        .as_deref()
+                        .is_none_or(|kind| symbol.kind == kind)
+                })
+                .filter(|symbol| {
+                    request
+                        .symbol_container
+                        .as_deref()
+                        .is_none_or(|container| symbol.container.as_deref() == Some(container))
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                continue;
+            }
+            if let Some(line_hint) = request.line_hint {
+                if let Some(symbol) = matches
+                    .iter()
+                    .find(|symbol| line_hint >= symbol.start_line && line_hint <= symbol.end_line)
+                {
+                    resolved.push(ResolvedEditSymbol {
+                        repo: repo.clone(),
+                        symbol: symbol.clone(),
+                    });
+                    continue;
+                }
+            }
+            if matches.len() == 1 {
+                resolved.push(ResolvedEditSymbol {
+                    repo: repo.clone(),
+                    symbol: matches.into_iter().next().expect("single symbol match"),
+                });
+                continue;
+            }
+            return Ok(named_symbol_ambiguous_prepare_response(
+                &repo, &file, matches,
+            ));
+        }
+
+        match resolved.len() {
+            0 => Ok(not_found_prepare_response_for_file(&file)),
+            1 => {
+                self.prepare_symbol_edit_target(
+                    ResolvedScope {
+                        kind: ScopeKind::Repo,
+                        id: resolved[0].repo.display().to_string(),
+                        label: resolved[0].repo.display().to_string(),
+                        repos: vec![resolved[0].repo.clone()],
+                    },
+                    &resolved[0].symbol.symbol_id,
+                    request,
+                )
+                .await
+            }
+            _ => Ok(ambiguous_prepare_response_from_symbols(&file, &resolved)),
+        }
     }
 
     async fn prepare_file_edit_target(
@@ -2821,7 +2936,12 @@ impl Engine {
     #[allow(dead_code)]
     async fn persist_index_identity(&self) -> Result<()> {
         let configured_embedding_fingerprints = self.configured_embedding_fingerprints().await?;
-        let default_profile = self.inner.config.embedding.default_profile_name().to_string();
+        let default_profile = self
+            .inner
+            .config
+            .embedding
+            .default_profile_name()
+            .to_string();
         let legacy_fingerprint = configured_embedding_fingerprints
             .get(&default_profile)
             .cloned();
@@ -2855,13 +2975,12 @@ impl Engine {
         let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await?;
         let configured_embedding_dimension = self.embedding_dimension_for_repo(repo).await?;
         let snapshot_before = self.inner.snapshot.read().await?;
-        let repo_identity =
-            repo_embedding_identity_status_for_snapshot(
-                &snapshot_before,
-                snapshot_before.codebases.get(&repo_key),
-                &profile_name,
-                Some(configured_embedding_fingerprint.clone()),
-            );
+        let repo_identity = repo_embedding_identity_status_for_snapshot(
+            &snapshot_before,
+            snapshot_before.codebases.get(&repo_key),
+            &profile_name,
+            Some(configured_embedding_fingerprint.clone()),
+        );
         drop(snapshot_before);
         self.inner
             .snapshot
@@ -3171,17 +3290,18 @@ impl Engine {
                 self.inner
                     .snapshot
                     .update(|snapshot| {
-                        let entry = snapshot
-                            .codebases
-                            .entry(repo_key.clone())
-                            .or_insert_with(|| {
-                                SnapshotEntry::indexing(
-                                    0.0,
-                                    "running",
-                                    Some(profile_name.clone()),
-                                    Some(configured_embedding_fingerprint.clone()),
-                                )
-                            });
+                        let entry =
+                            snapshot
+                                .codebases
+                                .entry(repo_key.clone())
+                                .or_insert_with(|| {
+                                    SnapshotEntry::indexing(
+                                        0.0,
+                                        "running",
+                                        Some(profile_name.clone()),
+                                        Some(configured_embedding_fingerprint.clone()),
+                                    )
+                                });
                         *entry = SnapshotEntry::indexed_with_status(
                             Some(coverage.indexed_files),
                             Some(coverage.total_chunks),
@@ -3750,7 +3870,10 @@ impl Engine {
         repo_key: &str,
         progress: f64,
     ) -> Result<()> {
-        let profile_name = self.embedding_profile_name_for_repo(repo).ok().map(str::to_string);
+        let profile_name = self
+            .embedding_profile_name_for_repo(repo)
+            .ok()
+            .map(str::to_string);
         let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await.ok();
         self.inner
             .snapshot
@@ -3893,7 +4016,7 @@ impl Engine {
                         plan.collections.symbol,
                         &mut pending_symbols,
                     )
-                        .await?;
+                    .await?;
                 }
             }
 
@@ -3910,7 +4033,7 @@ impl Engine {
                         plan.collections.chunk,
                         &mut pending_chunks,
                     )
-                        .await?;
+                    .await?;
                 }
             }
 
@@ -3933,7 +4056,7 @@ impl Engine {
                 plan.collections.chunk,
                 &mut pending_chunks,
             )
-                .await?;
+            .await?;
         }
         if !pending_symbols.is_empty() {
             self.flush_symbol_documents(
@@ -3941,7 +4064,7 @@ impl Engine {
                 plan.collections.symbol,
                 &mut pending_symbols,
             )
-                .await?;
+            .await?;
         }
         if !pending_symbol_index_replacements.is_empty() {
             self.flush_symbol_index_replacements(plan.repo, &mut pending_symbol_index_replacements)
@@ -5122,9 +5245,10 @@ fn repo_embedding_identity_status_for_snapshot(
         reason = Some(format!(
             "embedding profile mismatch: local state is `{stored_profile}`, current config is `{configured_profile_name}`."
         ));
-    } else if let (Some(stored), Some(configured)) =
-        (stored_fingerprint.as_deref(), configured_fingerprint.as_deref())
-        && stored != configured
+    } else if let (Some(stored), Some(configured)) = (
+        stored_fingerprint.as_deref(),
+        configured_fingerprint.as_deref(),
+    ) && stored != configured
     {
         reason = Some(format!(
             "embedding fingerprint mismatch: local state is `{stored}`, current config is `{configured}`."
@@ -5478,6 +5602,100 @@ fn not_found_prepare_response_for_file(file: &str) -> PrepareEditTargetResponse 
         symbol_end_line: None,
         reason_code: None,
         suggested_next_tool: None,
+    }
+}
+
+fn named_symbol_ambiguous_prepare_response(
+    repo: &Path,
+    file: &str,
+    matches: Vec<IndexedSymbol>,
+) -> PrepareEditTargetResponse {
+    PrepareEditTargetResponse {
+        status: EditTargetStatus::Ambiguous,
+        repo: Some(repo.display().to_string()),
+        repo_label: Some(repo_basename(&repo.display().to_string())),
+        relative_path: Some(file.to_string()),
+        start_line: None,
+        end_line: None,
+        content: None,
+        anchors: Vec::new(),
+        anchor_quality: None,
+        resolution_type: Some(EditResolutionType::Symbol),
+        file_hash: None,
+        indexed: Some(true),
+        stale: Some(false),
+        indexed_at: None,
+        indexed_file_hash: None,
+        symbol_id: None,
+        truncated: Some(matches.len() > 8),
+        candidates: matches
+            .into_iter()
+            .take(8)
+            .map(|symbol| EditTargetCandidate {
+                repo: repo.display().to_string(),
+                repo_label: repo_basename(&repo.display().to_string()),
+                relative_path: symbol.relative_path.clone(),
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+                preview: match symbol.container.as_deref() {
+                    Some(container) => {
+                        format!("{} {} in {}", symbol.kind, symbol.name, container)
+                    }
+                    None => format!("{} {}", symbol.kind, symbol.name),
+                },
+            })
+            .collect(),
+        symbol_start_line: None,
+        symbol_end_line: None,
+        reason_code: Some(EditTargetReasonCode::MultipleMatches),
+        suggested_next_tool: Some("prepare_edit_target".to_string()),
+    }
+}
+
+fn ambiguous_prepare_response_from_symbols(
+    file: &str,
+    resolved: &[ResolvedEditSymbol],
+) -> PrepareEditTargetResponse {
+    PrepareEditTargetResponse {
+        status: EditTargetStatus::Ambiguous,
+        repo: None,
+        repo_label: None,
+        relative_path: Some(file.to_string()),
+        start_line: None,
+        end_line: None,
+        content: None,
+        anchors: Vec::new(),
+        anchor_quality: None,
+        resolution_type: Some(EditResolutionType::Symbol),
+        file_hash: None,
+        indexed: Some(true),
+        stale: Some(false),
+        indexed_at: None,
+        indexed_file_hash: None,
+        symbol_id: None,
+        truncated: Some(resolved.len() > 8),
+        candidates: resolved
+            .iter()
+            .take(8)
+            .map(|entry| EditTargetCandidate {
+                repo: entry.repo.display().to_string(),
+                repo_label: repo_basename(&entry.repo.display().to_string()),
+                relative_path: entry.symbol.relative_path.clone(),
+                start_line: entry.symbol.start_line,
+                end_line: entry.symbol.end_line,
+                preview: match entry.symbol.container.as_deref() {
+                    Some(container) => format!(
+                        "{} {} in {}",
+                        entry.symbol.kind, entry.symbol.name, container
+                    ),
+                    None => format!("{} {}", entry.symbol.kind, entry.symbol.name),
+                },
+            })
+            .collect(),
+        symbol_start_line: None,
+        symbol_end_line: None,
+        reason_code: Some(EditTargetReasonCode::MultipleMatches),
+        suggested_next_tool: Some("prepare_edit_target".to_string()),
     }
 }
 
@@ -5857,8 +6075,8 @@ mod tests {
         collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
         hash_text_like_file, index_identity_status_for_snapshot, index_status_for_coverage,
         is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
-        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking, scan_repo,
-        search_text_scans_live_repo, select_edit_anchors, select_text_match,
+        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking,
+        scan_repo, search_text_scans_live_repo, select_edit_anchors, select_text_match,
         stale_vector_collections, symbol_collection_name, text_search_has_bounded_target,
         validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
     };
@@ -6361,8 +6579,7 @@ mod tests {
             ("zzz-hosted".to_string(), "hosted-fingerprint".to_string()),
         ]);
 
-        let status =
-            index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
+        let status = index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
 
         assert!(status.compatible);
         assert!(status.reason.is_none());
@@ -6382,15 +6599,16 @@ mod tests {
             ("zzz-hosted".to_string(), "hosted-fingerprint".to_string()),
         ]);
 
-        let status =
-            index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
+        let status = index_identity_status_for_snapshot(&snapshot, "zzz-hosted", &configured);
 
         assert!(!status.compatible);
-        assert!(status
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("zzz-hosted"));
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("zzz-hosted")
+        );
     }
 
     #[test]

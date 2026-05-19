@@ -151,7 +151,11 @@ async fn main() -> Result<()> {
             let cfg = load_config(cli.config.as_deref())?;
             commands::release_vector_collections::run(&cfg).await
         }
-        Command::RefreshOne { force, listen, path } => {
+        Command::RefreshOne {
+            force,
+            listen,
+            path,
+        } => {
             let resolved_scope = if cli.config.is_some() || !looks_like_absolute_repo_scope(&path) {
                 let cfg = load_config(cli.config.as_deref())?;
                 Some(cfg.resolve_scope(None, Some(&path))?)

@@ -53,7 +53,10 @@ pub async fn run(config: &Config, apply: bool) -> Result<()> {
                     .drop_vector_collections(&vector_collections)
                     .await
                     .context("dropping agent-context vector collections")?;
-                println!("Dropped {} agent-context vector collection(s)", dropped.len());
+                println!(
+                    "Dropped {} agent-context vector collection(s)",
+                    dropped.len()
+                );
             }
             Err(error) => {
                 eprintln!(
@@ -63,7 +66,10 @@ pub async fn run(config: &Config, apply: bool) -> Result<()> {
         }
     }
 
-    println!("Removed local agent-context state for {}", config.config_path.display());
+    println!(
+        "Removed local agent-context state for {}",
+        config.config_path.display()
+    );
     Ok(())
 }
 
@@ -91,8 +97,7 @@ fn remove_path_if_present(path: &Path) -> Result<()> {
         std::fs::remove_dir_all(path)
             .with_context(|| format!("removing directory {}", path.display()))?;
     } else {
-        std::fs::remove_file(path)
-            .with_context(|| format!("removing file {}", path.display()))?;
+        std::fs::remove_file(path).with_context(|| format!("removing file {}", path.display()))?;
     }
     Ok(())
 }

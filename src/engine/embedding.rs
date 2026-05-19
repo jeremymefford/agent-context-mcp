@@ -178,8 +178,8 @@ impl EmbeddingRegistry {
         match self
             .clients
             .get(profile_name)
-            .with_context(|| format!("embedding profile `{profile_name}` is not initialized"))
-        ? {
+            .with_context(|| format!("embedding profile `{profile_name}` is not initialized"))?
+        {
             EmbeddingRegistryEntry::Ready(client) => Ok(client),
             EmbeddingRegistryEntry::Failed(error) => {
                 bail!("embedding profile `{profile_name}` is unavailable: {error}")
