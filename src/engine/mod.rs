@@ -4314,18 +4314,16 @@ pub fn render_search_text(result: &SearchResponse) -> String {
     for (index, hit) in result.hits.iter().enumerate() {
         lines.push(String::new());
         lines.push(format!(
-            "{}. {} :: {}:{}-{} score={:.6} matchType={} stale={}",
+            "{}. {} :: {}:{}-{} score={:.6}",
             index + 1,
             hit.repo_label,
             hit.relative_path,
             hit.start_line,
             hit.end_line,
-            hit.score,
-            hit.match_type,
-            hit.stale
+            hit.score
         ));
         lines.push(hit.repo.clone());
-        lines.push(truncate_for_display(&hit.content, 800));
+        lines.push(truncate_for_display(&hit.content, 320));
     }
     for error in &result.repo_errors {
         lines.push(format!("ERR {}: {}", error.repo, error.error));

@@ -2,11 +2,11 @@ use crate::config::{Config, ResolvedScope};
 use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
-    AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode, EditTargetStatus,
-    Engine, FileOutlineResponse, PrepareEditTargetRequest, PrepareEditTargetResponse,
-    RepoSearchError, SearchMode, SearchPlanSummary, SearchRequest, SearchResponse,
-    SymbolSearchResponse, SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest,
-    render_clear_text, render_search_explanation_text, render_status_text,
+    EditTargetAnchor, EditTargetReasonCode, EditTargetStatus, Engine, FileOutlineResponse,
+    PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError, SearchMode,
+    SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchResponse,
+    SymbolSearchScopeRequest, TextSearchResponse, TextSearchScopeRequest, render_clear_text,
+    render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -272,8 +272,6 @@ struct ListScopesResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactSearchResponse {
-    scope: String,
-    label: String,
     #[serde(skip_serializing_if = "is_false")]
     partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -288,16 +286,9 @@ struct CompactSearchResponse {
 struct CompactSearchHit {
     repo_label: String,
     relative_path: String,
-    start_line: u64,
-    end_line: u64,
-    language: String,
-    match_type: String,
+    line: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     content: String,
-    #[serde(skip_serializing_if = "is_false")]
-    stale: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,8 +304,6 @@ struct CompactSearchHit {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactSymbolSearchResponse {
-    scope: String,
-    label: String,
     #[serde(skip_serializing_if = "is_false")]
     partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -332,30 +321,18 @@ struct CompactSymbolHit {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<String>,
-    start_line: u64,
-    end_line: u64,
-    language: String,
-    #[serde(skip_serializing_if = "is_false")]
-    stale: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo: Option<String>,
+    line: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lexical_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    indexed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactTextSearchResponse {
-    scope: String,
-    label: String,
     #[serde(skip_serializing_if = "is_false")]
     partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -368,8 +345,7 @@ struct CompactTextSearchResponse {
 struct CompactTextSearchHit {
     repo_label: String,
     relative_path: String,
-    start_line: u64,
-    end_line: u64,
+    line: u64,
     preview: String,
 }
 
@@ -377,8 +353,6 @@ struct CompactTextSearchHit {
 #[serde(rename_all = "camelCase")]
 struct CompactPrepareEditTargetResponse {
     status: EditTargetStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relative_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,12 +363,6 @@ struct CompactPrepareEditTargetResponse {
     content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     anchors: Vec<EditTargetAnchor>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    anchor_quality: Option<AnchorQuality>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolution_type: Option<EditResolutionType>,
-    #[serde(skip_serializing_if = "is_false")]
-    stale: bool,
     #[serde(skip_serializing_if = "is_false")]
     unindexed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,10 +372,6 @@ struct CompactPrepareEditTargetResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     candidates: Vec<CompactEditTargetCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_start_line: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_end_line: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<EditTargetReasonCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next_tool: Option<String>,
@@ -416,7 +380,6 @@ struct CompactPrepareEditTargetResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactEditTargetCandidate {
-    repo_label: String,
     relative_path: String,
     start_line: u64,
     end_line: u64,
@@ -433,9 +396,6 @@ enum OutlineDetail {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactFileOutlineResponse {
-    scope: String,
-    label: String,
-    file: String,
     matches: Vec<CompactFileOutlineMatch>,
 }
 
@@ -444,31 +404,17 @@ struct CompactFileOutlineResponse {
 struct CompactFileOutlineMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     repo: Option<String>,
-    repo_label: String,
-    relative_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(skip_serializing_if = "is_false")]
-    stale: bool,
     #[serde(skip_serializing_if = "is_false")]
     truncated: bool,
-    returned_node_count: usize,
-    total_node_count: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    remaining_node_count: usize,
     symbols: Vec<CompactOutlineNode>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactOutlineNode {
-    symbol_id: String,
     name: String,
     kind: String,
-    start_line: u64,
-    end_line: u64,
-    #[serde(skip_serializing_if = "is_false")]
-    has_children: bool,
+    line: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<CompactOutlineNode>,
 }
@@ -1266,21 +1212,14 @@ fn render_list_scopes_text(result: &ListScopesResult) -> String {
 }
 
 fn render_search_summary_text(result: &SearchResponse) -> String {
-    let mut lines = vec![format!(
-        "Scope: {} hits={} partial={}",
-        result.label,
-        result.hits.len(),
-        result.partial
-    )];
+    let mut lines = vec![format!("hits={} partial={}", result.hits.len(), result.partial)];
     for (index, hit) in result.hits.iter().enumerate() {
         lines.push(format!(
-            "{}. {} :: {}:{}-{} {}",
+            "{}. {} :: {}:{}",
             index + 1,
             hit.repo_label,
             hit.relative_path,
-            hit.start_line,
-            hit.end_line,
-            hit.match_type
+            hit.start_line
         ));
     }
     for error in &result.repo_errors {
@@ -1290,20 +1229,14 @@ fn render_search_summary_text(result: &SearchResponse) -> String {
 }
 
 fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
-    let mut lines = vec![format!(
-        "Scope: {} symbols={} partial={}",
-        result.label,
-        result.hits.len(),
-        result.partial
-    )];
+    let mut lines = vec![format!("symbols={} partial={}", result.hits.len(), result.partial)];
     for (index, hit) in result.hits.iter().enumerate() {
         lines.push(format!(
-            "{}. {} :: {}:{}-{} {} {}",
+            "{}. {} :: {}:{} {} {}",
             index + 1,
             hit.repo_label,
             hit.relative_path,
             hit.start_line,
-            hit.end_line,
             hit.kind,
             hit.name
         ));
@@ -1315,12 +1248,7 @@ fn render_symbol_search_summary_text(result: &SymbolSearchResponse) -> String {
 }
 
 fn render_text_search_summary_text(result: &TextSearchResponse) -> String {
-    let mut lines = vec![format!(
-        "Scope: {} hits={} partial={}",
-        result.label,
-        result.hits.len(),
-        result.partial
-    )];
+    let mut lines = vec![format!("hits={} partial={}", result.hits.len(), result.partial)];
     if result.hits.is_empty() {
         lines.push("No exact literal hits.".to_string());
     }
@@ -1335,8 +1263,7 @@ fn render_prepare_edit_target_summary_text(
 ) -> String {
     match result.status {
         EditTargetStatus::Ready => format!(
-            "Ready {} :: {}:{}-{} anchors={}",
-            result.repo_label.as_deref().unwrap_or("unknown"),
+            "Ready {}:{}-{} anchors={}",
             result.relative_path.as_deref().unwrap_or("unknown"),
             result.start_line.unwrap_or(0),
             result.end_line.unwrap_or(0),
@@ -1380,18 +1307,15 @@ fn reason_code_label(reason: EditTargetReasonCode) -> &'static str {
 }
 
 fn render_outline_summary_text(result: &CompactFileOutlineResponse) -> String {
-    let mut lines = vec![format!("Scope: {} file={}", result.label, result.file)];
+    let mut lines = Vec::new();
     if result.matches.is_empty() {
         lines.push("No indexed outline.".to_string());
         return lines.join("\n");
     }
     for entry in &result.matches {
         lines.push(format!(
-            "{} :: {} nodes={}/{} truncated={}",
-            entry.repo_label,
-            entry.relative_path,
-            entry.returned_node_count,
-            entry.total_node_count,
+            "outline topLevelSymbols={} truncated={}",
+            entry.symbols.len(),
             entry.truncated
         ));
     }
@@ -1403,8 +1327,6 @@ fn compact_search_response(
     include_diagnostics: bool,
 ) -> CompactSearchResponse {
     CompactSearchResponse {
-        scope: result.scope.clone(),
-        label: result.label.clone(),
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
         plan: include_diagnostics.then(|| result.plan.clone()),
@@ -1414,13 +1336,8 @@ fn compact_search_response(
             .map(|hit| CompactSearchHit {
                 repo_label: hit.repo_label.clone(),
                 relative_path: hit.relative_path.clone(),
-                start_line: hit.start_line,
-                end_line: hit.end_line,
-                language: hit.language.clone(),
-                match_type: hit.match_type.clone(),
+                line: hit.start_line,
                 content: hit.content.clone(),
-                stale: hit.stale,
-                repo: include_diagnostics.then(|| hit.repo.clone()),
                 score: include_diagnostics.then_some(round_score(hit.score)),
                 dense_score: include_diagnostics
                     .then(|| hit.dense_score.map(round_score))
@@ -1444,8 +1361,6 @@ fn compact_symbol_search_response(
     include_diagnostics: bool,
 ) -> CompactSymbolSearchResponse {
     CompactSymbolSearchResponse {
-        scope: result.scope.clone(),
-        label: result.label.clone(),
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
         hits: result
@@ -1458,11 +1373,7 @@ fn compact_symbol_search_response(
                 name: hit.name.clone(),
                 kind: hit.kind.clone(),
                 container: hit.container.clone(),
-                start_line: hit.start_line,
-                end_line: hit.end_line,
-                language: hit.language.clone(),
-                stale: hit.stale,
-                repo: include_diagnostics.then(|| hit.repo.clone()),
+                line: hit.start_line,
                 score: include_diagnostics.then_some(round_score(hit.score)),
                 lexical_score: include_diagnostics
                     .then(|| hit.lexical_score.map(round_score))
@@ -1470,8 +1381,6 @@ fn compact_symbol_search_response(
                 semantic_score: include_diagnostics
                     .then(|| hit.semantic_score.map(round_score))
                     .flatten(),
-                indexed_at: include_diagnostics.then(|| hit.indexed_at.clone()),
-                file_hash: include_diagnostics.then(|| hit.file_hash.clone()),
             })
             .collect(),
     }
@@ -1479,8 +1388,6 @@ fn compact_symbol_search_response(
 
 fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearchResponse {
     CompactTextSearchResponse {
-        scope: result.scope.clone(),
-        label: result.label.clone(),
         partial: result.partial,
         repo_errors: result.repo_errors.clone(),
         hits: result
@@ -1489,8 +1396,7 @@ fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearc
             .map(|hit| CompactTextSearchHit {
                 repo_label: hit.repo_label.clone(),
                 relative_path: hit.relative_path.clone(),
-                start_line: hit.start_line,
-                end_line: hit.end_line,
+                line: hit.start_line,
                 preview: hit.preview.clone(),
             })
             .collect(),
@@ -1502,15 +1408,11 @@ fn compact_prepare_edit_target_response(
 ) -> CompactPrepareEditTargetResponse {
     CompactPrepareEditTargetResponse {
         status: result.status,
-        repo_label: result.repo_label.clone(),
         relative_path: result.relative_path.clone(),
         start_line: result.start_line,
         end_line: result.end_line,
         content: result.content.clone(),
         anchors: result.anchors.clone(),
-        anchor_quality: result.anchor_quality,
-        resolution_type: result.resolution_type,
-        stale: result.stale.unwrap_or(false),
         unindexed: matches!(result.indexed, Some(false)),
         symbol_id: result.symbol_id.clone(),
         truncated: result.truncated.unwrap_or(false),
@@ -1518,15 +1420,12 @@ fn compact_prepare_edit_target_response(
             .candidates
             .iter()
             .map(|candidate| CompactEditTargetCandidate {
-                repo_label: candidate.repo_label.clone(),
                 relative_path: candidate.relative_path.clone(),
                 start_line: candidate.start_line,
                 end_line: candidate.end_line,
                 preview: candidate.preview.clone(),
             })
             .collect(),
-        symbol_start_line: result.symbol_start_line,
-        symbol_end_line: result.symbol_end_line,
         reason_code: result.reason_code,
         suggested_next_tool: result.suggested_next_tool.clone(),
     }
@@ -1552,31 +1451,18 @@ fn compact_outline_response(
 ) -> CompactFileOutlineResponse {
     let include_repo = result.matches.len() > 1;
     CompactFileOutlineResponse {
-        scope: result.scope,
-        label: result.label,
-        file: result.file,
         matches: result
             .matches
             .into_iter()
             .map(|entry| {
-                let total_node_count = count_outline_nodes(&entry.symbols);
                 let mut budget = OutlineBudget {
                     remaining_nodes: options.max_nodes.max(1),
                     truncated: false,
                 };
                 let symbols = compact_outline_nodes(&entry.symbols, options, 1, true, &mut budget);
-                let returned_node_count = count_compact_outline_nodes(&symbols);
-                let remaining_node_count = total_node_count.saturating_sub(returned_node_count);
                 CompactFileOutlineMatch {
                     repo: include_repo.then_some(entry.repo),
-                    repo_label: entry.repo_label,
-                    relative_path: entry.relative_path,
-                    language: entry.language,
-                    stale: entry.stale,
-                    truncated: budget.truncated || remaining_node_count > 0,
-                    returned_node_count,
-                    total_node_count,
-                    remaining_node_count,
+                    truncated: budget.truncated || count_compact_outline_nodes(&symbols) < count_outline_nodes(&entry.symbols),
                     symbols,
                 }
             })
@@ -1618,12 +1504,9 @@ fn compact_outline_nodes(
             Vec::new()
         };
         compact.push(CompactOutlineNode {
-            symbol_id: node.symbol_id.clone(),
             name: node.name.clone(),
             kind: node.kind.clone(),
-            start_line: node.start_line,
-            end_line: node.end_line,
-            has_children,
+            line: node.start_line,
             children,
         });
     }
@@ -1659,10 +1542,6 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 fn invalid_params(error: anyhow::Error) -> McpError {
     McpError::invalid_params(error.to_string(), None)
 }
@@ -1696,19 +1575,19 @@ fn default_include_content() -> bool {
 }
 
 fn default_snippet_chars() -> usize {
-    360
+    220
 }
 
 fn default_outline_depth() -> usize {
-    2
+    1
 }
 
 fn default_outline_max_nodes() -> usize {
-    64
+    12
 }
 
 fn default_outline_top_level_limit() -> usize {
-    32
+    8
 }
 
 fn default_before_lines() -> usize {
@@ -1908,8 +1787,8 @@ fn search_code_schema() -> Map<String, Value> {
                 "format": "uint",
                 "minimum": 0,
                 "maximum": 1200,
-                "default": 360,
-                "description": "Approximate max discovery snippet characters."
+                "default": 220,
+                "description": "Approximate max discovery snippet characters. Keep this small unless you need broader preview context."
             },
             "includeDiagnostics": {
                 "type": "boolean",
@@ -2099,7 +1978,7 @@ fn get_file_outline_schema() -> Map<String, Value> {
                 "format": "uint",
                 "minimum": 1,
                 "maximum": 16,
-                "default": 2,
+                "default": 1,
                 "description": "Maximum outline tree depth for `compact` or `full` detail."
             },
             "maxNodes": {
@@ -2107,7 +1986,7 @@ fn get_file_outline_schema() -> Map<String, Value> {
                 "format": "uint",
                 "minimum": 1,
                 "maximum": 512,
-                "default": 64,
+                "default": 12,
                 "description": "Maximum outline nodes returned across the file."
             },
             "topLevelLimit": {
@@ -2115,7 +1994,7 @@ fn get_file_outline_schema() -> Map<String, Value> {
                 "format": "uint",
                 "minimum": 1,
                 "maximum": 256,
-                "default": 32,
+                "default": 8,
                 "description": "Maximum top-level declarations returned before truncation."
             }
         },
@@ -2354,7 +2233,7 @@ mod tests {
         assert!(schema["properties"].get("path").is_none());
         assert_eq!(
             schema["properties"]["snippetChars"]["default"].as_u64(),
-            Some(360)
+            Some(220)
         );
         assert!(
             schema["properties"]["includeContent"]["description"]
@@ -2451,12 +2330,16 @@ mod tests {
             Some("summary")
         );
         assert_eq!(
+            outline["properties"]["maxDepth"]["default"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
             outline["properties"]["maxNodes"]["default"].as_u64(),
-            Some(64)
+            Some(12)
         );
         assert_eq!(
             outline["properties"]["topLevelLimit"]["default"].as_u64(),
-            Some(32)
+            Some(8)
         );
         assert!(SERVER_INSTRUCTIONS.contains("search_symbols for exact definitions"));
         assert!(SERVER_INSTRUCTIONS.contains("search_text for exact literals"));
@@ -2519,14 +2402,17 @@ mod tests {
         };
 
         let json = to_value(compact_prepare_edit_target_response(&response)).unwrap();
-        assert_eq!(json["repoLabel"], "repo");
-        assert!(json.get("repo").is_none());
+        assert!(json.get("repoLabel").is_none());
         assert!(json.get("fileHash").is_none());
         assert!(json.get("indexedAt").is_none());
         assert!(json.get("indexedFileHash").is_none());
         assert!(json.get("stale").is_none());
+        assert!(json.get("anchorQuality").is_none());
+        assert!(json.get("resolutionType").is_none());
         assert!(json.get("unindexed").is_none());
         assert!(json.get("truncated").is_none());
+        assert!(json.get("symbolStartLine").is_none());
+        assert!(json.get("symbolEndLine").is_none());
         assert_eq!(json["anchors"][0]["text"], "fn build() {");
     }
 
@@ -2604,12 +2490,14 @@ mod tests {
 
         assert!(value.get("plan").is_none());
         assert!(value.get("repoErrors").is_none());
-        assert!(hit.get("repo").is_none());
+        assert!(hit.get("language").is_none());
+        assert!(hit.get("matchType").is_none());
         assert!(hit.get("score").is_none());
         assert!(hit.get("denseScore").is_none());
         assert!(hit.get("indexedAt").is_none());
         assert!(hit.get("stale").is_none());
         assert_eq!(hit["relativePath"].as_str(), Some("src/lib.rs"));
+        assert_eq!(hit["line"].as_u64(), Some(10));
         assert_eq!(hit["content"].as_str(), Some("fn example() {}"));
     }
 
@@ -2673,9 +2561,7 @@ mod tests {
                 .children
                 .is_empty()
         );
-        assert_eq!(compact.matches[0].returned_node_count, 2);
-        assert_eq!(compact.matches[0].total_node_count, 3);
-        assert_eq!(compact.matches[0].remaining_node_count, 1);
+        assert_eq!(compact.matches[0].symbols[0].line, 1);
         assert!(compact.matches[0].truncated);
     }
 
@@ -2738,12 +2624,9 @@ mod tests {
 
         let match_entry = &compact.matches[0];
         assert!(match_entry.repo.is_none());
-        assert_eq!(match_entry.returned_node_count, 2);
-        assert_eq!(match_entry.total_node_count, 3);
-        assert_eq!(match_entry.remaining_node_count, 1);
         assert!(match_entry.truncated);
         assert!(match_entry.symbols[0].children.is_empty());
-        assert!(match_entry.symbols[0].has_children);
+        assert_eq!(match_entry.symbols[0].line, 1);
     }
 
     #[test]
@@ -2786,9 +2669,7 @@ mod tests {
         );
 
         assert_eq!(compact.matches[0].symbols.len(), 2);
-        assert_eq!(compact.matches[0].returned_node_count, 2);
-        assert_eq!(compact.matches[0].total_node_count, 4);
-        assert_eq!(compact.matches[0].remaining_node_count, 2);
+        assert_eq!(compact.matches[0].symbols[0].line, 1);
         assert!(compact.matches[0].truncated);
     }
 
