@@ -763,11 +763,10 @@ impl ServerHandler for NativeServer {
                         .map_err(internal_error)?;
                     Ok(tool_success(
                         render_search_summary_text(&result),
-                        serde_json::to_value(compact_search_response(
+                        Some(compact_search_response_value(
                             &result,
                             args.include_diagnostics,
-                        ))
-                        .ok(),
+                        )),
                     ))
                 }
                 "search_symbols" => {
@@ -794,12 +793,11 @@ impl ServerHandler for NativeServer {
                         .map_err(internal_error)?;
                     Ok(tool_success(
                         render_symbol_search_summary_text(&result),
-                        serde_json::to_value(compact_symbol_search_response(
+                        Some(compact_symbol_search_response_value(
                             &result,
                             args.include_symbol_id,
                             args.include_diagnostics,
-                        ))
-                        .ok(),
+                        )),
                     ))
                 }
                 "search_text" => {
@@ -832,7 +830,7 @@ impl ServerHandler for NativeServer {
                         .map_err(internal_error)?;
                     Ok(tool_success(
                         render_text_search_summary_text(&result),
-                        serde_json::to_value(compact_text_search_response(&result)).ok(),
+                        Some(compact_text_search_response_value(&result)),
                     ))
                 }
                 "prepare_edit_target" => {
@@ -1398,6 +1396,15 @@ fn compact_search_response(
     }
 }
 
+fn compact_search_response_value(result: &SearchResponse, include_diagnostics: bool) -> Value {
+    let compact = compact_search_response(result, include_diagnostics);
+    if !compact.partial && compact.repo_errors.is_empty() && compact.plan.is_none() {
+        serde_json::to_value(compact.hits).unwrap_or_else(|_| Value::Array(Vec::new()))
+    } else {
+        serde_json::to_value(compact).unwrap_or(Value::Null)
+    }
+}
+
 fn compact_symbol_search_response(
     result: &SymbolSearchResponse,
     include_symbol_id: bool,
@@ -1430,6 +1437,19 @@ fn compact_symbol_search_response(
     }
 }
 
+fn compact_symbol_search_response_value(
+    result: &SymbolSearchResponse,
+    include_symbol_id: bool,
+    include_diagnostics: bool,
+) -> Value {
+    let compact = compact_symbol_search_response(result, include_symbol_id, include_diagnostics);
+    if !compact.partial && compact.repo_errors.is_empty() {
+        serde_json::to_value(compact.hits).unwrap_or_else(|_| Value::Array(Vec::new()))
+    } else {
+        serde_json::to_value(compact).unwrap_or(Value::Null)
+    }
+}
+
 fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearchResponse {
     let include_repo_label = text_hits_span_multiple_repos(&result.hits);
     CompactTextSearchResponse {
@@ -1445,6 +1465,15 @@ fn compact_text_search_response(result: &TextSearchResponse) -> CompactTextSearc
                 preview: hit.preview.clone(),
             })
             .collect(),
+    }
+}
+
+fn compact_text_search_response_value(result: &TextSearchResponse) -> Value {
+    let compact = compact_text_search_response(result);
+    if !compact.partial && compact.repo_errors.is_empty() {
+        serde_json::to_value(compact.hits).unwrap_or_else(|_| Value::Array(Vec::new()))
+    } else {
+        serde_json::to_value(compact).unwrap_or(Value::Null)
     }
 }
 
@@ -2117,9 +2146,10 @@ fn list_scopes_schema() -> Map<String, Value> {
 mod tests {
     use super::{
         OutlineCompactionOptions, OutlineDetail, SERVER_INSTRUCTIONS, SearchMode,
-        compact_outline_response, compact_prepare_edit_target_response, compact_search_response,
-        compact_symbol_search_response, compact_text_search_response, default_limit,
-        enforce_loopback_bind, get_file_outline_schema, list_scopes_schema, listen_is_loopback,
+        compact_outline_response, compact_prepare_edit_target_response,
+        compact_search_response_value, compact_symbol_search_response_value,
+        compact_text_search_response_value, default_limit, enforce_loopback_bind,
+        get_file_outline_schema, list_scopes_schema, listen_is_loopback,
         normalize_extension_filter, parse_search_mode, parse_splitter_kind,
         prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
     };
@@ -2128,8 +2158,8 @@ mod tests {
     use crate::engine::{
         AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode,
         EditTargetStatus, FileOutlineMatch, FileOutlineResponse, PrepareEditTargetResponse,
-        SearchHit, SearchPlanSummary, SearchResponse, SymbolSearchHit, SymbolSearchResponse,
-        TextSearchHit, TextSearchResponse,
+        RepoSearchError, SearchHit, SearchPlanSummary, SearchResponse, SymbolSearchHit,
+        SymbolSearchResponse, TextSearchHit, TextSearchResponse,
     };
     use serde_json::{Value, to_value};
 
@@ -2455,10 +2485,10 @@ mod tests {
             }],
         };
 
-        let json = to_value(compact_text_search_response(&response)).unwrap();
-        assert!(json["hits"][0].get("repo").is_none());
-        assert!(json["hits"][0].get("repoLabel").is_none());
-        assert_eq!(json["hits"][0]["preview"], "fn build() {}");
+        let json = compact_text_search_response_value(&response);
+        assert!(json[0].get("repo").is_none());
+        assert!(json[0].get("repoLabel").is_none());
+        assert_eq!(json[0]["preview"], "fn build() {}");
     }
 
     #[test]
@@ -2490,9 +2520,9 @@ mod tests {
             ],
         };
 
-        let json = to_value(compact_text_search_response(&response)).unwrap();
-        assert_eq!(json["hits"][0]["repoLabel"], "repo-a");
-        assert_eq!(json["hits"][1]["repoLabel"], "repo-b");
+        let json = compact_text_search_response_value(&response);
+        assert_eq!(json[0]["repoLabel"], "repo-a");
+        assert_eq!(json[1]["repoLabel"], "repo-b");
     }
 
     #[test]
@@ -2610,11 +2640,9 @@ mod tests {
             }],
         };
 
-        let value = to_value(compact_search_response(&response, false)).unwrap();
-        let hit = &value["hits"][0];
+        let value = compact_search_response_value(&response, false);
+        let hit = &value[0];
 
-        assert!(value.get("plan").is_none());
-        assert!(value.get("repoErrors").is_none());
         assert!(hit.get("repoLabel").is_none());
         assert!(hit.get("language").is_none());
         assert!(hit.get("matchType").is_none());
@@ -2681,9 +2709,9 @@ mod tests {
             ],
         };
 
-        let value = to_value(compact_search_response(&response, false)).unwrap();
-        assert_eq!(value["hits"][0]["repoLabel"], "repo-a");
-        assert_eq!(value["hits"][1]["repoLabel"], "repo-b");
+        let value = compact_search_response_value(&response, false);
+        assert_eq!(value[0]["repoLabel"], "repo-a");
+        assert_eq!(value[1]["repoLabel"], "repo-b");
     }
 
     #[test]
@@ -2713,9 +2741,9 @@ mod tests {
             }],
         };
 
-        let value = to_value(compact_symbol_search_response(&response, false, false)).unwrap();
-        assert!(value["hits"][0].get("symbolId").is_none());
-        assert!(value["hits"][0].get("repoLabel").is_none());
+        let value = compact_symbol_search_response_value(&response, false, false);
+        assert!(value[0].get("symbolId").is_none());
+        assert!(value[0].get("repoLabel").is_none());
     }
 
     #[test]
@@ -2765,9 +2793,9 @@ mod tests {
             ],
         };
 
-        let value = to_value(compact_symbol_search_response(&response, false, false)).unwrap();
-        assert_eq!(value["hits"][0]["repoLabel"], "repo-a");
-        assert_eq!(value["hits"][1]["repoLabel"], "repo-b");
+        let value = compact_symbol_search_response_value(&response, false, false);
+        assert_eq!(value[0]["repoLabel"], "repo-a");
+        assert_eq!(value[1]["repoLabel"], "repo-b");
     }
 
     #[test]
@@ -2797,8 +2825,76 @@ mod tests {
             }],
         };
 
-        let value = to_value(compact_symbol_search_response(&response, true, false)).unwrap();
-        assert_eq!(value["hits"][0]["symbolId"], "sym_123");
+        let value = compact_symbol_search_response_value(&response, true, false);
+        assert_eq!(value[0]["symbolId"], "sym_123");
+    }
+
+    #[test]
+    fn compact_search_response_keeps_box_when_metadata_is_present() {
+        let response = SearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: true,
+            repo_errors: vec![RepoSearchError {
+                repo: "/tmp/repo".to_string(),
+                error: "boom".to_string(),
+            }],
+            plan: SearchPlanSummary {
+                requested_mode: "auto".to_string(),
+                effective_mode: "hybrid".to_string(),
+                query_kind: "mixed".to_string(),
+                dense_weight: 1.0,
+                lexical_weight: 1.0,
+                symbol_weight: 1.0,
+                symbol_lexical_share: 0.5,
+                symbol_semantic_share: 0.5,
+                dedupe_by_file: true,
+            },
+            hits: Vec::new(),
+        };
+
+        let value = compact_search_response_value(&response, true);
+        assert!(value.is_object());
+        assert_eq!(value["partial"], true);
+        assert!(value.get("hits").is_some());
+    }
+
+    #[test]
+    fn compact_text_search_response_keeps_box_when_metadata_is_present() {
+        let response = TextSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: true,
+            repo_errors: vec![RepoSearchError {
+                repo: "/tmp/repo".to_string(),
+                error: "boom".to_string(),
+            }],
+            hits: Vec::new(),
+        };
+
+        let value = compact_text_search_response_value(&response);
+        assert!(value.is_object());
+        assert_eq!(value["partial"], true);
+        assert!(value.get("hits").is_some());
+    }
+
+    #[test]
+    fn compact_symbol_search_response_keeps_box_when_metadata_is_present() {
+        let response = SymbolSearchResponse {
+            scope: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            partial: true,
+            repo_errors: vec![RepoSearchError {
+                repo: "/tmp/repo".to_string(),
+                error: "boom".to_string(),
+            }],
+            hits: Vec::new(),
+        };
+
+        let value = compact_symbol_search_response_value(&response, false, false);
+        assert!(value.is_object());
+        assert_eq!(value["partial"], true);
+        assert!(value.get("hits").is_some());
     }
 
     #[test]
