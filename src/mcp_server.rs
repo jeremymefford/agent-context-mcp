@@ -3,10 +3,10 @@ use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
     EditTargetAnchor, EditTargetReasonCode, EditTargetStatus, Engine, FileOutlineResponse,
-    PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError, SearchHit, SearchMode,
-    SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchHit, SymbolSearchResponse,
-    SymbolSearchScopeRequest, TextSearchHit, TextSearchResponse, TextSearchScopeRequest,
-    render_clear_text, render_search_explanation_text, render_status_text,
+    PREPARE_READY_MAX_LINES, PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError,
+    SearchHit, SearchMode, SearchPlanSummary, SearchRequest, SearchResponse, SymbolSearchHit,
+    SymbolSearchResponse, SymbolSearchScopeRequest, TextSearchHit, TextSearchResponse,
+    TextSearchScopeRequest, render_clear_text, render_search_explanation_text, render_status_text,
 };
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -854,9 +854,9 @@ impl ServerHandler for NativeServer {
                                 line_hint: args.line_hint,
                                 query: args.query.filter(|value| !value.is_empty()),
                                 occurrence: args.occurrence,
-                                before_lines: args.before_lines.min(4),
-                                after_lines: args.after_lines.min(8),
-                                max_lines: args.max_lines.clamp(1, 32),
+                                before_lines: args.before_lines.min(32),
+                                after_lines: args.after_lines.min(96),
+                                max_lines: args.max_lines.clamp(1, PREPARE_READY_MAX_LINES),
                                 anchor_count: args.anchor_count.clamp(1, 3),
                             },
                         )
@@ -1691,15 +1691,15 @@ fn default_outline_top_level_limit() -> usize {
 }
 
 fn default_before_lines() -> usize {
-    2
+    8
 }
 
 fn default_after_lines() -> usize {
-    6
+    24
 }
 
 fn default_max_lines() -> usize {
-    32
+    96
 }
 
 fn default_anchor_count() -> usize {

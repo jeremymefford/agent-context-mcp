@@ -387,6 +387,7 @@ Preferred routing:
 - use `search_text` for exact strings, identifiers, test names, and log lines inside a known repo, known file, or bounded repo-relative tree instead of narrow `rg`
 - use `get_file_outline` once the target file is known and you need structure rather than broad file reads
 - use `prepare_edit_target` only when the exact patch location is already known; it can take `symbolId` or a normal symbol hit shape like `file + symbolName (+ symbolKind/symbolContainer/lineHint)`, and it is not an overview or header-scanning tool
+- when `prepare_edit_target` is given a known `file + query`, it returns the containing symbol body when that is small enough to patch safely; use the returned content as the authoritative edit window instead of falling back to shell line reads
 - fall back to shell `rg` / `sed` / `bat` only for regex-heavy cases, unindexed files, or MCP outages
 
 ## Example Agent Workflow

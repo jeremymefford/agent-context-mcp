@@ -56,7 +56,7 @@ const LIVE_FILE_CACHE_LIMIT: usize = 64;
 const SEARCH_TEXT_SHORTLIST_LIMIT: usize = 64;
 const SEARCH_TEXT_FALLBACK_MAX_FILES: usize = 64;
 const SEARCH_TEXT_PREVIEW_CHARS: usize = 180;
-const PREPARE_READY_MAX_LINES: usize = 32;
+pub(crate) const PREPARE_READY_MAX_LINES: usize = 160;
 const PREPARE_AMBIGUOUS_PREVIEW_CHARS: usize = 120;
 const PREPARE_AMBIGUOUS_PREVIEW_BEFORE_LINES: u64 = 1;
 const PREPARE_AMBIGUOUS_PREVIEW_AFTER_LINES: u64 = 1;
@@ -2157,9 +2157,13 @@ impl Engine {
                 let indexed_metadata = self
                     .indexed_file_metadata(&repo, &snapshot.relative_path)
                     .await?;
+                let file_symbols = self
+                    .load_file_outline_symbols(&repo.display().to_string(), &snapshot.relative_path)
+                    .await?;
                 if let Some(ready) = self.pick_ready_file_match_target(
                     &snapshot,
                     indexed_metadata.clone(),
+                    &file_symbols,
                     &matches,
                     request,
                 )? {
@@ -2570,6 +2574,19 @@ impl Engine {
         else {
             return Ok(None);
         };
+        if symbol_fits_ready_window(symbol, selected, request.max_lines) {
+            return Ok(Some(ReadyEditTarget {
+                snapshot: snapshot.clone(),
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+                resolution_type,
+                symbol_id: Some(symbol.symbol_id.clone()),
+                indexed_metadata: indexed_metadata.clone(),
+                truncated: false,
+                symbol_signature_line: Some(symbol.start_line),
+                query: request.query.clone(),
+            }));
+        }
         let (start_line, end_line, truncated) = bounded_window(
             snapshot.total_lines(),
             selected.start_line,
@@ -2595,6 +2612,7 @@ impl Engine {
         &self,
         snapshot: &Arc<LiveFileSnapshot>,
         indexed_metadata: IndexedFileMetadata,
+        file_symbols: &[IndexedSymbol],
         matches: &[TextMatch],
         request: &PrepareEditTargetRequest,
     ) -> Result<Option<ReadyEditTarget>> {
@@ -2602,6 +2620,23 @@ impl Engine {
         else {
             return Ok(None);
         };
+        let covering_symbol = narrowest_covering_symbol(file_symbols, selected.start_line)
+            .filter(|symbol| selected.end_line <= symbol.end_line);
+        if let Some(symbol) = covering_symbol {
+            if symbol_fits_ready_window(symbol, selected, request.max_lines) {
+                return Ok(Some(ReadyEditTarget {
+                    snapshot: snapshot.clone(),
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    resolution_type: EditResolutionType::Literal,
+                    symbol_id: Some(symbol.symbol_id.clone()),
+                    indexed_metadata,
+                    truncated: false,
+                    symbol_signature_line: Some(symbol.start_line),
+                    query: request.query.clone(),
+                }));
+            }
+        }
         let (start_line, end_line, truncated) = bounded_window(
             snapshot.total_lines(),
             selected.start_line,
@@ -2615,10 +2650,13 @@ impl Engine {
             start_line,
             end_line,
             resolution_type: EditResolutionType::Literal,
-            symbol_id: None,
+            symbol_id: covering_symbol.map(|symbol| symbol.symbol_id.clone()),
             indexed_metadata,
-            truncated,
-            symbol_signature_line: None,
+            truncated: truncated
+                || covering_symbol.is_some_and(|symbol| {
+                    start_line != symbol.start_line || end_line != symbol.end_line
+                }),
+            symbol_signature_line: covering_symbol.map(|symbol| symbol.start_line),
             query: request.query.clone(),
         }))
     }
@@ -5767,6 +5805,13 @@ fn narrowest_covering_symbol(symbols: &[IndexedSymbol], line: u64) -> Option<&In
         })
 }
 
+fn symbol_fits_ready_window(symbol: &IndexedSymbol, selected: TextMatch, max_lines: usize) -> bool {
+    selected.start_line >= symbol.start_line
+        && selected.end_line <= symbol.end_line
+        && span_line_count(symbol.start_line, symbol.end_line) <= max_lines as u64
+        && span_line_count(symbol.start_line, symbol.end_line) <= PREPARE_READY_MAX_LINES as u64
+}
+
 fn select_text_match(
     matches: &[TextMatch],
     line_hint: Option<u64>,
@@ -6077,8 +6122,9 @@ mod tests {
         is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
         plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking,
         scan_repo, search_text_scans_live_repo, select_edit_anchors, select_text_match,
-        stale_vector_collections, symbol_collection_name, text_search_has_bounded_target,
-        validate_absolute_repo_path, vector_flush_needed, vector_release_needed,
+        stale_vector_collections, symbol_collection_name, symbol_fits_ready_window,
+        text_search_has_bounded_target, validate_absolute_repo_path, vector_flush_needed,
+        vector_release_needed,
     };
     use crate::config::{ResolvedScope, ScopeKind, SearchConfig};
     use crate::engine::live_files::LiveFileStore;
@@ -6178,6 +6224,33 @@ mod tests {
     }
 
     #[test]
+    fn symbol_ready_window_requires_selected_match_to_fit_budget() {
+        let symbol = IndexedSymbol {
+            symbol_id: "helper".to_string(),
+            repo: "/tmp/repo".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            name: "helper".to_string(),
+            kind: "function".to_string(),
+            container: None,
+            language: "rust".to_string(),
+            start_line: 10,
+            end_line: 80,
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            file_hash: "hash".to_string(),
+            parent_symbol_id: None,
+        };
+        let selected = TextMatch {
+            start_byte: 120,
+            end_byte: 132,
+            start_line: 42,
+            end_line: 42,
+        };
+
+        assert!(symbol_fits_ready_window(&symbol, selected, 96));
+        assert!(!symbol_fits_ready_window(&symbol, selected, 32));
+    }
+
+    #[test]
     fn select_edit_anchors_prefers_unique_query_line() {
         let repo = temp_dir("anchors-repo");
         let file = repo.join("src").join("lib.rs");
@@ -6209,12 +6282,13 @@ mod tests {
             unique_in_file: true,
         }];
 
+        assert_eq!(ready_target_reason(100, 259, &anchors), None);
         assert_eq!(
-            ready_target_reason(100, 164, &anchors),
+            ready_target_reason(100, 260, &anchors),
             Some((EditTargetReasonCode::WindowTooBroad, "search_text"))
         );
         assert_eq!(
-            ready_target_reason(1001, 1097, &anchors),
+            ready_target_reason(1001, 1161, &anchors),
             Some((EditTargetReasonCode::WindowTooBroad, "search_text"))
         );
     }
