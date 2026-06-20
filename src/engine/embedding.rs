@@ -11,6 +11,7 @@ use tokio::sync::OnceCell;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 pub const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
+const VOYAGE_MAX_BATCH_ITEMS: usize = 1000;
 const MAX_RETRIES: usize = 4;
 
 #[derive(Clone)]
@@ -137,6 +138,25 @@ impl EmbeddingClient {
     }
 
     pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let batch_limit = self.document_batch_limit();
+        if texts.len() > batch_limit {
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for batch in texts.chunks(batch_limit) {
+                embeddings.extend(self.embed_document_batch(batch).await?);
+            }
+            return Ok(embeddings);
+        }
+        self.embed_document_batch(texts).await
+    }
+
+    fn document_batch_limit(&self) -> usize {
+        match self.inner.as_ref() {
+            EmbeddingInner::Voyage(_) => VOYAGE_MAX_BATCH_ITEMS,
+            EmbeddingInner::OpenAi(_) | EmbeddingInner::Ollama(_) => usize::MAX,
+        }
+    }
+
+    async fn embed_document_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         match self.inner.as_ref() {
             EmbeddingInner::Voyage(client) => client.embed(texts, Some("document")).await,
             EmbeddingInner::OpenAi(client) => client.embed(texts).await,
@@ -231,7 +251,7 @@ impl VoyageClient {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        if texts.len() > 1000 {
+        if texts.len() > VOYAGE_MAX_BATCH_ITEMS {
             bail!("Voyage batch exceeds max item count: {}", texts.len());
         }
 
