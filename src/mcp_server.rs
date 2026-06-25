@@ -505,7 +505,7 @@ pub fn tool_list() -> Vec<Tool> {
     vec![
         build_tool(
             "index_codebase",
-            "Start background indexing for a configured scope. Defaults to the configured default group.",
+            "Start background indexing for a configured scope. Worktree scopes refresh only their overlay in overlay mode. Defaults to the configured default group.",
             false,
             index_codebase_schema(),
         ),
@@ -1800,9 +1800,9 @@ fn nullable_string_schema(description: &str) -> Value {
 fn index_codebase_schema() -> Map<String, Value> {
     json!({
         "type": "object",
-        "description": "Start background indexing for a configured scope.",
+        "description": "Start background indexing for a configured scope. In worktree overlay mode, worktree scopes refresh only changed/new overlay files and never trigger an automatic full worktree scan.",
         "properties": {
-            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "scope": nullable_string_schema("Configured group id, canonical repo root, or worktree root. Defaults to the configured default group."),
             "force": {
                 "type": "boolean",
                 "default": false,

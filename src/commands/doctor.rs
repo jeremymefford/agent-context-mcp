@@ -464,6 +464,13 @@ mod tests {
             configured_embedding_fingerprint: None,
             stored_embedding_fingerprint: None,
             embedding_mismatch_reason: None,
+            repo_type: None,
+            canonical_repo_label: None,
+            overlay_status: None,
+            changed_files: None,
+            deleted_files: None,
+            overlay_bytes: None,
+            overlay_mismatch_reason: None,
         }
     }
 

@@ -31,6 +31,8 @@ pub struct Snapshot {
     pub embedding_fingerprint: Option<String>,
     #[serde(default)]
     pub codebases: BTreeMap<String, SnapshotEntry>,
+    #[serde(default)]
+    pub worktrees: BTreeMap<String, WorktreeSnapshotEntry>,
     #[serde(
         default,
         rename = "lastUpdated",
@@ -77,6 +79,39 @@ pub struct SnapshotEntry {
     pub last_index_mtime: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_root_mtime: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSnapshotEntry {
+    pub status: String,
+    pub canonical_root: String,
+    pub repo_identity: String,
+    pub overlay_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_mismatch_reason: Option<String>,
+    #[serde(
+        default,
+        rename = "embeddingProfile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub embedding_profile: Option<String>,
+    #[serde(
+        default,
+        rename = "embeddingFingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub embedding_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
 }
 
 impl SnapshotStore {
@@ -175,6 +210,15 @@ impl SnapshotStore {
                 healed += 1;
             }
         }
+        for entry in snapshot.worktrees.values_mut() {
+            if entry.status == "indexing" {
+                entry.status = "indexfailed".to_string();
+                entry.overlay_status = Some("failed".to_string());
+                entry.overlay_mismatch_reason = Some(reason.to_string());
+                entry.last_updated = Some(timestamp());
+                healed += 1;
+            }
+        }
 
         if healed > 0 {
             snapshot.last_updated = Some(timestamp());
@@ -182,6 +226,82 @@ impl SnapshotStore {
         }
 
         Ok(healed)
+    }
+}
+
+impl WorktreeSnapshotEntry {
+    pub fn indexing(
+        canonical_root: impl Into<String>,
+        repo_identity: impl Into<String>,
+        overlay_id: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            status: "indexing".to_string(),
+            canonical_root: canonical_root.into(),
+            repo_identity: repo_identity.into(),
+            overlay_id: overlay_id.into(),
+            overlay_status: Some("queued".to_string()),
+            changed_files: Some(0),
+            deleted_files: Some(0),
+            overlay_bytes: Some(0),
+            overlay_mismatch_reason: None,
+            embedding_profile,
+            embedding_fingerprint,
+            last_updated: Some(timestamp()),
+        }
+    }
+
+    pub fn indexed(
+        canonical_root: impl Into<String>,
+        repo_identity: impl Into<String>,
+        overlay_id: impl Into<String>,
+        overlay_status: impl Into<String>,
+        changed_files: u64,
+        deleted_files: u64,
+        overlay_bytes: u64,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            status: "indexed".to_string(),
+            canonical_root: canonical_root.into(),
+            repo_identity: repo_identity.into(),
+            overlay_id: overlay_id.into(),
+            overlay_status: Some(overlay_status.into()),
+            changed_files: Some(changed_files),
+            deleted_files: Some(deleted_files),
+            overlay_bytes: Some(overlay_bytes),
+            overlay_mismatch_reason: None,
+            embedding_profile,
+            embedding_fingerprint,
+            last_updated: Some(timestamp()),
+        }
+    }
+
+    pub fn failed(
+        canonical_root: impl Into<String>,
+        repo_identity: impl Into<String>,
+        overlay_id: impl Into<String>,
+        message: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            status: "indexfailed".to_string(),
+            canonical_root: canonical_root.into(),
+            repo_identity: repo_identity.into(),
+            overlay_id: overlay_id.into(),
+            overlay_status: Some("failed".to_string()),
+            changed_files: None,
+            deleted_files: None,
+            overlay_bytes: None,
+            overlay_mismatch_reason: Some(message.into()),
+            embedding_profile,
+            embedding_fingerprint,
+            last_updated: Some(timestamp()),
+        }
     }
 }
 

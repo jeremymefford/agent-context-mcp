@@ -37,6 +37,18 @@ base_url = "http://127.0.0.1:11434"
 # repo = "/absolute/path/to/repo"
 # profile = "local"
 
+[worktrees]
+# ignore = do not auto-resolve Git worktrees unless explicitly configured as repos
+# overlay = reuse the canonical repo index and index only changed/new worktree files
+# full = treat configured worktree paths as separate full repos
+mode = "overlay"
+auto_discover = true
+max_overlay_files = 500
+max_overlay_bytes = "25MB"
+# "inherit" uses the canonical repo embedding profile. Set a profile name such as
+# "ollama" to force cheaper local embeddings for worktree overlays.
+embedding_profile = "inherit"
+
 [milvus]
 address = "127.0.0.1:19530"
 # token_env = "MILVUS_TOKEN"

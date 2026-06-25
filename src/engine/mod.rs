@@ -6,8 +6,8 @@ pub mod milvus;
 pub mod splitter;
 pub mod symbols;
 
-use crate::config::{Config, ResolvedScope, ScopeKind};
-use crate::snapshot::{Snapshot, SnapshotEntry, SnapshotStore};
+use crate::config::{Config, ResolvedScope, ScopeKind, WorktreeMode, WorktreeResolution};
+use crate::snapshot::{Snapshot, SnapshotEntry, SnapshotStore, WorktreeSnapshotEntry};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -15,7 +15,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,6 +50,10 @@ const INDEX_FORMAT_VERSION: &str = "v1";
 const SEARCH_ROOT_VERSION: &str = "v1";
 const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
 const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
+const OVERLAY_CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_overlay_";
+const OVERLAY_SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_overlay_";
+const OVERLAY_STORAGE_ROOT_PREFIX: &str = "/__agent_context_overlay";
+const WORKTREE_EMBEDDING_INHERIT: &str = "inherit";
 const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
 const REMOVED_REPO_INDEX_STATUS: &str = "removed";
 const LIVE_FILE_CACHE_LIMIT: usize = 64;
@@ -501,12 +505,27 @@ pub struct RepoStatus {
     pub stored_embedding_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_mismatch_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_repo_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_mismatch_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct RepoFile {
     absolute_path: PathBuf,
     hash: String,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -514,6 +533,55 @@ struct FileDiff {
     added: Vec<String>,
     modified: Vec<String>,
     removed: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoContext {
+    requested_root: PathBuf,
+    canonical_root: PathBuf,
+    overlay: Option<WorktreeOverlayContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryProfileUsage {
+    canonical_repos: BTreeSet<String>,
+    overlay_repos: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeOverlayContext {
+    resolution: WorktreeResolution,
+    storage_root: PathBuf,
+    repo_key: String,
+    chunk_collection: String,
+    symbol_collection: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OverlayIndexState {
+    canonical_root: String,
+    worktree_root: String,
+    repo_identity: String,
+    overlay_id: String,
+    #[serde(default)]
+    replaced_paths: Vec<String>,
+    #[serde(default)]
+    deleted_paths: Vec<String>,
+    #[serde(default)]
+    indexed_hashes: Vec<(String, String)>,
+    #[serde(default)]
+    changed_files: u64,
+    #[serde(default)]
+    deleted_files: u64,
+    #[serde(default)]
+    overlay_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overlay_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -633,7 +701,23 @@ struct RepoSearchOutcome {
     repo: String,
     stale: bool,
     hits: Vec<RepoSearchHit>,
+    warnings: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolRepoSearchOutcome {
+    repo: PathBuf,
+    stale: bool,
+    hits: Vec<RankedSymbolHit>,
+    warnings: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchContextResult<T> {
+    hits: Vec<T>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +850,7 @@ struct IndexCollections<'a> {
 #[derive(Clone, Copy)]
 struct ProcessFilesPlan<'a> {
     repo: &'a Path,
+    storage_repo: &'a Path,
     repo_key: &'a str,
     profile_name: &'a str,
     collections: IndexCollections<'a>,
@@ -899,6 +984,107 @@ impl Engine {
         self.inner.embedding.dimension(profile_name).await
     }
 
+    fn repo_context(&self, repo: &Path) -> Result<RepoContext> {
+        if self.inner.config.worktrees.mode == WorktreeMode::Overlay
+            && let Some(resolution) = self.inner.config.worktree_resolution(repo)?
+        {
+            let overlay_id = resolution.overlay_id.clone();
+            return Ok(RepoContext {
+                requested_root: resolution.worktree_root.clone(),
+                canonical_root: resolution.canonical_root.clone(),
+                overlay: Some(WorktreeOverlayContext {
+                    resolution,
+                    storage_root: overlay_storage_root(&overlay_id),
+                    repo_key: overlay_repo_key(&overlay_id),
+                    chunk_collection: overlay_collection_name(&overlay_id),
+                    symbol_collection: overlay_symbol_collection_name(&overlay_id),
+                }),
+            });
+        }
+
+        Ok(RepoContext {
+            requested_root: repo.to_path_buf(),
+            canonical_root: repo.to_path_buf(),
+            overlay: None,
+        })
+    }
+
+    fn overlay_profile_name<'a>(&'a self, ctx: &'a RepoContext) -> Result<&'a str> {
+        if ctx.overlay.is_none() {
+            return self.embedding_profile_name_for_repo(&ctx.canonical_root);
+        }
+        let configured = self.inner.config.worktrees.embedding_profile.as_str();
+        if configured == WORKTREE_EMBEDDING_INHERIT {
+            self.embedding_profile_name_for_repo(&ctx.canonical_root)
+        } else {
+            Ok(configured)
+        }
+    }
+
+    async fn overlay_fingerprint(&self, ctx: &RepoContext) -> Result<String> {
+        let profile_name = self.overlay_profile_name(ctx)?;
+        self.inner.embedding.fingerprint(profile_name).await
+    }
+
+    async fn overlay_dimension(&self, ctx: &RepoContext) -> Result<usize> {
+        let profile_name = self.overlay_profile_name(ctx)?;
+        self.inner.embedding.dimension(profile_name).await
+    }
+
+    fn overlay_state_path(&self, overlay_id: &str) -> PathBuf {
+        self.inner
+            .config
+            .index_root
+            .join("overlays")
+            .join(format!("{overlay_id}.json"))
+    }
+
+    async fn load_overlay_state(
+        &self,
+        overlay: &WorktreeOverlayContext,
+    ) -> Result<Option<OverlayIndexState>> {
+        self.load_overlay_state_by_id(&overlay.resolution.overlay_id)
+            .await
+    }
+
+    async fn load_overlay_state_by_id(
+        &self,
+        overlay_id: &str,
+    ) -> Result<Option<OverlayIndexState>> {
+        let path = self.overlay_state_path(overlay_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading overlay state {}", path.display()))?;
+        let state = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing overlay state {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    async fn save_overlay_state(&self, state: &OverlayIndexState) -> Result<()> {
+        let path = self.overlay_state_path(&state.overlay_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating overlay state dir {}", parent.display()))?;
+        }
+        let raw = serde_json::to_string_pretty(state)?;
+        tokio::fs::write(&path, raw)
+            .await
+            .with_context(|| format!("writing overlay state {}", path.display()))
+    }
+
+    async fn remove_overlay_state_if_present(&self, overlay_id: &str) -> Result<()> {
+        let path = self.overlay_state_path(overlay_id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
     async fn configured_embedding_fingerprints(&self) -> Result<BTreeMap<String, String>> {
         let mut fingerprints = BTreeMap::new();
         for profile_name in self.inner.config.embedding.profiles().map(|(name, _)| name) {
@@ -945,7 +1131,8 @@ impl Engine {
 
     pub async fn vector_hygiene_report(&self) -> Result<VectorHygieneReport> {
         let repos = self.inner.config.all_repos()?;
-        let expected = expected_vector_collections(&repos);
+        let snapshot = self.inner.snapshot.read().await?;
+        let expected = expected_vector_collections(&repos, &snapshot);
         let mut agent_context_collections = self
             .inner
             .milvus
@@ -1003,6 +1190,31 @@ impl Engine {
 
     pub async fn mark_scope_indexing(&self, scope: &ResolvedScope) -> Result<()> {
         for repo in &scope.repos {
+            let ctx = self.repo_context(repo)?;
+            if let Some(overlay) = ctx.overlay.as_ref() {
+                let profile_name = self.overlay_profile_name(&ctx).ok().map(str::to_string);
+                let embedding_fingerprint = self.overlay_fingerprint(&ctx).await.ok();
+                let worktree_key = overlay.resolution.worktree_root.display().to_string();
+                let canonical_root = overlay.resolution.canonical_root.display().to_string();
+                let repo_identity = overlay.resolution.repo_identity.clone();
+                let overlay_id = overlay.resolution.overlay_id.clone();
+                self.inner
+                    .snapshot
+                    .update(|snapshot| {
+                        snapshot.worktrees.insert(
+                            worktree_key.clone(),
+                            WorktreeSnapshotEntry::indexing(
+                                canonical_root.clone(),
+                                repo_identity.clone(),
+                                overlay_id.clone(),
+                                profile_name.clone(),
+                                embedding_fingerprint.clone(),
+                            ),
+                        );
+                    })
+                    .await?;
+                continue;
+            }
             let repo_key = repo.display().to_string();
             let profile_name = self
                 .embedding_profile_name_for_repo(repo)
@@ -1099,8 +1311,23 @@ impl Engine {
 
         for repo in scope.repos {
             if repo.is_absolute() && !repo.exists() {
-                match self.clear_removed_repo(&repo, force).await {
-                    Ok(result) => results.push(result),
+                match self.clear_removed_worktree_overlay(&repo, force).await {
+                    Ok(Some(result)) => results.push(result),
+                    Ok(None) => match self.clear_removed_repo(&repo, force).await {
+                        Ok(result) => results.push(result),
+                        Err(error) => {
+                            has_errors = true;
+                            results.push(RepoIndexResult {
+                                repo: repo.display().to_string(),
+                                indexed_files: None,
+                                total_chunks: None,
+                                index_status: Some("failed".to_string()),
+                                full_reindex: force,
+                                changes: RepoChangeSummary::default(),
+                                error: Some(error.to_string()),
+                            });
+                        }
+                    },
                     Err(error) => {
                         has_errors = true;
                         results.push(RepoIndexResult {
@@ -1232,30 +1459,71 @@ impl Engine {
         self.inner.milvus.has_collection(collection_name).await
     }
 
-    async fn search_symbol_collection_presence(
+    async fn query_profile_usages_for_contexts(
         &self,
-        repos: &[PathBuf],
-    ) -> Result<HashMap<String, bool>> {
-        let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
-        let repo_checks = repos.to_vec();
-        let mut stream = futures::stream::iter(repo_checks.into_iter().map(|repo| {
-            let engine = self.clone();
-            async move {
-                let _repo_permit = engine.acquire_repo_search_budget().await?;
-                let exists = engine
-                    .has_collection_on_search_path(&symbol_collection_name(&repo))
-                    .await?;
-                Ok::<_, anyhow::Error>((repo.display().to_string(), exists))
+        scope_contexts: &[RepoContext],
+        blocked_repos: &HashMap<String, String>,
+    ) -> Result<BTreeMap<String, QueryProfileUsage>> {
+        let mut usages = BTreeMap::<String, QueryProfileUsage>::new();
+        for ctx in scope_contexts {
+            let repo_key = ctx.requested_root.display().to_string();
+            if blocked_repos.contains_key(&repo_key) {
+                continue;
             }
-        }))
-        .buffer_unordered(parallelism);
+            let canonical_profile = self
+                .embedding_profile_name_for_repo(&ctx.canonical_root)?
+                .to_string();
+            usages
+                .entry(canonical_profile)
+                .or_default()
+                .canonical_repos
+                .insert(repo_key.clone());
 
-        let mut presence = HashMap::new();
-        while let Some(item) = stream.next().await {
-            let (repo_key, exists) = item?;
-            presence.insert(repo_key, exists);
+            let Some(overlay) = ctx.overlay.as_ref() else {
+                continue;
+            };
+            let overlay_searchable = match self.load_overlay_state(overlay).await {
+                Ok(Some(state)) => overlay_state_has_search_index(&state),
+                Ok(None) | Err(_) => false,
+            };
+            if overlay_searchable {
+                usages
+                    .entry(self.overlay_profile_name(ctx)?.to_string())
+                    .or_default()
+                    .overlay_repos
+                    .insert(repo_key);
+            }
         }
-        Ok(presence)
+        Ok(usages)
+    }
+
+    async fn embed_query_vectors_for_usages(
+        &self,
+        profile_usages: BTreeMap<String, QueryProfileUsage>,
+        query: &str,
+        blocked_repos: &mut HashMap<String, String>,
+    ) -> Result<(HashMap<String, Arc<Vec<f32>>>, HashMap<String, String>)> {
+        let mut query_vectors = HashMap::new();
+        let mut overlay_query_errors = HashMap::new();
+        for (profile_name, usage) in profile_usages {
+            let _dense_permit = self.acquire_dense_budget().await?;
+            match self.inner.embedding.embed_query(&profile_name, query).await {
+                Ok(vector) => {
+                    query_vectors.insert(profile_name, Arc::new(vector));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    apply_query_embedding_failure(
+                        &profile_name,
+                        &usage,
+                        &message,
+                        blocked_repos,
+                        &mut overlay_query_errors,
+                    );
+                }
+            }
+        }
+        Ok((query_vectors, overlay_query_errors))
     }
 
     pub async fn search_scope(
@@ -1269,70 +1537,65 @@ impl Engine {
         let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
         let filter_expression = build_extension_filter(&request.extension_filter);
         let snapshot = self.inner.snapshot.read().await?;
-        let scope_repos = scope.repos;
+        let scope_contexts = scope
+            .repos
+            .iter()
+            .map(|repo| self.repo_context(repo))
+            .collect::<Result<Vec<_>>>()?;
         let mut blocked_repos = HashMap::new();
         let mut query_vectors: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+        let mut overlay_query_errors: HashMap<String, String> = HashMap::new();
 
-        for repo in &scope_repos {
-            let identity = self.repo_embedding_identity_status(&snapshot, repo).await?;
+        for ctx in &scope_contexts {
+            let identity = self
+                .repo_embedding_identity_status(&snapshot, &ctx.canonical_root)
+                .await?;
             if let Some(reason) = identity.reason {
-                blocked_repos.insert(repo.display().to_string(), reason);
+                blocked_repos.insert(ctx.requested_root.display().to_string(), reason);
             }
         }
 
         if plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0 {
-            let mut repos_by_profile: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for repo in &scope_repos {
-                let repo_key = repo.display().to_string();
-                if blocked_repos.contains_key(&repo_key) {
-                    continue;
-                }
-                let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-                repos_by_profile
-                    .entry(profile_name)
-                    .or_default()
-                    .push(repo_key);
-            }
-
-            for (profile_name, repo_keys) in repos_by_profile {
-                let _dense_permit = self.acquire_dense_budget().await?;
-                match self
-                    .inner
-                    .embedding
-                    .embed_query(&profile_name, &request.query)
-                    .await
-                {
-                    Ok(vector) => {
-                        let vector = Arc::new(vector);
-                        for repo_key in repo_keys {
-                            query_vectors.insert(repo_key, vector.clone());
-                        }
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        for repo_key in repo_keys {
-                            blocked_repos.insert(repo_key, message.clone());
-                        }
-                    }
-                }
-            }
+            let usages = self
+                .query_profile_usages_for_contexts(&scope_contexts, &blocked_repos)
+                .await?;
+            let (vectors, errors) = self
+                .embed_query_vectors_for_usages(usages, &request.query, &mut blocked_repos)
+                .await?;
+            query_vectors = vectors;
+            overlay_query_errors = errors;
         }
 
-        let mut stream = futures::stream::iter(scope_repos.into_iter().map(|repo| {
+        let mut stream = futures::stream::iter(scope_contexts.into_iter().map(|ctx| {
             let engine = self.clone();
             let request = request.clone();
             let plan = plan.clone();
-            let query_vector = query_vectors.get(&repo.display().to_string()).cloned();
-            let repo_error = blocked_repos.get(&repo.display().to_string()).cloned();
+            let canonical_query_vector = engine
+                .embedding_profile_name_for_repo(&ctx.canonical_root)
+                .ok()
+                .and_then(|profile| query_vectors.get(profile).cloned());
+            let overlay_query_vector = ctx.overlay.as_ref().and_then(|_| {
+                engine
+                    .overlay_profile_name(&ctx)
+                    .ok()
+                    .and_then(|profile| query_vectors.get(profile).cloned())
+            });
+            let repo_error = blocked_repos
+                .get(&ctx.requested_root.display().to_string())
+                .cloned();
             let filter_expression = filter_expression.clone();
-            let entry = snapshot.codebases.get(&repo.display().to_string()).cloned();
+            let entry = snapshot
+                .codebases
+                .get(&ctx.canonical_root.display().to_string())
+                .cloned();
             async move {
-                let repo_label = repo.display().to_string();
+                let repo_label = ctx.requested_root.display().to_string();
                 if let Some(error) = repo_error {
                     return RepoSearchOutcome {
                         repo: repo_label,
                         stale: false,
                         hits: Vec::new(),
+                        warnings: Vec::new(),
                         error: Some(error),
                     };
                 }
@@ -1343,35 +1606,41 @@ impl Engine {
                             repo: repo_label,
                             stale: false,
                             hits: Vec::new(),
+                            warnings: Vec::new(),
                             error: Some(error.to_string()),
                         };
                     }
                 };
                 let stale = engine
-                    .repo_is_stale(&repo, entry.as_ref())
+                    .repo_is_stale(&ctx.requested_root, entry.as_ref())
                     .await
                     .unwrap_or(false);
                 match engine
-                    .search_repo(
-                        &repo,
+                    .search_repo_context(
+                        &ctx,
                         &request,
                         &plan,
-                        query_vector.as_ref().map(|value| value.as_slice()),
+                        canonical_query_vector
+                            .as_ref()
+                            .map(|value| value.as_slice()),
+                        overlay_query_vector.as_ref().map(|value| value.as_slice()),
                         per_repo_limit,
                         filter_expression.as_deref(),
                     )
                     .await
                 {
-                    Ok(hits) => RepoSearchOutcome {
+                    Ok(result) => RepoSearchOutcome {
                         repo: repo_label,
                         stale,
-                        hits,
+                        hits: result.hits,
+                        warnings: result.warnings,
                         error: None,
                     },
                     Err(error) => RepoSearchOutcome {
                         repo: repo_label,
                         stale,
                         hits: Vec::new(),
+                        warnings: Vec::new(),
                         error: Some(error.to_string()),
                     },
                 }
@@ -1379,15 +1648,32 @@ impl Engine {
         }))
         .buffer_unordered(parallelism);
 
-        let mut repo_errors = Vec::new();
+        let mut repo_errors = overlay_query_errors
+            .into_iter()
+            .map(|(repo, error)| RepoSearchError { repo, error })
+            .collect::<Vec<_>>();
+        let mut repo_error_repos = repo_errors
+            .iter()
+            .map(|error| error.repo.clone())
+            .collect::<HashSet<_>>();
         let mut merged = Vec::new();
         while let Some(outcome) = stream.next().await {
             if let Some(error) = outcome.error {
-                repo_errors.push(RepoSearchError {
-                    repo: outcome.repo,
-                    error,
-                });
+                if repo_error_repos.insert(outcome.repo.clone()) {
+                    repo_errors.push(RepoSearchError {
+                        repo: outcome.repo,
+                        error,
+                    });
+                }
                 continue;
+            }
+            for warning in outcome.warnings {
+                if repo_error_repos.insert(outcome.repo.clone()) {
+                    repo_errors.push(RepoSearchError {
+                        repo: outcome.repo.clone(),
+                        error: warning,
+                    });
+                }
             }
             for mut hit in outcome.hits {
                 hit.combined_score = hit.combined_score.max(0.0);
@@ -1428,147 +1714,164 @@ impl Engine {
         let flavor = classify_query(&request.query);
         let (lexical_share, semantic_share) = symbol_query_shares(flavor);
         let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
-        let scope_repos = scope.repos;
-        let symbol_collection_presence = if semantic_share > 0.0 {
-            self.search_symbol_collection_presence(&scope_repos).await?
-        } else {
-            HashMap::new()
-        };
+        let scope_contexts = scope
+            .repos
+            .iter()
+            .map(|repo| self.repo_context(repo))
+            .collect::<Result<Vec<_>>>()?;
         let per_repo_limit = (request.limit.max(5) * 4).min(64);
         let snapshot = self.inner.snapshot.read().await?;
         let mut blocked_repos = HashMap::new();
         let mut query_vectors: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+        let mut overlay_query_errors: HashMap<String, String> = HashMap::new();
 
-        for repo in &scope_repos {
-            let identity = self.repo_embedding_identity_status(&snapshot, repo).await?;
+        for ctx in &scope_contexts {
+            let identity = self
+                .repo_embedding_identity_status(&snapshot, &ctx.canonical_root)
+                .await?;
             if let Some(reason) = identity.reason {
-                blocked_repos.insert(repo.display().to_string(), reason);
+                blocked_repos.insert(ctx.requested_root.display().to_string(), reason);
             }
         }
 
-        let any_symbol_collections = symbol_collection_presence.values().any(|exists| *exists);
-        if semantic_share > 0.0 && any_symbol_collections {
-            let mut repos_by_profile: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for repo in &scope_repos {
-                let repo_key = repo.display().to_string();
-                if blocked_repos.contains_key(&repo_key) {
-                    continue;
-                }
-                if !symbol_collection_presence
-                    .get(&repo_key)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-                repos_by_profile
-                    .entry(profile_name)
-                    .or_default()
-                    .push(repo_key);
-            }
-
-            for (profile_name, repo_keys) in repos_by_profile {
-                let _dense_permit = self.acquire_dense_budget().await?;
-                match self
-                    .inner
-                    .embedding
-                    .embed_query(&profile_name, &request.query)
-                    .await
-                {
-                    Ok(vector) => {
-                        let vector = Arc::new(vector);
-                        for repo_key in repo_keys {
-                            query_vectors.insert(repo_key, vector.clone());
-                        }
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        for repo_key in repo_keys {
-                            blocked_repos.insert(repo_key, message.clone());
-                        }
-                    }
-                }
-            }
+        if semantic_share > 0.0 {
+            let usages = self
+                .query_profile_usages_for_contexts(&scope_contexts, &blocked_repos)
+                .await?;
+            let (vectors, errors) = self
+                .embed_query_vectors_for_usages(usages, &request.query, &mut blocked_repos)
+                .await?;
+            query_vectors = vectors;
+            overlay_query_errors = errors;
         }
 
-        let mut stream = futures::stream::iter(scope_repos.into_iter().map(|repo| {
+        let mut stream = futures::stream::iter(scope_contexts.into_iter().map(|ctx| {
             let engine = self.clone();
             let request = request.clone();
-            let query_vector = query_vectors.get(&repo.display().to_string()).cloned();
-            let repo_error = blocked_repos.get(&repo.display().to_string()).cloned();
-            let entry = snapshot.codebases.get(&repo.display().to_string()).cloned();
-            let symbol_collection_exists = symbol_collection_presence
-                .get(&repo.display().to_string())
-                .copied()
-                .unwrap_or(false);
+            let canonical_query_vector = engine
+                .embedding_profile_name_for_repo(&ctx.canonical_root)
+                .ok()
+                .and_then(|profile| query_vectors.get(profile).cloned());
+            let overlay_query_vector = ctx.overlay.as_ref().and_then(|_| {
+                engine
+                    .overlay_profile_name(&ctx)
+                    .ok()
+                    .and_then(|profile| query_vectors.get(profile).cloned())
+            });
+            let repo_error = blocked_repos
+                .get(&ctx.requested_root.display().to_string())
+                .cloned();
+            let entry = snapshot
+                .codebases
+                .get(&ctx.canonical_root.display().to_string())
+                .cloned();
             async move {
                 if let Some(error) = repo_error {
-                    return Err(anyhow::anyhow!("{}: {error}", repo.display()));
+                    return SymbolRepoSearchOutcome {
+                        repo: ctx.requested_root,
+                        stale: false,
+                        hits: Vec::new(),
+                        warnings: Vec::new(),
+                        error: Some(error),
+                    };
                 }
-                let _repo_permit = engine.acquire_repo_search_budget().await?;
+                let _repo_permit = match engine.acquire_repo_search_budget().await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        return SymbolRepoSearchOutcome {
+                            repo: ctx.requested_root,
+                            stale: false,
+                            hits: Vec::new(),
+                            warnings: Vec::new(),
+                            error: Some(error.to_string()),
+                        };
+                    }
+                };
                 let stale = engine
-                    .repo_is_stale(&repo, entry.as_ref())
+                    .repo_is_stale(&ctx.requested_root, entry.as_ref())
                     .await
                     .unwrap_or(false);
                 match engine
-                    .search_symbol_repo(
-                        &repo,
+                    .search_symbol_context(
+                        &ctx,
                         &request,
                         flavor,
                         per_repo_limit,
-                        SymbolFusionConfig {
-                            query_vector: query_vector.as_ref().map(|value| value.as_slice()),
-                            lexical_share,
-                            semantic_share,
-                            symbol_collection_exists,
-                        },
+                        canonical_query_vector
+                            .as_ref()
+                            .map(|value| value.as_slice()),
+                        overlay_query_vector.as_ref().map(|value| value.as_slice()),
+                        lexical_share,
+                        semantic_share,
                     )
                     .await
                 {
-                    Ok(hits) => Ok::<_, anyhow::Error>((repo, stale, hits)),
-                    Err(error) => Err(anyhow::anyhow!("{}: {error}", repo.display())),
+                    Ok(result) => SymbolRepoSearchOutcome {
+                        repo: ctx.requested_root,
+                        stale,
+                        hits: result.hits,
+                        warnings: result.warnings,
+                        error: None,
+                    },
+                    Err(error) => SymbolRepoSearchOutcome {
+                        repo: ctx.requested_root,
+                        stale,
+                        hits: Vec::new(),
+                        warnings: Vec::new(),
+                        error: Some(error.to_string()),
+                    },
                 }
             }
         }))
         .buffer_unordered(parallelism);
 
-        let mut repo_errors = Vec::new();
+        let mut repo_errors = overlay_query_errors
+            .into_iter()
+            .map(|(repo, error)| RepoSearchError { repo, error })
+            .collect::<Vec<_>>();
+        let mut repo_error_repos = repo_errors
+            .iter()
+            .map(|error| error.repo.clone())
+            .collect::<HashSet<_>>();
         let mut hits = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok((repo, stale, repo_hits)) => {
-                    for hit in repo_hits {
-                        hits.push(SymbolSearchHit {
-                            symbol_id: hit.symbol_id,
-                            repo: repo.display().to_string(),
-                            repo_label: repo_basename(&repo.display().to_string()),
-                            relative_path: hit.relative_path,
-                            name: hit.name,
-                            kind: hit.kind,
-                            container: hit.container,
-                            language: hit.language,
-                            start_line: hit.start_line,
-                            end_line: hit.end_line,
-                            score: hit.combined_score,
-                            lexical_score: (hit.lexical_score > 0.0).then_some(hit.lexical_score),
-                            semantic_score: (hit.semantic_score > 0.0)
-                                .then_some(hit.semantic_score),
-                            indexed_at: hit.indexed_at,
-                            file_hash: hit.file_hash,
-                            stale,
-                        });
-                    }
+        while let Some(outcome) = stream.next().await {
+            let repo_key = outcome.repo.display().to_string();
+            if let Some(error) = outcome.error {
+                if repo_error_repos.insert(repo_key.clone()) {
+                    repo_errors.push(RepoSearchError {
+                        repo: repo_key,
+                        error,
+                    });
                 }
-                Err(error) => repo_errors.push(RepoSearchError {
-                    repo: error
-                        .to_string()
-                        .split(':')
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    error: error.to_string(),
-                }),
+                continue;
+            }
+            for warning in outcome.warnings {
+                if repo_error_repos.insert(repo_key.clone()) {
+                    repo_errors.push(RepoSearchError {
+                        repo: repo_key.clone(),
+                        error: warning,
+                    });
+                }
+            }
+            for hit in outcome.hits {
+                hits.push(SymbolSearchHit {
+                    symbol_id: hit.symbol_id,
+                    repo: repo_key.clone(),
+                    repo_label: repo_basename(&repo_key),
+                    relative_path: hit.relative_path,
+                    name: hit.name,
+                    kind: hit.kind,
+                    container: hit.container,
+                    language: hit.language,
+                    start_line: hit.start_line,
+                    end_line: hit.end_line,
+                    score: hit.combined_score,
+                    lexical_score: (hit.lexical_score > 0.0).then_some(hit.lexical_score),
+                    semantic_score: (hit.semantic_score > 0.0).then_some(hit.semantic_score),
+                    indexed_at: hit.indexed_at,
+                    file_hash: hit.file_hash,
+                    stale: outcome.stale,
+                });
             }
         }
 
@@ -1709,15 +2012,17 @@ impl Engine {
         let mut matches = Vec::new();
 
         for repo in scope.repos {
+            let ctx = self.repo_context(&repo)?;
             let repo_key = repo.display().to_string();
+            let canonical_key = ctx.canonical_root.display().to_string();
             let symbols = self
-                .load_file_outline_symbols(&repo_key, &normalized_file)
+                .load_file_outline_symbols_for_repo(&repo, &normalized_file)
                 .await?;
             if symbols.is_empty() {
                 continue;
             }
             let repo_stale = self
-                .repo_is_stale(&repo, snapshot.codebases.get(&repo_key))
+                .repo_is_stale(&repo, snapshot.codebases.get(&canonical_key))
                 .await
                 .unwrap_or(false);
             let stale = self
@@ -1835,28 +2140,9 @@ impl Engine {
                 .await;
         }
 
-        let lexical_hits = self
-            .run_search_lexical_blocking("search_text_shortlist", {
-                let repo_path = repo.to_path_buf();
-                let local_index = self.inner.local_index.clone();
-                let request = ChunkSearchRequest {
-                    query: request.query.clone(),
-                    limit: SEARCH_TEXT_SHORTLIST_LIMIT,
-                    flavor: query_flavor(classify_query(&request.query)),
-                    path_prefix: request.path_prefix.clone(),
-                    language: request.language.clone(),
-                    file: None,
-                    extension_filter: request.extension_filter.clone(),
-                };
-                move || local_index.search_chunks(&repo_path, &request)
-            })
+        let files = self
+            .search_text_index_candidate_files(repo, request)
             .await?;
-        let mut files = lexical_hits
-            .into_iter()
-            .map(|hit| hit.relative_path)
-            .collect::<Vec<_>>();
-        files.sort();
-        files.dedup();
         if !files.is_empty() {
             return Ok(files);
         }
@@ -1875,10 +2161,65 @@ impl Engine {
                 )
             })
             .await?;
-        if request.path_prefix.is_none() || fallback.len() <= SEARCH_TEXT_FALLBACK_MAX_FILES {
-            return Ok(fallback);
-        }
-        Ok(Vec::new())
+        validate_search_text_fallback_size(request, fallback.len())?;
+        Ok(fallback)
+    }
+
+    async fn search_text_index_candidate_files(
+        &self,
+        repo: &Path,
+        request: &TextSearchScopeRequest,
+    ) -> Result<Vec<String>> {
+        let ctx = self.repo_context(repo)?;
+        let chunk_request = text_search_chunk_request(request);
+        let canonical_hits = self
+            .run_search_lexical_blocking("search_text_shortlist", {
+                let repo_path = ctx.canonical_root.clone();
+                let local_index = self.inner.local_index.clone();
+                let request = chunk_request.clone();
+                move || local_index.search_chunks(&repo_path, &request)
+            })
+            .await?;
+        let canonical_files = canonical_hits
+            .into_iter()
+            .map(|hit| hit.relative_path)
+            .collect::<Vec<_>>();
+
+        let Some(overlay) = ctx.overlay.as_ref() else {
+            return Ok(dedup_relative_paths(canonical_files));
+        };
+        let overlay_state = match self.load_overlay_state(overlay).await {
+            Ok(Some(state)) => state,
+            Ok(None) | Err(_) => return Ok(dedup_relative_paths(canonical_files)),
+        };
+
+        let suppressed_paths = if overlay_state_suppresses_canonical(&overlay_state) {
+            overlay_suppressed_paths(&overlay_state)
+        } else {
+            BTreeSet::new()
+        };
+        let overlay_files = if overlay_state_has_search_index(&overlay_state) {
+            let overlay_hits = self
+                .run_search_lexical_blocking("search_text_overlay_shortlist", {
+                    let repo_path = overlay.storage_root.clone();
+                    let local_index = self.inner.local_index.clone();
+                    let request = chunk_request;
+                    move || local_index.search_chunks(&repo_path, &request)
+                })
+                .await?;
+            overlay_hits
+                .into_iter()
+                .map(|hit| hit.relative_path)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        Ok(merge_text_candidate_files(
+            canonical_files,
+            overlay_files,
+            &suppressed_paths,
+        ))
     }
 
     fn narrow_scope_to_repo(
@@ -2062,7 +2403,7 @@ impl Engine {
 
         for repo in repos {
             let symbols = self
-                .load_file_outline_symbols(&repo.display().to_string(), &file)
+                .load_file_outline_symbols_for_repo(&repo, &file)
                 .await?;
             let matches = symbols
                 .into_iter()
@@ -2158,7 +2499,7 @@ impl Engine {
                     .indexed_file_metadata(&repo, &snapshot.relative_path)
                     .await?;
                 let file_symbols = self
-                    .load_file_outline_symbols(&repo.display().to_string(), &snapshot.relative_path)
+                    .load_file_outline_symbols_for_repo(&repo, &snapshot.relative_path)
                     .await?;
                 if let Some(ready) = self.pick_ready_file_match_target(
                     &snapshot,
@@ -2183,7 +2524,7 @@ impl Engine {
                 .indexed_file_metadata(&repo, &snapshot.relative_path)
                 .await?;
             let file_symbols = self
-                .load_file_outline_symbols(&repo.display().to_string(), &snapshot.relative_path)
+                .load_file_outline_symbols_for_repo(&repo, &snapshot.relative_path)
                 .await?;
             if let Some(symbol) = narrowest_covering_symbol(&file_symbols, line_hint) {
                 let symbol_lines = span_line_count(symbol.start_line, symbol.end_line);
@@ -2445,9 +2786,51 @@ impl Engine {
         Ok(snapshot)
     }
 
+    async fn index_lookup_target(
+        &self,
+        repo: &Path,
+        relative_path: &str,
+    ) -> Result<(PathBuf, String)> {
+        let ctx = self.repo_context(repo)?;
+        let normalized_path = normalize_relative_path(relative_path);
+        if let Some(overlay) = ctx.overlay.as_ref() {
+            if let Ok(Some(state)) = self.load_overlay_state(overlay).await {
+                if overlay_lookup_uses_overlay(&state, &normalized_path) {
+                    return Ok((overlay.storage_root.clone(), overlay.repo_key.clone()));
+                }
+            }
+        }
+        Ok((
+            ctx.canonical_root.clone(),
+            ctx.canonical_root.display().to_string(),
+        ))
+    }
+
+    async fn load_file_outline_symbols_for_repo(
+        &self,
+        repo: &Path,
+        relative_path: &str,
+    ) -> Result<Vec<IndexedSymbol>> {
+        let (repo_path, repo_key) = self.index_lookup_target(repo, relative_path).await?;
+        let _ = repo_path;
+        self.load_file_outline_symbols(&repo_key, relative_path)
+            .await
+    }
+
     async fn indexed_file_metadata(
         &self,
         repo: &Path,
+        relative_path: &str,
+    ) -> Result<IndexedFileMetadata> {
+        let (repo_path, repo_key) = self.index_lookup_target(repo, relative_path).await?;
+        self.indexed_file_metadata_from_index(&repo_path, &repo_key, relative_path)
+            .await
+    }
+
+    async fn indexed_file_metadata_from_index(
+        &self,
+        repo: &Path,
+        repo_key: &str,
         relative_path: &str,
     ) -> Result<IndexedFileMetadata> {
         let repo_path = repo.to_path_buf();
@@ -2475,7 +2858,7 @@ impl Engine {
             return Ok(chunk_metadata);
         }
 
-        let repo_key = repo.display().to_string();
+        let repo_key = repo_key.to_string();
         let symbol_path = normalized_path.clone();
         let symbol_store = self.inner.symbol_store.clone();
         self.run_search_lexical_blocking("indexed_file_symbol_metadata", move || {
@@ -2501,18 +2884,31 @@ impl Engine {
         repo: &Path,
         symbol_id: &str,
     ) -> Result<Option<ResolvedEditSymbol>> {
-        let repo_key = repo.display().to_string();
+        let ctx = self.repo_context(repo)?;
+        let mut repo_keys = Vec::new();
+        if let Some(overlay) = ctx.overlay.as_ref() {
+            repo_keys.push(overlay.repo_key.clone());
+            repo_keys.push(ctx.canonical_root.display().to_string());
+        } else {
+            repo_keys.push(repo.display().to_string());
+        }
         let symbol_id = symbol_id.to_string();
-        let symbol_store = self.inner.symbol_store.clone();
-        let symbol = self
-            .run_search_lexical_blocking("resolve_symbol_for_edit", move || {
-                symbol_store.symbol_by_id(&repo_key, &symbol_id)
-            })
-            .await?;
-        Ok(symbol.map(|symbol| ResolvedEditSymbol {
-            repo: repo.to_path_buf(),
-            symbol,
-        }))
+        for repo_key in repo_keys {
+            let symbol_store = self.inner.symbol_store.clone();
+            let symbol_id = symbol_id.clone();
+            let symbol = self
+                .run_search_lexical_blocking("resolve_symbol_for_edit", move || {
+                    symbol_store.symbol_by_id(&repo_key, &symbol_id)
+                })
+                .await?;
+            if let Some(symbol) = symbol {
+                return Ok(Some(ResolvedEditSymbol {
+                    repo: repo.to_path_buf(),
+                    symbol,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     fn resolve_prepare_repos(
@@ -2883,8 +3279,13 @@ impl Engine {
         let mut total_chunks = 0u64;
 
         for repo in scope.repos {
+            let ctx = self.repo_context(&repo)?;
             let repo_key = repo.display().to_string();
-            let status = self.status_for_repo(&snapshot, &repo).await?;
+            let status = if ctx.overlay.is_some() {
+                self.status_for_worktree_overlay(&snapshot, &ctx).await?
+            } else {
+                self.status_for_repo(&snapshot, &repo).await?
+            };
             indexed_files += status.indexed_files.unwrap_or(0);
             total_chunks += status.total_chunks.unwrap_or(0);
             repos.push(RepoStatus {
@@ -2994,6 +3395,445 @@ impl Engine {
         Ok(())
     }
 
+    async fn fail_worktree_overlay(
+        &self,
+        overlay: &WorktreeOverlayContext,
+        worktree_key: &str,
+        canonical_key: &str,
+        message: String,
+        profile_name: Option<String>,
+        embedding_fingerprint: Option<String>,
+        force: bool,
+        changes: RepoChangeSummary,
+        index_status: &str,
+    ) -> Result<RepoIndexResult> {
+        let failed_state = failed_overlay_state(
+            overlay,
+            worktree_key,
+            canonical_key,
+            profile_name.clone(),
+            embedding_fingerprint.clone(),
+        );
+        if self.save_overlay_state(&failed_state).await.is_err() {
+            self.remove_overlay_state_if_present(&overlay.resolution.overlay_id)
+                .await?;
+        }
+        self.inner
+            .snapshot
+            .update(|snapshot| {
+                snapshot.worktrees.insert(
+                    worktree_key.to_string(),
+                    WorktreeSnapshotEntry::failed(
+                        canonical_key.to_string(),
+                        overlay.resolution.repo_identity.clone(),
+                        overlay.resolution.overlay_id.clone(),
+                        message.clone(),
+                        profile_name.clone(),
+                        embedding_fingerprint.clone(),
+                    ),
+                );
+            })
+            .await?;
+        Ok(RepoIndexResult {
+            repo: worktree_key.to_string(),
+            indexed_files: None,
+            total_chunks: None,
+            index_status: Some(index_status.to_string()),
+            full_reindex: force,
+            changes,
+            error: Some(message),
+        })
+    }
+
+    async fn index_worktree_overlay(
+        &self,
+        ctx: RepoContext,
+        force: bool,
+        splitter: SplitterKind,
+        custom_extensions: &[String],
+        ignore_patterns: &[String],
+        mode: IndexExecutionMode,
+    ) -> Result<RepoIndexResult> {
+        let Some(overlay) = ctx.overlay.as_ref() else {
+            bail!("internal error: missing worktree overlay context");
+        };
+        let worktree_key = ctx.requested_root.display().to_string();
+        let canonical_key = ctx.canonical_root.display().to_string();
+        let profile_name = match self.overlay_profile_name(&ctx) {
+            Ok(name) => name.to_string(),
+            Err(error) => {
+                return self
+                    .fail_worktree_overlay(
+                        overlay,
+                        &worktree_key,
+                        &canonical_key,
+                        error.to_string(),
+                        None,
+                        None,
+                        force,
+                        RepoChangeSummary::default(),
+                        "failed",
+                    )
+                    .await;
+            }
+        };
+        let configured_embedding_fingerprint = match self.overlay_fingerprint(&ctx).await {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return self
+                    .fail_worktree_overlay(
+                        overlay,
+                        &worktree_key,
+                        &canonical_key,
+                        error.to_string(),
+                        Some(profile_name.clone()),
+                        None,
+                        force,
+                        RepoChangeSummary::default(),
+                        "failed",
+                    )
+                    .await;
+            }
+        };
+        let configured_embedding_dimension = match self.overlay_dimension(&ctx).await {
+            Ok(dimension) => dimension,
+            Err(error) => {
+                return self
+                    .fail_worktree_overlay(
+                        overlay,
+                        &worktree_key,
+                        &canonical_key,
+                        error.to_string(),
+                        Some(profile_name.clone()),
+                        Some(configured_embedding_fingerprint.clone()),
+                        force,
+                        RepoChangeSummary::default(),
+                        "failed",
+                    )
+                    .await;
+            }
+        };
+
+        if !ctx.canonical_root.exists() {
+            let message = format!(
+                "canonical repo `{}` is missing",
+                ctx.canonical_root.display()
+            );
+            return self
+                .fail_worktree_overlay(
+                    overlay,
+                    &worktree_key,
+                    &canonical_key,
+                    message,
+                    Some(profile_name.clone()),
+                    Some(configured_embedding_fingerprint.clone()),
+                    false,
+                    RepoChangeSummary::default(),
+                    "canonical_missing",
+                )
+                .await;
+        }
+
+        {
+            let snapshot = self.inner.snapshot.read().await?;
+            let canonical_entry = snapshot.codebases.get(&canonical_key);
+            if !matches!(
+                canonical_entry.map(|entry| entry.status.as_str()),
+                Some("indexed")
+            ) {
+                let message = format!(
+                    "canonical repo `{}` is not indexed; index it before refreshing worktree overlays",
+                    ctx.canonical_root.display()
+                );
+                drop(snapshot);
+                return self
+                    .fail_worktree_overlay(
+                        overlay,
+                        &worktree_key,
+                        &canonical_key,
+                        message,
+                        Some(profile_name.clone()),
+                        Some(configured_embedding_fingerprint.clone()),
+                        false,
+                        RepoChangeSummary::default(),
+                        "canonical_missing",
+                    )
+                    .await;
+            }
+        }
+
+        self.inner
+            .snapshot
+            .update(|snapshot| {
+                snapshot.worktrees.insert(
+                    worktree_key.clone(),
+                    WorktreeSnapshotEntry::indexing(
+                        canonical_key.clone(),
+                        overlay.resolution.repo_identity.clone(),
+                        overlay.resolution.overlay_id.clone(),
+                        Some(profile_name.clone()),
+                        Some(configured_embedding_fingerprint.clone()),
+                    ),
+                );
+                if let Some(entry) = snapshot.worktrees.get_mut(&worktree_key) {
+                    entry.overlay_status = Some("running".to_string());
+                }
+            })
+            .await?;
+
+        let mut attempted_changes = RepoChangeSummary::default();
+        let outcome = async {
+            self.remove_overlay_state_if_present(&overlay.resolution.overlay_id)
+                .await?;
+            let canonical_root = ctx.canonical_root.clone();
+            let worktree_root = ctx.requested_root.clone();
+            let canonical_custom_extensions = custom_extensions.to_vec();
+            let canonical_ignore_patterns = ignore_patterns.to_vec();
+            let canonical_files = run_low_priority_blocking("scan_canonical_for_overlay", move || {
+                scan_repo(
+                    &canonical_root,
+                    &canonical_custom_extensions,
+                    &canonical_ignore_patterns,
+                )
+            })
+            .await?;
+            let worktree_custom_extensions = custom_extensions.to_vec();
+            let worktree_ignore_patterns = ignore_patterns.to_vec();
+            let worktree_files = run_low_priority_blocking("scan_worktree_overlay", move || {
+                scan_repo(
+                    &worktree_root,
+                    &worktree_custom_extensions,
+                    &worktree_ignore_patterns,
+                )
+            })
+            .await?;
+
+            let live_canonical_hashes = canonical_files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.hash.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let canonical_merkle_path =
+                merkle_snapshot_path(&self.inner.config.merkle_dir(), &ctx.canonical_root);
+            let canonical_hashes = load_merkle_snapshot(&canonical_merkle_path)
+                .await
+                .ok()
+                .filter(MerkleSnapshot::is_compatible)
+                .map(|snapshot| snapshot.file_hashes.into_iter().collect::<BTreeMap<_, _>>())
+                .unwrap_or(live_canonical_hashes);
+            let worktree_hashes = worktree_files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.hash.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let diff = diff_files(&canonical_hashes, &worktree_hashes);
+            let to_index = diff
+                .added
+                .iter()
+                .chain(diff.modified.iter())
+                .filter_map(|path| worktree_files.get(path).cloned())
+                .collect::<Vec<_>>();
+            let overlay_bytes = to_index
+                .iter()
+                .map(|file| file.bytes)
+                .fold(0u64, u64::saturating_add);
+            let changed_files = to_index.len() as u64;
+            let deleted_files = diff.removed.len() as u64;
+            let changes = RepoChangeSummary {
+                added: diff.added.len() as u64,
+                modified: diff.modified.len() as u64,
+                removed: deleted_files,
+            };
+            attempted_changes = changes.clone();
+            let over_cap = changed_files as usize > self.inner.config.worktrees.max_overlay_files
+                || overlay_bytes > self.inner.config.worktrees.max_overlay_bytes;
+
+            if over_cap {
+                self.clear_worktree_overlay_indexes(overlay).await?;
+                let state = OverlayIndexState {
+                    canonical_root: canonical_key.clone(),
+                    worktree_root: worktree_key.clone(),
+                    repo_identity: overlay.resolution.repo_identity.clone(),
+                    overlay_id: overlay.resolution.overlay_id.clone(),
+                    replaced_paths: diff.modified.clone(),
+                    deleted_paths: diff.removed.clone(),
+                    indexed_hashes: Vec::new(),
+                    changed_files,
+                    deleted_files,
+                    overlay_bytes,
+                    overlay_status: Some("too_large".to_string()),
+                    embedding_profile: Some(profile_name.clone()),
+                    embedding_fingerprint: Some(configured_embedding_fingerprint.clone()),
+                };
+                self.save_overlay_state(&state).await?;
+                self.inner
+                    .snapshot
+                    .update(|snapshot| {
+                        snapshot.worktrees.insert(
+                            worktree_key.clone(),
+                            WorktreeSnapshotEntry::indexed(
+                                canonical_key.clone(),
+                                overlay.resolution.repo_identity.clone(),
+                                overlay.resolution.overlay_id.clone(),
+                                "too_large",
+                                changed_files,
+                                deleted_files,
+                                overlay_bytes,
+                                Some(profile_name.clone()),
+                                Some(configured_embedding_fingerprint.clone()),
+                            ),
+                        );
+                        if let Some(entry) = snapshot.worktrees.get_mut(&worktree_key) {
+                            entry.overlay_mismatch_reason = Some(format!(
+                                "overlay has {changed_files} changed/new files and {overlay_bytes} bytes, exceeding configured caps"
+                            ));
+                        }
+                    })
+                    .await?;
+                return Ok(RepoIndexResult {
+                    repo: worktree_key.clone(),
+                    indexed_files: Some(0),
+                    total_chunks: Some(0),
+                    index_status: Some("too_large".to_string()),
+                    full_reindex: false,
+                    changes,
+                    error: None,
+                });
+            }
+
+            self.clear_worktree_overlay_indexes(overlay).await?;
+            if !to_index.is_empty() {
+                self.inner
+                    .milvus
+                    .create_hybrid_collection(
+                        &overlay.chunk_collection,
+                        configured_embedding_dimension,
+                        &format!("codebasePath:{}", ctx.requested_root.display()),
+                    )
+                    .await?;
+                self.inner
+                    .milvus
+                    .create_hybrid_collection(
+                        &overlay.symbol_collection,
+                        configured_embedding_dimension,
+                        &format!("symbolCodebasePath:{}", ctx.requested_root.display()),
+                    )
+                    .await?;
+            }
+
+            let processing = self
+                .process_files(
+                    ProcessFilesPlan {
+                        repo: &ctx.requested_root,
+                        storage_repo: &overlay.storage_root,
+                        repo_key: &overlay.repo_key,
+                        profile_name: &profile_name,
+                        collections: IndexCollections {
+                            chunk: &overlay.chunk_collection,
+                            symbol: (!to_index.is_empty())
+                                .then_some(overlay.symbol_collection.as_str()),
+                        },
+                        splitter,
+                        total_files: 0,
+                        mode,
+                    },
+                    &to_index,
+                )
+                .await?;
+            let indexed_hashes = worktree_hashes
+                .iter()
+                .filter(|(path, _)| processing.indexed_paths.contains(*path))
+                .map(|(path, hash)| (path.clone(), hash.clone()))
+                .collect::<Vec<_>>();
+            let state = OverlayIndexState {
+                canonical_root: canonical_key.clone(),
+                worktree_root: worktree_key.clone(),
+                repo_identity: overlay.resolution.repo_identity.clone(),
+                overlay_id: overlay.resolution.overlay_id.clone(),
+                replaced_paths: diff.modified.clone(),
+                deleted_paths: diff.removed.clone(),
+                indexed_hashes,
+                changed_files,
+                deleted_files,
+                overlay_bytes,
+                overlay_status: Some("completed".to_string()),
+                embedding_profile: Some(profile_name.clone()),
+                embedding_fingerprint: Some(configured_embedding_fingerprint.clone()),
+            };
+            let overlay_storage_root = overlay.storage_root.clone();
+            let local_index = self.inner.local_index.clone();
+            let chunk_coverage =
+                run_low_priority_blocking("count_overlay_chunk_coverage", move || {
+                    local_index.chunk_coverage(&overlay_storage_root)
+                })
+                .await?;
+            let coverage = IndexCoverage {
+                indexed_files: chunk_coverage.indexed_files,
+                total_chunks: chunk_coverage.total_chunks,
+            };
+            let index_status = index_status_for_coverage(processing.status, coverage);
+            if !to_index.is_empty()
+                && let Err(error) = self
+                    .maintain_vector_collections(
+                        &[
+                            overlay.chunk_collection.clone(),
+                            overlay.symbol_collection.clone(),
+                        ],
+                        true,
+                    )
+                    .await
+            {
+                bail!("vector maintenance failed: {error}");
+            }
+            self.save_overlay_state(&state).await?;
+            self.inner
+                .snapshot
+                .update(|snapshot| {
+                    snapshot.worktrees.insert(
+                        worktree_key.clone(),
+                        WorktreeSnapshotEntry::indexed(
+                            canonical_key.clone(),
+                            overlay.resolution.repo_identity.clone(),
+                            overlay.resolution.overlay_id.clone(),
+                            index_status.clone(),
+                            changed_files,
+                            deleted_files,
+                            overlay_bytes,
+                            Some(profile_name.clone()),
+                            Some(configured_embedding_fingerprint.clone()),
+                        ),
+                    );
+                })
+                .await?;
+            Ok::<_, anyhow::Error>(RepoIndexResult {
+                repo: worktree_key.clone(),
+                indexed_files: Some(coverage.indexed_files),
+                total_chunks: Some(coverage.total_chunks),
+                index_status: Some(index_status),
+                full_reindex: false,
+                changes,
+                error: None,
+            })
+        }
+        .await;
+
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.fail_worktree_overlay(
+                    overlay,
+                    &worktree_key,
+                    &canonical_key,
+                    error.to_string(),
+                    Some(profile_name),
+                    Some(configured_embedding_fingerprint),
+                    force,
+                    attempted_changes,
+                    "failed",
+                )
+                .await
+            }
+        }
+    }
+
     async fn index_repo(
         &self,
         repo: &Path,
@@ -3008,6 +3848,19 @@ impl Engine {
             return self.clear_removed_repo(repo, force).await;
         }
         validate_repo_path(repo)?;
+        let ctx = self.repo_context(repo)?;
+        if ctx.overlay.is_some() {
+            return self
+                .index_worktree_overlay(
+                    ctx,
+                    force,
+                    splitter,
+                    custom_extensions,
+                    ignore_patterns,
+                    mode,
+                )
+                .await;
+        }
         let repo_key = repo.display().to_string();
         let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
         let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await?;
@@ -3114,6 +3967,7 @@ impl Engine {
                     .process_files(
                         ProcessFilesPlan {
                             repo,
+                            storage_repo: repo,
                             repo_key: &repo_key,
                             profile_name: &profile_name,
                             collections: IndexCollections {
@@ -3227,6 +4081,7 @@ impl Engine {
                     .process_files(
                         ProcessFilesPlan {
                             repo,
+                            storage_repo: repo,
                             repo_key: &repo_key,
                             profile_name: &profile_name,
                             collections: IndexCollections {
@@ -3352,6 +4207,8 @@ impl Engine {
                         }
                     })
                     .await?;
+                self.invalidate_worktree_overlays_for_canonical(&repo_key)
+                    .await?;
 
                 Ok(RepoIndexResult {
                     repo: repo_key,
@@ -3403,6 +4260,39 @@ impl Engine {
         Ok(removed_repo_index_result(repo, removed_files, force))
     }
 
+    async fn clear_removed_worktree_overlay(
+        &self,
+        repo: &Path,
+        force: bool,
+    ) -> Result<Option<RepoIndexResult>> {
+        let repo_key = repo.display().to_string();
+        let entry = {
+            let snapshot = self.inner.snapshot.read().await?;
+            snapshot.worktrees.get(&repo_key).cloned()
+        };
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+
+        let overlay = worktree_overlay_context_from_snapshot(repo, &entry);
+        self.clear_worktree_overlay_indexes(&overlay).await?;
+        let state_path = self.overlay_state_path(&entry.overlay_id);
+        if state_path.exists() {
+            tokio::fs::remove_file(&state_path)
+                .await
+                .with_context(|| format!("removing {}", state_path.display()))?;
+        }
+        self.inner
+            .snapshot
+            .update(|snapshot| {
+                snapshot.worktrees.remove(&repo_key);
+            })
+            .await?;
+
+        let removed_files = entry.changed_files.unwrap_or(0);
+        Ok(Some(removed_repo_index_result(repo, removed_files, force)))
+    }
+
     async fn previous_indexed_file_count(&self, repo: &Path) -> u64 {
         let merkle_path = merkle_snapshot_path(&self.inner.config.merkle_dir(), repo);
         if !merkle_path.exists() {
@@ -3416,6 +4306,24 @@ impl Engine {
 
     async fn clear_repo(&self, repo: &Path) -> Result<()> {
         validate_absolute_repo_path(repo)?;
+        let ctx = self.repo_context(repo)?;
+        if let Some(overlay) = ctx.overlay.as_ref() {
+            self.clear_worktree_overlay_indexes(overlay).await?;
+            let state_path = self.overlay_state_path(&overlay.resolution.overlay_id);
+            if state_path.exists() {
+                tokio::fs::remove_file(&state_path)
+                    .await
+                    .with_context(|| format!("removing {}", state_path.display()))?;
+            }
+            let worktree_key = overlay.resolution.worktree_root.display().to_string();
+            self.inner
+                .snapshot
+                .update(|snapshot| {
+                    snapshot.worktrees.remove(&worktree_key);
+                })
+                .await?;
+            return Ok(());
+        }
         self.clear_repo_indexes(repo).await
     }
 
@@ -3465,6 +4373,82 @@ impl Engine {
         Ok(())
     }
 
+    async fn clear_worktree_overlay_indexes(&self, overlay: &WorktreeOverlayContext) -> Result<()> {
+        if self
+            .inner
+            .milvus
+            .refresh_collection_presence(&overlay.chunk_collection)
+            .await?
+        {
+            self.inner
+                .milvus
+                .drop_collection(&overlay.chunk_collection)
+                .await?;
+        }
+        if self
+            .inner
+            .milvus
+            .refresh_collection_presence(&overlay.symbol_collection)
+            .await?
+        {
+            self.inner
+                .milvus
+                .drop_collection(&overlay.symbol_collection)
+                .await?;
+        }
+        let storage_root = overlay.storage_root.clone();
+        let local_index = self.inner.local_index.clone();
+        run_low_priority_blocking("clear_overlay_local_index", move || {
+            local_index.clear_repo(&storage_root)
+        })
+        .await?;
+        let overlay_repo_key = overlay.repo_key.clone();
+        let symbol_store = self.inner.symbol_store.clone();
+        run_low_priority_blocking("clear_overlay_symbol_rows", move || {
+            symbol_store.clear_repo(&overlay_repo_key)
+        })
+        .await
+    }
+
+    async fn invalidate_worktree_overlays_for_canonical(&self, canonical_key: &str) -> Result<()> {
+        let snapshot = self.inner.snapshot.read().await?;
+        let affected = snapshot
+            .worktrees
+            .iter()
+            .filter(|(_, entry)| entry.canonical_root == canonical_key)
+            .filter(|(_, entry)| entry.status != "indexing")
+            .map(|(worktree, entry)| (worktree.clone(), entry.overlay_id.clone()))
+            .collect::<Vec<_>>();
+        drop(snapshot);
+
+        if affected.is_empty() {
+            return Ok(());
+        }
+
+        let reason = "canonical index refreshed; refresh this worktree overlay".to_string();
+        self.inner
+            .snapshot
+            .update(|snapshot| {
+                for (worktree_key, _) in &affected {
+                    if let Some(entry) = snapshot.worktrees.get_mut(worktree_key) {
+                        entry.overlay_status = Some("stale".to_string());
+                        entry.overlay_mismatch_reason = Some(reason.clone());
+                        entry.last_updated = Some(crate::snapshot::timestamp());
+                    }
+                }
+            })
+            .await?;
+
+        for (_, overlay_id) in affected {
+            if let Some(mut state) = self.load_overlay_state_by_id(&overlay_id).await? {
+                state.overlay_status = Some("stale".to_string());
+                self.save_overlay_state(&state).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn maintain_vector_collections(&self, collections: &[String], flush: bool) -> Result<()> {
         let mut collections = collections.to_vec();
         collections.sort();
@@ -3491,23 +4475,108 @@ impl Engine {
         Ok(())
     }
 
-    async fn search_repo(
+    async fn search_repo_context(
         &self,
-        repo: &Path,
+        ctx: &RepoContext,
+        request: &SearchRequest,
+        plan: &SearchPlan,
+        canonical_query_vector: Option<&[f32]>,
+        overlay_query_vector: Option<&[f32]>,
+        limit: usize,
+        filter_expression: Option<&str>,
+    ) -> Result<SearchContextResult<RepoSearchHit>> {
+        let canonical_key = ctx.canonical_root.display().to_string();
+        let mut hits = self
+            .search_repo_index(
+                &ctx.requested_root,
+                &ctx.canonical_root,
+                &canonical_key,
+                &collection_name(&ctx.canonical_root),
+                &symbol_collection_name(&ctx.canonical_root),
+                request,
+                plan,
+                canonical_query_vector,
+                limit,
+                filter_expression,
+            )
+            .await?;
+
+        let Some(overlay) = ctx.overlay.as_ref() else {
+            return Ok(SearchContextResult {
+                hits,
+                warnings: Vec::new(),
+            });
+        };
+
+        let mut warnings = Vec::new();
+        let overlay_state = match self.load_overlay_state(overlay).await {
+            Ok(state) => state,
+            Err(error) => {
+                warnings.push(overlay_state_load_warning(&error));
+                None
+            }
+        };
+        let suppressed_paths = overlay_state
+            .as_ref()
+            .filter(|state| overlay_state_suppresses_canonical(state))
+            .map(overlay_suppressed_paths)
+            .unwrap_or_default();
+        if !suppressed_paths.is_empty() {
+            hits.retain(|hit| !suppressed_paths.contains(&hit.relative_path));
+        }
+
+        let overlay_healthy = overlay_state
+            .as_ref()
+            .is_some_and(overlay_state_has_search_index);
+        if overlay_healthy {
+            let overlay_hits = self
+                .search_repo_index(
+                    &ctx.requested_root,
+                    &overlay.storage_root,
+                    &overlay.repo_key,
+                    &overlay.chunk_collection,
+                    &overlay.symbol_collection,
+                    request,
+                    plan,
+                    overlay_query_vector,
+                    limit,
+                    filter_expression,
+                )
+                .await?;
+            hits.extend(overlay_hits);
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .combined_score
+                .partial_cmp(&left.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(SearchContextResult { hits, warnings })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_repo_index(
+        &self,
+        display_repo: &Path,
+        storage_repo: &Path,
+        symbol_repo_key: &str,
+        collection_name: &str,
+        symbol_collection_name: &str,
         request: &SearchRequest,
         plan: &SearchPlan,
         query_vector: Option<&[f32]>,
         limit: usize,
         filter_expression: Option<&str>,
     ) -> Result<Vec<RepoSearchHit>> {
-        let collection_name = collection_name(repo);
         let dense_hits = if let Some(query_vector) = query_vector {
             if plan.dense_weight > 0.0 {
                 let _dense_permit = self.acquire_dense_budget().await?;
-                if self.inner.milvus.has_collection(&collection_name).await? {
+                if self.inner.milvus.has_collection(collection_name).await? {
                     self.inner
                         .milvus
-                        .search_dense(&collection_name, query_vector, limit, filter_expression)
+                        .search_dense(collection_name, query_vector, limit, filter_expression)
                         .await?
                         .into_iter()
                         .filter(|hit| search_document_matches(hit, request))
@@ -3524,7 +4593,7 @@ impl Engine {
 
         let lexical_hits = self
             .run_search_lexical_blocking("search_chunk_index", {
-                let repo_path = repo.to_path_buf();
+                let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let request = ChunkSearchRequest {
                     query: request.query.clone(),
@@ -3540,7 +4609,7 @@ impl Engine {
             .await?;
 
         let symbol_collection_exists = if plan.symbol_semantic_share > 0.0 {
-            self.has_collection_on_search_path(&symbol_collection_name(repo))
+            self.has_collection_on_search_path(symbol_collection_name)
                 .await?
         } else {
             false
@@ -3548,7 +4617,9 @@ impl Engine {
 
         let symbol_hits = self
             .search_symbol_repo(
-                repo,
+                storage_repo,
+                symbol_repo_key,
+                symbol_collection_name,
                 &SymbolSearchScopeRequest {
                     query: request.query.clone(),
                     limit,
@@ -3569,10 +4640,16 @@ impl Engine {
             .await?;
 
         let mut merged: HashMap<String, RepoSearchHit> = HashMap::new();
-        accumulate_dense_hits(&mut merged, repo, dense_hits, plan.dense_weight);
-        accumulate_lexical_hits(&mut merged, repo, lexical_hits, plan.lexical_weight);
-        self.accumulate_symbol_hits(&mut merged, repo, symbol_hits, plan.symbol_weight)
-            .await?;
+        accumulate_dense_hits(&mut merged, display_repo, dense_hits, plan.dense_weight);
+        accumulate_lexical_hits(&mut merged, display_repo, lexical_hits, plan.lexical_weight);
+        self.accumulate_symbol_hits(
+            &mut merged,
+            display_repo,
+            storage_repo,
+            symbol_hits,
+            plan.symbol_weight,
+        )
+        .await?;
 
         let mut hits = merged.into_values().collect::<Vec<_>>();
         hits.sort_by(|left, right| {
@@ -3584,9 +4661,110 @@ impl Engine {
         Ok(hits)
     }
 
+    async fn search_symbol_context(
+        &self,
+        ctx: &RepoContext,
+        request: &SymbolSearchScopeRequest,
+        flavor: QueryKind,
+        limit: usize,
+        canonical_query_vector: Option<&[f32]>,
+        overlay_query_vector: Option<&[f32]>,
+        lexical_share: f64,
+        semantic_share: f64,
+    ) -> Result<SearchContextResult<RankedSymbolHit>> {
+        let canonical_collection = symbol_collection_name(&ctx.canonical_root);
+        let canonical_collection_exists = if semantic_share > 0.0 {
+            self.has_collection_on_search_path(&canonical_collection)
+                .await?
+        } else {
+            false
+        };
+        let canonical_key = ctx.canonical_root.display().to_string();
+        let mut hits = self
+            .search_symbol_repo(
+                &ctx.canonical_root,
+                &canonical_key,
+                &canonical_collection,
+                request,
+                flavor,
+                limit,
+                SymbolFusionConfig {
+                    query_vector: canonical_query_vector,
+                    lexical_share,
+                    semantic_share,
+                    symbol_collection_exists: canonical_collection_exists,
+                },
+            )
+            .await?;
+
+        let Some(overlay) = ctx.overlay.as_ref() else {
+            return Ok(SearchContextResult {
+                hits,
+                warnings: Vec::new(),
+            });
+        };
+
+        let mut warnings = Vec::new();
+        let overlay_state = match self.load_overlay_state(overlay).await {
+            Ok(state) => state,
+            Err(error) => {
+                warnings.push(overlay_state_load_warning(&error));
+                None
+            }
+        };
+        let suppressed_paths = overlay_state
+            .as_ref()
+            .filter(|state| overlay_state_suppresses_canonical(state))
+            .map(overlay_suppressed_paths)
+            .unwrap_or_default();
+        if !suppressed_paths.is_empty() {
+            hits.retain(|hit| !suppressed_paths.contains(&hit.relative_path));
+        }
+
+        let overlay_healthy = overlay_state
+            .as_ref()
+            .is_some_and(overlay_state_has_search_index);
+        if overlay_healthy {
+            let overlay_collection_exists = if semantic_share > 0.0 {
+                self.has_collection_on_search_path(&overlay.symbol_collection)
+                    .await?
+            } else {
+                false
+            };
+            let overlay_hits = self
+                .search_symbol_repo(
+                    &overlay.storage_root,
+                    &overlay.repo_key,
+                    &overlay.symbol_collection,
+                    request,
+                    flavor,
+                    limit,
+                    SymbolFusionConfig {
+                        query_vector: overlay_query_vector,
+                        lexical_share,
+                        semantic_share,
+                        symbol_collection_exists: overlay_collection_exists,
+                    },
+                )
+                .await?;
+            hits.extend(overlay_hits);
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .combined_score
+                .partial_cmp(&left.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(SearchContextResult { hits, warnings })
+    }
+
     async fn search_symbol_repo(
         &self,
-        repo: &Path,
+        storage_repo: &Path,
+        symbol_repo_key: &str,
+        symbol_collection_name: &str,
         request: &SymbolSearchScopeRequest,
         flavor: QueryKind,
         limit: usize,
@@ -3594,7 +4772,7 @@ impl Engine {
     ) -> Result<Vec<RankedSymbolHit>> {
         let indexed_hits = self
             .run_search_lexical_blocking("search_symbol_index", {
-                let repo_path = repo.to_path_buf();
+                let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let request = SymbolSearchRequest {
                     query: request.query.clone(),
@@ -3610,13 +4788,12 @@ impl Engine {
             .await?;
 
         let semantic_hits = if fusion.semantic_share > 0.0 && fusion.symbol_collection_exists {
-            let collection_name = symbol_collection_name(repo);
             if let Some(query_vector) = fusion.query_vector {
                 let _dense_permit = self.acquire_dense_budget().await?;
                 self.inner
                     .milvus
                     .search_dense(
-                        &collection_name,
+                        symbol_collection_name,
                         query_vector,
                         limit.saturating_mul(4),
                         None,
@@ -3643,7 +4820,7 @@ impl Engine {
         let authoritative = self
             .run_search_lexical_blocking("load_symbol_rows", {
                 let symbol_store = self.inner.symbol_store.clone();
-                let repo_key = repo.display().to_string();
+                let repo_key = symbol_repo_key.to_string();
                 move || symbol_store.symbols_by_repo_and_ids(&repo_key, &symbol_ids)
             })
             .await?;
@@ -3682,7 +4859,8 @@ impl Engine {
     async fn accumulate_symbol_hits(
         &self,
         merged: &mut HashMap<String, RepoSearchHit>,
-        repo: &Path,
+        display_repo: &Path,
+        storage_repo: &Path,
         symbol_hits: Vec<RankedSymbolHit>,
         weight: f64,
     ) -> Result<()> {
@@ -3698,7 +4876,7 @@ impl Engine {
         let mut file_chunk_cache: HashMap<String, Vec<LexicalChunkSearchHit>> = HashMap::new();
         for (rank, hit) in symbol_hits.into_iter().enumerate() {
             if !file_chunk_cache.contains_key(&hit.relative_path) {
-                let repo_path = repo.to_path_buf();
+                let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let relative_path = hit.relative_path.clone();
                 let chunks = self
@@ -3714,9 +4892,9 @@ impl Engine {
 
             let score = fused_source_score(rank, hit.combined_score, max_score, weight);
             if let Some(chunk_hit) = chunk_hit {
-                let key = format!("{}:{}", repo.display(), chunk_hit.id);
+                let key = format!("{}:{}", display_repo.display(), chunk_hit.id);
                 let entry = merged.entry(key).or_insert_with(|| RepoSearchHit {
-                    repo: repo.display().to_string(),
+                    repo: display_repo.display().to_string(),
                     relative_path: chunk_hit.relative_path.clone(),
                     start_line: chunk_hit.start_line,
                     end_line: chunk_hit.end_line,
@@ -3733,9 +4911,9 @@ impl Engine {
                 entry.combined_score += score;
             } else {
                 let id = format!("symbol:{}", hit.symbol_id);
-                let key = format!("{}:{id}", repo.display());
+                let key = format!("{}:{id}", display_repo.display());
                 let entry = merged.entry(key).or_insert_with(|| RepoSearchHit {
-                    repo: repo.display().to_string(),
+                    repo: display_repo.display().to_string(),
                     relative_path: hit.relative_path.clone(),
                     start_line: hit.start_line,
                     end_line: hit.end_line,
@@ -3810,6 +4988,13 @@ impl Engine {
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
+                repo_type: None,
+                canonical_repo_label: None,
+                overlay_status: None,
+                changed_files: None,
+                deleted_files: None,
+                overlay_bytes: None,
+                overlay_mismatch_reason: None,
             });
         }
 
@@ -3829,6 +5014,13 @@ impl Engine {
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
+                repo_type: None,
+                canonical_repo_label: None,
+                overlay_status: None,
+                changed_files: None,
+                deleted_files: None,
+                overlay_bytes: None,
+                overlay_mismatch_reason: None,
             },
             None => RepoStatus {
                 repo: repo_key.clone(),
@@ -3845,6 +5037,110 @@ impl Engine {
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
+                repo_type: None,
+                canonical_repo_label: None,
+                overlay_status: None,
+                changed_files: None,
+                deleted_files: None,
+                overlay_bytes: None,
+                overlay_mismatch_reason: None,
+            },
+        })
+    }
+
+    async fn status_for_worktree_overlay(
+        &self,
+        snapshot: &Snapshot,
+        ctx: &RepoContext,
+    ) -> Result<RepoStatus> {
+        let Some(overlay) = ctx.overlay.as_ref() else {
+            bail!("internal error: missing worktree overlay context");
+        };
+        let repo_key = ctx.requested_root.display().to_string();
+        let canonical_key = ctx.canonical_root.display().to_string();
+        let entry = snapshot.worktrees.get(&repo_key).cloned();
+        let profile_name = self.overlay_profile_name(ctx)?.to_string();
+        let configured_fingerprint = self.inner.embedding.fingerprint(&profile_name).await.ok();
+        let stored_fingerprint = entry
+            .as_ref()
+            .and_then(|entry| entry.embedding_fingerprint.clone());
+        let fingerprint_mismatch = match (
+            configured_fingerprint.as_deref(),
+            stored_fingerprint.as_deref(),
+        ) {
+            (Some(configured), Some(stored)) if configured != stored => Some(format!(
+                "overlay embedding fingerprint mismatch: local state is `{stored}`, current config is `{configured}`"
+            )),
+            _ => None,
+        };
+        let overlay_mismatch_reason = entry
+            .as_ref()
+            .and_then(|entry| entry.overlay_mismatch_reason.clone())
+            .or_else(|| fingerprint_mismatch.clone());
+        let coverage = {
+            let storage_root = overlay.storage_root.clone();
+            let local_index = self.inner.local_index.clone();
+            self.run_search_lexical_blocking("overlay_status_chunk_coverage", move || {
+                local_index.chunk_coverage(&storage_root)
+            })
+            .await
+            .ok()
+        };
+        let default_overlay_status = if snapshot.codebases.contains_key(&canonical_key) {
+            "not_indexed"
+        } else {
+            "canonical_missing"
+        };
+
+        Ok(match entry {
+            Some(entry) => RepoStatus {
+                repo: repo_key.clone(),
+                repo_label: repo_basename(&repo_key),
+                collection_name: overlay.chunk_collection.clone(),
+                status: entry.status,
+                indexed_files: coverage
+                    .as_ref()
+                    .map(|coverage| coverage.indexed_files)
+                    .or(entry.changed_files),
+                total_chunks: coverage.as_ref().map(|coverage| coverage.total_chunks),
+                index_status: entry.overlay_status.clone(),
+                indexing_percentage: None,
+                last_attempted_percentage: None,
+                error_message: entry.overlay_mismatch_reason.clone(),
+                embedding_profile: entry.embedding_profile.or(Some(profile_name)),
+                configured_embedding_fingerprint: configured_fingerprint,
+                stored_embedding_fingerprint: stored_fingerprint,
+                embedding_mismatch_reason: fingerprint_mismatch,
+                repo_type: Some("worktree_overlay".to_string()),
+                canonical_repo_label: Some(repo_basename(&canonical_key)),
+                overlay_status: entry.overlay_status,
+                changed_files: entry.changed_files,
+                deleted_files: entry.deleted_files,
+                overlay_bytes: entry.overlay_bytes,
+                overlay_mismatch_reason,
+            },
+            None => RepoStatus {
+                repo: repo_key.clone(),
+                repo_label: repo_basename(&repo_key),
+                collection_name: overlay.chunk_collection.clone(),
+                status: "not_indexed".to_string(),
+                indexed_files: None,
+                total_chunks: None,
+                index_status: Some(default_overlay_status.to_string()),
+                indexing_percentage: None,
+                last_attempted_percentage: None,
+                error_message: None,
+                embedding_profile: Some(profile_name),
+                configured_embedding_fingerprint: configured_fingerprint,
+                stored_embedding_fingerprint: None,
+                embedding_mismatch_reason: None,
+                repo_type: Some("worktree_overlay".to_string()),
+                canonical_repo_label: Some(repo_basename(&canonical_key)),
+                overlay_status: Some(default_overlay_status.to_string()),
+                changed_files: None,
+                deleted_files: None,
+                overlay_bytes: None,
+                overlay_mismatch_reason,
             },
         })
     }
@@ -4035,7 +5331,7 @@ impl Engine {
             });
             if pending_symbol_index_replacements.len() >= SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE {
                 self.flush_symbol_index_replacements(
-                    plan.repo,
+                    plan.storage_repo,
                     &mut pending_symbol_index_replacements,
                 )
                 .await?;
@@ -4067,6 +5363,7 @@ impl Engine {
                 if pending_chunks.len() >= EMBEDDING_BATCH_SIZE {
                     self.flush_chunks(
                         plan.repo,
+                        plan.storage_repo,
                         plan.profile_name,
                         plan.collections.chunk,
                         &mut pending_chunks,
@@ -4090,6 +5387,7 @@ impl Engine {
         if !pending_chunks.is_empty() {
             self.flush_chunks(
                 plan.repo,
+                plan.storage_repo,
                 plan.profile_name,
                 plan.collections.chunk,
                 &mut pending_chunks,
@@ -4105,8 +5403,11 @@ impl Engine {
             .await?;
         }
         if !pending_symbol_index_replacements.is_empty() {
-            self.flush_symbol_index_replacements(plan.repo, &mut pending_symbol_index_replacements)
-                .await?;
+            self.flush_symbol_index_replacements(
+                plan.storage_repo,
+                &mut pending_symbol_index_replacements,
+            )
+            .await?;
         }
 
         Ok(ProcessFilesResult {
@@ -4178,6 +5479,7 @@ impl Engine {
     async fn flush_chunks(
         &self,
         repo: &Path,
+        storage_repo: &Path,
         profile_name: &str,
         collection_name: &str,
         pending_chunks: &mut Vec<PendingChunk>,
@@ -4267,7 +5569,7 @@ impl Engine {
             .insert_documents(collection_name, &vector_documents)
             .await?;
 
-        let repo_path = repo.to_path_buf();
+        let repo_path = storage_repo.to_path_buf();
         let local_index = self.inner.local_index.clone();
         run_low_priority_blocking("write_chunk_lexical_docs", move || {
             local_index.index_chunks(&repo_path, &chunk_documents)
@@ -4351,11 +5653,117 @@ pub fn symbol_collection_name(repo: &Path) -> String {
     format!("hybrid_symbols_{digest:x}")
 }
 
-fn expected_vector_collections(repos: &[PathBuf]) -> HashSet<String> {
-    repos
+fn overlay_collection_name(overlay_id: &str) -> String {
+    format!("{OVERLAY_CHUNK_COLLECTION_PREFIX}{overlay_id}")
+}
+
+fn overlay_symbol_collection_name(overlay_id: &str) -> String {
+    format!("{OVERLAY_SYMBOL_COLLECTION_PREFIX}{overlay_id}")
+}
+
+fn overlay_storage_root(overlay_id: &str) -> PathBuf {
+    PathBuf::from(OVERLAY_STORAGE_ROOT_PREFIX).join(overlay_id)
+}
+
+fn overlay_repo_key(overlay_id: &str) -> String {
+    format!("overlay:{overlay_id}")
+}
+
+fn worktree_overlay_context_from_snapshot(
+    worktree_root: &Path,
+    entry: &WorktreeSnapshotEntry,
+) -> WorktreeOverlayContext {
+    WorktreeOverlayContext {
+        resolution: WorktreeResolution {
+            worktree_root: worktree_root.to_path_buf(),
+            canonical_root: PathBuf::from(&entry.canonical_root),
+            repo_identity: entry.repo_identity.clone(),
+            overlay_id: entry.overlay_id.clone(),
+        },
+        storage_root: overlay_storage_root(&entry.overlay_id),
+        repo_key: overlay_repo_key(&entry.overlay_id),
+        chunk_collection: overlay_collection_name(&entry.overlay_id),
+        symbol_collection: overlay_symbol_collection_name(&entry.overlay_id),
+    }
+}
+
+fn failed_overlay_state(
+    overlay: &WorktreeOverlayContext,
+    worktree_key: &str,
+    canonical_key: &str,
+    embedding_profile: Option<String>,
+    embedding_fingerprint: Option<String>,
+) -> OverlayIndexState {
+    OverlayIndexState {
+        canonical_root: canonical_key.to_string(),
+        worktree_root: worktree_key.to_string(),
+        repo_identity: overlay.resolution.repo_identity.clone(),
+        overlay_id: overlay.resolution.overlay_id.clone(),
+        replaced_paths: Vec::new(),
+        deleted_paths: Vec::new(),
+        indexed_hashes: Vec::new(),
+        changed_files: 0,
+        deleted_files: 0,
+        overlay_bytes: 0,
+        overlay_status: Some("failed".to_string()),
+        embedding_profile,
+        embedding_fingerprint,
+    }
+}
+
+fn overlay_suppressed_paths(state: &OverlayIndexState) -> BTreeSet<String> {
+    state
+        .replaced_paths
+        .iter()
+        .chain(state.deleted_paths.iter())
+        .cloned()
+        .collect()
+}
+
+fn overlay_state_suppresses_canonical(state: &OverlayIndexState) -> bool {
+    matches!(
+        state.overlay_status.as_deref(),
+        None | Some("completed") | Some("empty") | Some("too_large")
+    )
+}
+
+fn overlay_state_has_search_index(state: &OverlayIndexState) -> bool {
+    matches!(
+        state.overlay_status.as_deref(),
+        None | Some("completed") | Some("empty")
+    )
+}
+
+fn overlay_state_has_indexed_path(state: &OverlayIndexState, normalized_path: &str) -> bool {
+    overlay_state_has_search_index(state)
+        && state
+            .indexed_hashes
+            .iter()
+            .any(|(path, _)| path == normalized_path)
+}
+
+fn overlay_lookup_uses_overlay(state: &OverlayIndexState, normalized_path: &str) -> bool {
+    overlay_state_has_indexed_path(state, normalized_path)
+        || (overlay_state_suppresses_canonical(state)
+            && overlay_suppressed_paths(state).contains(normalized_path))
+}
+
+fn overlay_state_load_warning(error: &anyhow::Error) -> String {
+    format!("overlay state unavailable: {error}")
+}
+
+fn expected_vector_collections(repos: &[PathBuf], snapshot: &Snapshot) -> HashSet<String> {
+    let mut expected = repos
         .iter()
         .flat_map(|repo| [collection_name(repo), symbol_collection_name(repo)])
-        .collect()
+        .collect::<HashSet<_>>();
+    for worktree in snapshot.worktrees.values() {
+        if worktree.status == "indexed" || worktree.status == "indexing" {
+            expected.insert(overlay_collection_name(&worktree.overlay_id));
+            expected.insert(overlay_symbol_collection_name(&worktree.overlay_id));
+        }
+    }
+    expected
 }
 
 fn stale_vector_collections(existing: &[String], expected: &HashSet<String>) -> Vec<String> {
@@ -4370,6 +5778,8 @@ fn stale_vector_collections(existing: &[String], expected: &HashSet<String>) -> 
 fn is_agent_context_vector_collection(collection: &str) -> bool {
     collection.starts_with(CHUNK_COLLECTION_PREFIX)
         || collection.starts_with(SYMBOL_COLLECTION_PREFIX)
+        || collection.starts_with(OVERLAY_CHUNK_COLLECTION_PREFIX)
+        || collection.starts_with(OVERLAY_SYMBOL_COLLECTION_PREFIX)
 }
 
 fn vector_release_needed(full_reindex: bool, changes: &RepoChangeSummary) -> bool {
@@ -4532,15 +5942,32 @@ pub fn render_status_text(result: &StatusReport) -> String {
                     .map(|progress| format!(" last_attempted={progress:.1}%"))
             })
             .unwrap_or_default();
+        let overlay_suffix = if repo.repo_type.as_deref() == Some("worktree_overlay") {
+            format!(
+                " repo_type=worktree_overlay canonical={} overlay_status={} changed={} deleted={} overlay_bytes={}{}",
+                repo.canonical_repo_label.as_deref().unwrap_or("unknown"),
+                repo.overlay_status.as_deref().unwrap_or("unknown"),
+                repo.changed_files.unwrap_or(0),
+                repo.deleted_files.unwrap_or(0),
+                repo.overlay_bytes.unwrap_or(0),
+                repo.overlay_mismatch_reason
+                    .as_ref()
+                    .map(|reason| format!(" overlay_reason={reason}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "{} status={} index_status={} files={} chunks={}{}{}",
+            "{} status={} index_status={} files={} chunks={}{}{}{}",
             repo.repo,
             repo.status,
             repo.index_status.as_deref().unwrap_or("unknown"),
             repo.indexed_files.unwrap_or(0),
             repo.total_chunks.unwrap_or(0),
             progress_suffix,
-            error_suffix
+            error_suffix,
+            overlay_suffix
         ));
     }
 
@@ -5422,12 +6849,14 @@ fn scan_repo(
         let Some(hash) = hash_text_like_file(&absolute_path)? else {
             continue;
         };
+        let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
         files.insert(
             relative_path.clone(),
             RepoFile {
                 absolute_path,
                 hash,
+                bytes,
             },
         );
     }
@@ -5447,6 +6876,68 @@ fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
 
 fn text_search_has_bounded_target(scope: &ResolvedScope, request: &TextSearchScopeRequest) -> bool {
     request.file.is_some() || request.path_prefix.is_some() || scope.repos.len() == 1
+}
+
+fn text_search_chunk_request(request: &TextSearchScopeRequest) -> ChunkSearchRequest {
+    ChunkSearchRequest {
+        query: request.query.clone(),
+        limit: SEARCH_TEXT_SHORTLIST_LIMIT,
+        flavor: query_flavor(classify_query(&request.query)),
+        path_prefix: request.path_prefix.clone(),
+        language: request.language.clone(),
+        file: None,
+        extension_filter: request.extension_filter.clone(),
+    }
+}
+
+fn dedup_relative_paths(mut files: Vec<String>) -> Vec<String> {
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn merge_text_candidate_files(
+    canonical_files: Vec<String>,
+    overlay_files: Vec<String>,
+    suppressed_paths: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut files = canonical_files
+        .into_iter()
+        .filter(|path| !suppressed_paths.contains(path))
+        .collect::<Vec<_>>();
+    files.extend(overlay_files);
+    dedup_relative_paths(files)
+}
+
+fn validate_search_text_fallback_size(
+    request: &TextSearchScopeRequest,
+    file_count: usize,
+) -> Result<()> {
+    if request.path_prefix.is_some() && file_count > SEARCH_TEXT_FALLBACK_MAX_FILES {
+        bail!(
+            "search_text pathPrefix matched {file_count} files; narrow `file` or `pathPrefix` before retrying"
+        );
+    }
+    Ok(())
+}
+
+fn apply_query_embedding_failure(
+    profile_name: &str,
+    usage: &QueryProfileUsage,
+    message: &str,
+    blocked_repos: &mut HashMap<String, String>,
+    overlay_query_errors: &mut HashMap<String, String>,
+) {
+    for repo in &usage.canonical_repos {
+        blocked_repos.insert(repo.clone(), message.to_string());
+    }
+    let overlay_message =
+        format!("overlay semantic search unavailable for profile `{profile_name}`: {message}");
+    for repo in &usage.overlay_repos {
+        if !blocked_repos.contains_key(repo) {
+            overlay_query_errors.insert(repo.clone(), overlay_message.clone());
+        }
+    }
 }
 
 fn search_text_scans_live_repo(request: &TextSearchScopeRequest) -> bool {
@@ -6115,22 +7606,27 @@ mod tests {
     use super::{
         CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, IndexCompletionStatus,
         IndexCoverage, IndexExecutionMode, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot,
-        SearchBudgets, SearchMode, SearchRequest, TextMatch, TextSearchScopeRequest,
-        bounded_window, build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
+        OverlayIndexState, QueryProfileUsage, SearchBudgets, SearchMode, SearchRequest, TextMatch,
+        TextSearchScopeRequest, apply_query_embedding_failure, bounded_window,
+        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
         collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
-        hash_text_like_file, index_identity_status_for_snapshot, index_status_for_coverage,
-        is_agent_context_vector_collection, live_file_exists, narrowest_covering_symbol,
-        plan_search, ready_target_reason, removed_repo_index_result, run_low_priority_blocking,
-        scan_repo, search_text_scans_live_repo, select_edit_anchors, select_text_match,
+        failed_overlay_state, hash_text_like_file, index_identity_status_for_snapshot,
+        index_status_for_coverage, is_agent_context_vector_collection, live_file_exists,
+        merge_text_candidate_files, narrowest_covering_symbol, overlay_lookup_uses_overlay,
+        overlay_state_has_indexed_path, overlay_state_has_search_index, overlay_state_load_warning,
+        overlay_state_suppresses_canonical, plan_search, ready_target_reason,
+        removed_repo_index_result, run_low_priority_blocking, scan_repo,
+        search_text_scans_live_repo, select_edit_anchors, select_text_match,
         stale_vector_collections, symbol_collection_name, symbol_fits_ready_window,
-        text_search_has_bounded_target, validate_absolute_repo_path, vector_flush_needed,
-        vector_release_needed,
+        text_search_has_bounded_target, validate_absolute_repo_path,
+        validate_search_text_fallback_size, vector_flush_needed, vector_release_needed,
+        worktree_overlay_context_from_snapshot,
     };
     use crate::config::{ResolvedScope, ScopeKind, SearchConfig};
     use crate::engine::live_files::LiveFileStore;
     use crate::engine::symbols::IndexedSymbol;
-    use crate::snapshot::Snapshot;
-    use std::collections::BTreeMap;
+    use crate::snapshot::{Snapshot, WorktreeSnapshotEntry};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -6384,6 +7880,91 @@ mod tests {
     }
 
     #[test]
+    fn text_search_candidate_merge_uses_overlay_and_suppresses_replaced_paths() {
+        let suppressed_paths = BTreeSet::from(["src/changed.rs".to_string()]);
+        let merged = merge_text_candidate_files(
+            vec!["src/changed.rs".to_string(), "src/unchanged.rs".to_string()],
+            vec!["src/changed.rs".to_string(), "src/new.rs".to_string()],
+            &suppressed_paths,
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "src/changed.rs".to_string(),
+                "src/new.rs".to_string(),
+                "src/unchanged.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_search_fallback_errors_when_path_prefix_is_too_broad() {
+        let request = TextSearchScopeRequest {
+            repo: None,
+            query: "needle".to_string(),
+            limit: 10,
+            path_prefix: Some("src".to_string()),
+            language: None,
+            file: None,
+            extension_filter: Vec::new(),
+            case_sensitive: true,
+            whole_word: false,
+            context_lines: 1,
+        };
+
+        let error =
+            validate_search_text_fallback_size(&request, super::SEARCH_TEXT_FALLBACK_MAX_FILES + 1)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("pathPrefix matched"));
+        assert!(validate_search_text_fallback_size(&request, 1).is_ok());
+    }
+
+    #[test]
+    fn query_embedding_failure_blocks_canonical_but_only_partials_overlay() {
+        let mut usage = QueryProfileUsage::default();
+        usage.canonical_repos.insert("/tmp/canonical".to_string());
+        usage.overlay_repos.insert("/tmp/overlay".to_string());
+        let mut blocked_repos = HashMap::new();
+        let mut overlay_errors = HashMap::new();
+
+        apply_query_embedding_failure(
+            "local",
+            &usage,
+            "provider unavailable",
+            &mut blocked_repos,
+            &mut overlay_errors,
+        );
+
+        assert_eq!(
+            blocked_repos.get("/tmp/canonical").map(String::as_str),
+            Some("provider unavailable")
+        );
+        assert!(overlay_errors["/tmp/overlay"].contains("overlay semantic search unavailable"));
+    }
+
+    #[test]
+    fn query_embedding_failure_does_not_add_overlay_partial_for_blocked_repo() {
+        let mut usage = QueryProfileUsage::default();
+        usage.canonical_repos.insert("/tmp/repo".to_string());
+        usage.overlay_repos.insert("/tmp/repo".to_string());
+        let mut blocked_repos = HashMap::new();
+        let mut overlay_errors = HashMap::new();
+
+        apply_query_embedding_failure(
+            "shared",
+            &usage,
+            "provider unavailable",
+            &mut blocked_repos,
+            &mut overlay_errors,
+        );
+
+        assert!(blocked_repos.contains_key("/tmp/repo"));
+        assert!(!overlay_errors.contains_key("/tmp/repo"));
+    }
+
+    #[test]
     fn explicit_refresh_uses_parallel_file_preparation() {
         assert_eq!(IndexExecutionMode::Standard.file_prepare_parallelism(), 1);
         assert!(IndexExecutionMode::ExplicitRefresh.file_prepare_parallelism() >= 2);
@@ -6449,7 +8030,7 @@ mod tests {
     #[test]
     fn vector_collection_helpers_identify_expected_and_stale_collections() {
         let repos = vec![PathBuf::from("/tmp/example"), PathBuf::from("/tmp/another")];
-        let expected = expected_vector_collections(&repos);
+        let expected = expected_vector_collections(&repos, &Snapshot::default());
         assert!(expected.contains(&collection_name(Path::new("/tmp/example"))));
         assert!(expected.contains(&symbol_collection_name(Path::new("/tmp/example"))));
 
@@ -6523,6 +8104,120 @@ mod tests {
         assert!(result.indexed_files.is_none());
         assert!(result.total_chunks.is_none());
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn deleted_worktree_overlay_context_can_be_rebuilt_from_snapshot_entry() {
+        let entry = WorktreeSnapshotEntry::indexed(
+            "/tmp/canonical",
+            "common-dir",
+            "overlay123",
+            "completed",
+            2,
+            1,
+            128,
+            Some("local".to_string()),
+            Some("local:model:1024".to_string()),
+        );
+        let overlay =
+            worktree_overlay_context_from_snapshot(Path::new("/tmp/missing-worktree"), &entry);
+
+        assert_eq!(
+            overlay.resolution.worktree_root,
+            PathBuf::from("/tmp/missing-worktree")
+        );
+        assert_eq!(
+            overlay.resolution.canonical_root,
+            PathBuf::from("/tmp/canonical")
+        );
+        assert_eq!(overlay.resolution.repo_identity, "common-dir");
+        assert_eq!(overlay.resolution.overlay_id, "overlay123");
+        assert_eq!(overlay.repo_key, "overlay:overlay123");
+        assert_eq!(
+            overlay.storage_root,
+            PathBuf::from(super::OVERLAY_STORAGE_ROOT_PREFIX).join("overlay123")
+        );
+        assert!(overlay.chunk_collection.contains("overlay123"));
+        assert!(overlay.symbol_collection.contains("overlay123"));
+    }
+
+    #[test]
+    fn overlay_lookup_gates_stale_and_too_large_state() {
+        let completed = OverlayIndexState {
+            overlay_status: Some("completed".to_string()),
+            indexed_hashes: vec![("src/changed.rs".to_string(), "hash".to_string())],
+            ..OverlayIndexState::default()
+        };
+        assert!(overlay_state_has_indexed_path(&completed, "src/changed.rs"));
+        assert!(overlay_lookup_uses_overlay(&completed, "src/changed.rs"));
+
+        let stale = OverlayIndexState {
+            overlay_status: Some("stale".to_string()),
+            indexed_hashes: vec![("src/changed.rs".to_string(), "hash".to_string())],
+            replaced_paths: vec!["src/changed.rs".to_string()],
+            ..OverlayIndexState::default()
+        };
+        assert!(!overlay_state_has_indexed_path(&stale, "src/changed.rs"));
+        assert!(!overlay_lookup_uses_overlay(&stale, "src/changed.rs"));
+
+        let too_large = OverlayIndexState {
+            overlay_status: Some("too_large".to_string()),
+            replaced_paths: vec!["src/changed.rs".to_string()],
+            ..OverlayIndexState::default()
+        };
+        assert!(!overlay_state_has_indexed_path(
+            &too_large,
+            "src/changed.rs"
+        ));
+        assert!(overlay_lookup_uses_overlay(&too_large, "src/changed.rs"));
+    }
+
+    #[test]
+    fn failed_overlay_state_does_not_search_or_suppress_canonical() {
+        let entry = WorktreeSnapshotEntry::indexed(
+            "/tmp/canonical",
+            "common-dir",
+            "overlay123",
+            "completed",
+            2,
+            1,
+            128,
+            Some("local".to_string()),
+            Some("local:model:1024".to_string()),
+        );
+        let overlay = worktree_overlay_context_from_snapshot(Path::new("/tmp/worktree"), &entry);
+        let failed = failed_overlay_state(
+            &overlay,
+            "/tmp/worktree",
+            "/tmp/canonical",
+            Some("local".to_string()),
+            Some("local:model:1024".to_string()),
+        );
+
+        assert_eq!(failed.overlay_status.as_deref(), Some("failed"));
+        assert!(!overlay_state_has_search_index(&failed));
+        assert!(!overlay_state_suppresses_canonical(&failed));
+        assert!(!overlay_lookup_uses_overlay(&failed, "src/changed.rs"));
+    }
+
+    #[test]
+    fn text_candidate_merge_keeps_canonical_when_overlay_unavailable() {
+        let merged = merge_text_candidate_files(
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            Vec::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(merged, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn overlay_state_load_warning_is_repo_scoped_and_actionable() {
+        let error = anyhow::anyhow!("parsing overlay state /tmp/state.json");
+        let warning = overlay_state_load_warning(&error);
+
+        assert!(warning.contains("overlay state unavailable"));
+        assert!(warning.contains("parsing overlay state"));
     }
 
     #[test]

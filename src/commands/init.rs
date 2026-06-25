@@ -145,6 +145,15 @@ model = "{}"
 # repo = "/absolute/path/to/local-repo"
 # profile = "local"
 
+[worktrees]
+mode = "overlay"
+auto_discover = true
+max_overlay_files = 500
+max_overlay_bytes = "25MB"
+# Use "inherit" to match the canonical repo profile, or set a named
+# profile such as "local" to force cheaper worktree overlay embeddings.
+embedding_profile = "inherit"
+
 [milvus]
 address = "127.0.0.1:19530"
 # token_env = "MILVUS_TOKEN"

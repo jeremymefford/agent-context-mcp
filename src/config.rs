@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 const DEFAULT_CONFIG_PATH: &str = "~/Library/Application Support/agent-context/config.toml";
 const LEGACY_CONFIG_PATH: &str = "~/.config/agent-context/config.toml";
@@ -18,6 +19,10 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MILVUS_DATABASE: &str = "";
 const DEFAULT_EMBEDDING_PROFILE: &str = "default";
+const DEFAULT_WORKTREE_MODE: WorktreeMode = WorktreeMode::Overlay;
+const DEFAULT_WORKTREE_MAX_OVERLAY_FILES: usize = 500;
+const DEFAULT_WORKTREE_MAX_OVERLAY_BYTES: u64 = 25 * 1024 * 1024;
+const WORKTREE_EMBEDDING_INHERIT: &str = "inherit";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -31,6 +36,8 @@ pub struct Config {
     pub groups: Vec<GroupConfig>,
     pub freshness: FreshnessConfig,
     pub search: SearchConfig,
+    pub worktrees: WorktreeConfig,
+    pub(crate) worktree_canonicals: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +68,42 @@ pub struct EmbeddingProfileConfig {
 pub struct EmbeddingAssignment {
     pub repo: String,
     pub profile: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeMode {
+    Ignore,
+    Overlay,
+    Full,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeConfig {
+    pub mode: WorktreeMode,
+    pub auto_discover: bool,
+    pub max_overlay_files: usize,
+    pub max_overlay_bytes: u64,
+    pub embedding_profile: String,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_WORKTREE_MODE,
+            auto_discover: true,
+            max_overlay_files: DEFAULT_WORKTREE_MAX_OVERLAY_FILES,
+            max_overlay_bytes: DEFAULT_WORKTREE_MAX_OVERLAY_BYTES,
+            embedding_profile: WORKTREE_EMBEDDING_INHERIT.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeResolution {
+    pub worktree_root: PathBuf,
+    pub canonical_root: PathBuf,
+    pub repo_identity: String,
+    pub overlay_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +203,8 @@ struct RawConfig {
     #[serde(default)]
     search: Option<SearchConfig>,
     #[serde(default)]
+    worktrees: Option<RawWorktreeConfig>,
+    #[serde(default)]
     snapshot_path: Option<String>,
     #[serde(default)]
     index_root: Option<String>,
@@ -203,6 +248,20 @@ struct RawEmbeddingConfig {
     openai: Option<RawOpenAiProviderConfig>,
     #[serde(default)]
     ollama: Option<RawOllamaProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawWorktreeConfig {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    auto_discover: Option<bool>,
+    #[serde(default)]
+    max_overlay_files: Option<usize>,
+    #[serde(default)]
+    max_overlay_bytes: Option<String>,
+    #[serde(default)]
+    embedding_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -418,6 +477,12 @@ impl Config {
         }
 
         let embedding = build_embedding_config(&raw, config_dir, &groups)?;
+        let worktrees = build_worktree_config(raw.worktrees.as_ref(), &embedding)?;
+        let worktree_canonicals = if worktrees.mode == WorktreeMode::Overlay {
+            build_worktree_canonical_map(&groups)?
+        } else {
+            BTreeMap::new()
+        };
 
         Ok(Self {
             config_path: config_path.to_path_buf(),
@@ -430,6 +495,8 @@ impl Config {
             groups: std::mem::take(&mut groups),
             freshness,
             search,
+            worktrees,
+            worktree_canonicals,
         })
     }
 
@@ -484,9 +551,9 @@ impl Config {
         let raw = scope.or(path_alias).unwrap_or(&self.default_group);
         if raw.starts_with('/') || raw.starts_with('~') {
             let repo = normalize_absolute_path(raw)?;
-            if require_configured_repo && !self.is_configured_repo(&repo)? {
+            if require_configured_repo && !self.is_configured_repo_or_worktree(&repo)? {
                 bail!(
-                    "repo scope `{raw}` is not configured; MCP only allows configured repo roots or group ids"
+                    "repo scope `{raw}` is not configured; MCP only allows configured repo roots, worktrees, or group ids"
                 );
             }
             return Ok(ResolvedScope {
@@ -529,6 +596,36 @@ impl Config {
             .all_repos()?
             .iter()
             .any(|configured| configured == repo))
+    }
+
+    pub fn worktree_resolution(&self, repo: &Path) -> Result<Option<WorktreeResolution>> {
+        if self.worktrees.mode != WorktreeMode::Overlay {
+            return Ok(None);
+        }
+        let repo = clean_path(repo);
+        if !self.worktrees.auto_discover && !self.is_configured_repo(&repo)? {
+            return Ok(None);
+        }
+        let Some(identity) = git_repo_identity(&repo)? else {
+            return Ok(None);
+        };
+        let Some(canonical_root) = self.worktree_canonicals.get(&identity.common_git_dir) else {
+            return Ok(None);
+        };
+        if clean_path(canonical_root) == repo {
+            return Ok(None);
+        }
+        let overlay_id = overlay_id(&identity.common_git_dir, &repo.display().to_string());
+        Ok(Some(WorktreeResolution {
+            worktree_root: repo,
+            canonical_root: canonical_root.clone(),
+            repo_identity: identity.common_git_dir,
+            overlay_id,
+        }))
+    }
+
+    pub fn is_configured_repo_or_worktree(&self, repo: &Path) -> Result<bool> {
+        Ok(self.is_configured_repo(repo)? || self.worktree_resolution(repo)?.is_some())
     }
 }
 
@@ -943,6 +1040,189 @@ fn validate_search_config(search: &SearchConfig) -> Result<()> {
     Ok(())
 }
 
+fn build_worktree_config(
+    raw: Option<&RawWorktreeConfig>,
+    embedding: &EmbeddingConfig,
+) -> Result<WorktreeConfig> {
+    let mut config = WorktreeConfig::default();
+    if let Some(raw) = raw {
+        if let Some(mode) = raw.mode.as_deref() {
+            config.mode = parse_worktree_mode(mode)?;
+        }
+        if let Some(auto_discover) = raw.auto_discover {
+            config.auto_discover = auto_discover;
+        }
+        if let Some(max_overlay_files) = raw.max_overlay_files {
+            if max_overlay_files == 0 {
+                bail!("worktrees.max_overlay_files must be greater than 0");
+            }
+            config.max_overlay_files = max_overlay_files;
+        }
+        if let Some(max_overlay_bytes) = raw.max_overlay_bytes.as_deref() {
+            config.max_overlay_bytes = parse_byte_size(max_overlay_bytes)
+                .context("parsing worktrees.max_overlay_bytes")?;
+            if config.max_overlay_bytes == 0 {
+                bail!("worktrees.max_overlay_bytes must be greater than 0");
+            }
+        }
+        if let Some(profile) = raw.embedding_profile.as_deref() {
+            let profile = profile.trim();
+            if profile.is_empty() {
+                bail!("worktrees.embedding_profile must not be empty");
+            }
+            config.embedding_profile = profile.to_string();
+        }
+    }
+
+    if config.embedding_profile != WORKTREE_EMBEDDING_INHERIT
+        && !embedding.profiles.contains_key(&config.embedding_profile)
+    {
+        bail!(
+            "worktrees.embedding_profile `{}` does not match any configured embedding profile",
+            config.embedding_profile
+        );
+    }
+
+    Ok(config)
+}
+
+fn parse_worktree_mode(value: &str) -> Result<WorktreeMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ignore" => Ok(WorktreeMode::Ignore),
+        "overlay" => Ok(WorktreeMode::Overlay),
+        "full" => Ok(WorktreeMode::Full),
+        other => bail!("unsupported worktrees.mode `{other}`; expected ignore, overlay, or full"),
+    }
+}
+
+fn parse_byte_size(value: &str) -> Result<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("byte size must not be empty");
+    }
+    let split_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split_at);
+    if digits.is_empty() {
+        bail!("byte size `{value}` is missing a numeric prefix");
+    }
+    let amount = digits
+        .parse::<u64>()
+        .with_context(|| format!("invalid byte size `{value}`"))?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" | "kib" => 1024,
+        "mb" | "mib" => 1024 * 1024,
+        "gb" | "gib" => 1024 * 1024 * 1024,
+        other => bail!("unsupported byte size unit `{other}` in `{value}`"),
+    };
+    amount
+        .checked_mul(multiplier)
+        .with_context(|| format!("byte size `{value}` overflows u64"))
+}
+
+#[derive(Debug, Clone)]
+struct GitRepoIdentity {
+    common_git_dir: String,
+    root: PathBuf,
+    main_worktree: bool,
+}
+
+fn build_worktree_canonical_map(groups: &[GroupConfig]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut by_identity: BTreeMap<String, Vec<GitRepoIdentity>> = BTreeMap::new();
+    for repo in groups.iter().flat_map(|group| group.repos.iter()) {
+        let repo = normalize_path(repo)?;
+        let Some(identity) = git_repo_identity(&repo)? else {
+            continue;
+        };
+        let identities = by_identity
+            .entry(identity.common_git_dir.clone())
+            .or_default();
+        if !identities
+            .iter()
+            .any(|existing| clean_path(&existing.root) == clean_path(&identity.root))
+        {
+            identities.push(identity);
+        }
+    }
+
+    let mut canonicals = BTreeMap::new();
+    for (common_git_dir, identities) in by_identity {
+        let candidates = identities
+            .iter()
+            .filter(|identity| identity.main_worktree)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            let repos = identities
+                .iter()
+                .map(|identity| identity.root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "configured worktrees for git common dir `{common_git_dir}` need exactly one main/canonical checkout in overlay mode; configure the canonical checkout or set worktrees.mode = \"full\": {repos}"
+            );
+        }
+        canonicals.insert(common_git_dir, candidates[0].root.clone());
+    }
+
+    Ok(canonicals)
+}
+
+fn git_repo_identity(path: &Path) -> Result<Option<GitRepoIdentity>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Some(root) = run_git_path(path, &["rev-parse", "--show-toplevel"])? else {
+        return Ok(None);
+    };
+    let Some(common_git_dir) = run_git_text(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?
+    else {
+        return Ok(None);
+    };
+    let root = clean_path(&root);
+    let common_git_dir = clean_path(Path::new(common_git_dir.trim()))
+        .display()
+        .to_string();
+    let main_worktree = root.join(".git").is_dir();
+    Ok(Some(GitRepoIdentity {
+        common_git_dir,
+        root,
+        main_worktree,
+    }))
+}
+
+fn run_git_path(path: &Path, args: &[&str]) -> Result<Option<PathBuf>> {
+    Ok(run_git_text(path, args)?.map(|value| clean_path(Path::new(value.trim()))))
+}
+
+fn run_git_text(path: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = Command::new("git").arg("-C").arg(path).args(args).output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("running git"),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8(output.stdout).context("decoding git output")?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn overlay_id(repo_identity: &str, worktree_root: &str) -> String {
+    let digest = md5::compute(format!("{repo_identity}:{worktree_root}"));
+    format!("{digest:x}").chars().take(16).collect()
+}
+
 fn default_max_concurrent_requests() -> usize {
     2
 }
@@ -1104,7 +1384,7 @@ fn validate_groups(groups: &[GroupConfig]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, EmbeddingProvider, normalize_absolute_path};
+    use super::{Config, EmbeddingProvider, WorktreeMode, normalize_absolute_path};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1235,6 +1515,10 @@ mod tests {
             .unwrap();
         assert_eq!(profile.provider, EmbeddingProvider::Ollama);
         assert_eq!(profile.ollama.base_url, "http://localhost:11434");
+        assert_eq!(config.worktrees.mode, WorktreeMode::Overlay);
+        assert_eq!(config.worktrees.max_overlay_files, 500);
+        assert_eq!(config.worktrees.max_overlay_bytes, 25 * 1024 * 1024);
+        assert_eq!(config.worktrees.embedding_profile, "inherit");
     }
 
     #[test]
@@ -1290,6 +1574,79 @@ mod tests {
             config.embedding.profile("local").unwrap().ollama.base_url,
             "http://127.0.0.1:11435"
         );
+    }
+
+    #[test]
+    fn parses_worktree_overlay_config() {
+        let dir = temp_dir("worktrees");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+                model = "voyage-code-3"
+
+                [embedding.profiles.local]
+                provider = "ollama"
+                model = "qwen3-embedding"
+
+                [embedding.profiles.local.ollama]
+                base_url = "http://localhost:11434"
+
+                [worktrees]
+                mode = "overlay"
+                auto_discover = false
+                max_overlay_files = 42
+                max_overlay_bytes = "7MB"
+                embedding_profile = "local"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert_eq!(config.worktrees.mode, WorktreeMode::Overlay);
+        assert!(!config.worktrees.auto_discover);
+        assert_eq!(config.worktrees.max_overlay_files, 42);
+        assert_eq!(config.worktrees.max_overlay_bytes, 7 * 1024 * 1024);
+        assert_eq!(config.worktrees.embedding_profile, "local");
+    }
+
+    #[test]
+    fn rejects_unknown_worktree_embedding_profile() {
+        let dir = temp_dir("bad-worktree-profile");
+        let config_path = write_config(
+            &dir,
+            r#"
+                [embedding]
+                default_profile = "hosted"
+
+                [embedding.profiles.hosted]
+                provider = "voyage"
+                model = "voyage-code-3"
+
+                [worktrees]
+                embedding_profile = "missing"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/a"]
+            "#,
+        );
+
+        let error = Config::load_from_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("worktrees.embedding_profile"));
     }
 
     #[test]

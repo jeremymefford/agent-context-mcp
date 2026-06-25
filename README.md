@@ -460,6 +460,13 @@ base_url = "http://127.0.0.1:1234/v1"
 repo = "/absolute/path/to/local-repo"
 profile = "local"
 
+[worktrees]
+mode = "overlay"
+auto_discover = true
+max_overlay_files = 500
+max_overlay_bytes = "25MB"
+embedding_profile = "inherit"
+
 [milvus]
 address = "127.0.0.1:19530"
 
@@ -494,6 +501,18 @@ api_key_env = "VOYAGE_API_KEY"
 ```
 
 See the full template in [config.example.toml](config.example.toml).
+
+### Git Worktrees
+
+Worktrees default to cost-safe overlay mode. In overlay mode, a worktree that shares a Git common directory with a configured repo reuses the canonical repo’s full index and indexes only files that are new or changed in the worktree.
+
+- `mode = "overlay"` resolves worktree paths to the canonical repo plus a small overlay.
+- `mode = "ignore"` treats worktrees as unconfigured unless you list them explicitly as repos.
+- `mode = "full"` preserves separate full indexing for configured worktree paths.
+- `embedding_profile = "inherit"` uses the canonical repo’s embedding profile for overlay files. Set this to a named local profile, such as `ollama`, when you want cheaper worktree overlay embeddings.
+- `max_overlay_files` and `max_overlay_bytes` refuse unexpectedly large overlays. Over-cap overlays keep canonical search available and suppress stale canonical hits for changed/deleted paths when that tombstone data is available.
+
+`agent-context refresh-one <canonical-repo>` refreshes the canonical index. `agent-context refresh-one <worktree-path>` refreshes only that worktree overlay and never performs an automatic full worktree scan. Status output may show compact worktree fields such as `repoType`, `canonicalRepoLabel`, `overlayStatus`, `changedFiles`, `deletedFiles`, `overlayBytes`, and `overlayMismatchReason`; normal search responses stay compact and do not include overlay internals.
 
 ## Under The Hood
 

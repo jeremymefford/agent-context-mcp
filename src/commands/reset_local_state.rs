@@ -108,7 +108,7 @@ mod tests {
     use crate::config::{
         Config, EmbeddingConfig, EmbeddingProfileConfig, EmbeddingProvider, FreshnessConfig,
         GroupConfig, MilvusConfig, OllamaProviderConfig, OpenAiProviderConfig, SearchConfig,
-        VoyageProviderConfig,
+        VoyageProviderConfig, WorktreeConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -151,6 +151,8 @@ mod tests {
             }],
             freshness: FreshnessConfig::default(),
             search: SearchConfig::default(),
+            worktrees: WorktreeConfig::default(),
+            worktree_canonicals: BTreeMap::new(),
         }
     }
 
