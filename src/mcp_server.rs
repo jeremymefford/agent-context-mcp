@@ -15,6 +15,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use futures::FutureExt;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
@@ -31,15 +32,21 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+
+const INDEX_WORKER_STALE_AFTER: Duration = Duration::from_secs(300);
+const INDEX_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 struct NativeServer {
@@ -50,8 +57,143 @@ struct NativeServer {
 #[derive(Default)]
 struct IndexCoordinatorState {
     pending: BTreeMap<String, PendingIndexRequest>,
-    running: HashSet<String>,
-    worker_active: bool,
+    running: BTreeMap<String, u64>,
+    recovering: BTreeSet<String>,
+    worker: Option<IndexWorkerState>,
+    next_worker_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct IndexWorkerState {
+    generation: u64,
+    started_at: Instant,
+    last_heartbeat: Instant,
+}
+
+struct WorkerRecovery {
+    running_repos: Vec<String>,
+    age_secs: u64,
+    failure_recorded: bool,
+}
+
+impl IndexCoordinatorState {
+    fn live_worker_generation(&self, now: Instant) -> Option<u64> {
+        self.worker
+            .filter(|worker| now.duration_since(worker.last_heartbeat) <= INDEX_WORKER_STALE_AFTER)
+            .map(|worker| worker.generation)
+    }
+
+    fn begin_stale_worker_recovery(&mut self, now: Instant) -> Option<WorkerRecovery> {
+        let Some(worker) = self.worker else {
+            return None;
+        };
+        if now.duration_since(worker.last_heartbeat) <= INDEX_WORKER_STALE_AFTER {
+            return None;
+        }
+        let age_secs = now.duration_since(worker.started_at).as_secs();
+        self.worker = None;
+        let running_repos = std::mem::take(&mut self.running)
+            .into_keys()
+            .collect::<Vec<_>>();
+        self.recovering.extend(running_repos.iter().cloned());
+        Some(WorkerRecovery {
+            running_repos,
+            age_secs,
+            failure_recorded: false,
+        })
+    }
+
+    fn recovering_repos(&self) -> Vec<String> {
+        self.recovering.iter().cloned().collect()
+    }
+
+    fn begin_worker_abort_recovery(&mut self, generation: u64) -> Option<Vec<String>> {
+        if self.worker.map(|worker| worker.generation) != Some(generation) {
+            return None;
+        }
+        let running_repos = std::mem::take(&mut self.running)
+            .into_keys()
+            .collect::<Vec<_>>();
+        self.recovering.extend(running_repos.iter().cloned());
+        self.finish_worker(generation);
+        Some(running_repos)
+    }
+
+    fn finish_recovery(&mut self, repos: &[String]) {
+        for repo in repos {
+            self.recovering.remove(repo);
+        }
+    }
+
+    fn ready_pending_exists(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|(repo, request)| request.snapshot_queued && !self.recovering.contains(repo))
+    }
+
+    fn unqueued_ready_pending_repos(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .filter(|(repo, request)| !request.snapshot_queued && !self.recovering.contains(*repo))
+            .map(|(repo, _)| repo.clone())
+            .collect()
+    }
+
+    fn mark_pending_snapshot_queued(&mut self, repos: &[String]) {
+        for repo in repos {
+            if let Some(request) = self.pending.get_mut(repo) {
+                request.snapshot_queued = true;
+            }
+        }
+    }
+
+    fn remove_unqueued_pending(&mut self, repos: &[String]) {
+        for repo in repos {
+            if self
+                .pending
+                .get(repo)
+                .is_some_and(|request| !request.snapshot_queued)
+            {
+                self.pending.remove(repo);
+            }
+        }
+    }
+
+    fn ensure_live_worker_for_pending(&mut self, now: Instant) -> Option<u64> {
+        if !self.ready_pending_exists() || self.live_worker_generation(now).is_some() {
+            return None;
+        }
+        Some(self.start_worker(now))
+    }
+
+    fn start_worker(&mut self, now: Instant) -> u64 {
+        self.next_worker_generation = self.next_worker_generation.saturating_add(1);
+        let generation = self.next_worker_generation;
+        self.worker = Some(IndexWorkerState {
+            generation,
+            started_at: now,
+            last_heartbeat: now,
+        });
+        generation
+    }
+
+    fn heartbeat_worker(&mut self, generation: u64, now: Instant) -> bool {
+        if let Some(worker) = self.worker.as_mut()
+            && worker.generation == generation
+        {
+            worker.last_heartbeat = now;
+            return true;
+        }
+        false
+    }
+
+    fn finish_worker(&mut self, generation: u64) -> bool {
+        if self.worker.map(|worker| worker.generation) == Some(generation) {
+            self.worker = None;
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -62,6 +204,7 @@ struct PendingIndexRequest {
     splitter: SplitterKind,
     custom_extensions: Vec<String>,
     ignore_patterns: Vec<String>,
+    snapshot_queued: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -438,9 +581,14 @@ pub async fn serve(
 ) -> Result<()> {
     enforce_loopback_bind(listen, allow_remote_unauthenticated)?;
     let engine = Engine::new(config).await?;
-    engine
+    let interrupted_indexes = engine
         .mark_interrupted_indexing_failed("agent-context restarted while indexing was in progress")
         .await?;
+    if interrupted_indexes > 0 {
+        eprintln!(
+            "[warn] marked {interrupted_indexes} interrupted background index(es) failed during startup recovery"
+        );
+    }
     let server = NativeServer {
         engine,
         index_coordinator: Arc::new(Mutex::new(IndexCoordinatorState::default())),
@@ -1005,14 +1153,17 @@ impl NativeServer {
         custom_extensions: Vec<String>,
         ignore_patterns: Vec<String>,
     ) -> Result<IndexLaunchResult> {
+        let mut released_recovery_repos = self.finish_incomplete_recovery_if_possible().await;
+        let recovery = self.begin_stale_worker_recovery().await;
         let mut coordinator = self.index_coordinator.lock().await;
         let mut queued_repos = Vec::new();
         let mut merged_repos = Vec::new();
         let mut already_running = Vec::new();
+        let mut repos_to_mark_queued = Vec::new();
 
         for repo in &scope.repos {
             let repo_key = repo.display().to_string();
-            if coordinator.running.contains(&repo_key) {
+            if coordinator.running.contains_key(&repo_key) {
                 already_running.push(repo_key);
             } else if let Some(existing) = coordinator.pending.get_mut(&repo_key) {
                 existing.force |= force;
@@ -1023,8 +1174,15 @@ impl NativeServer {
                 if !ignore_patterns.is_empty() {
                     existing.ignore_patterns = ignore_patterns.clone();
                 }
+                if !existing.snapshot_queued
+                    && !coordinator.recovering.contains(&repo_key)
+                    && !repos_to_mark_queued.contains(&repo_key)
+                {
+                    repos_to_mark_queued.push(repo_key.clone());
+                }
                 merged_repos.push(repo_key);
             } else {
+                let snapshot_queued = false;
                 coordinator.pending.insert(
                     repo_key.clone(),
                     PendingIndexRequest {
@@ -1034,53 +1192,66 @@ impl NativeServer {
                         splitter,
                         custom_extensions: custom_extensions.clone(),
                         ignore_patterns: ignore_patterns.clone(),
+                        snapshot_queued,
                     },
                 );
+                if !coordinator.recovering.contains(&repo_key)
+                    && !repos_to_mark_queued.contains(&repo_key)
+                {
+                    repos_to_mark_queued.push(repo_key.clone());
+                }
                 queued_repos.push(repo_key);
             }
         }
-        let should_start_worker = !coordinator.worker_active && !coordinator.pending.is_empty();
-        if should_start_worker {
-            coordinator.worker_active = true;
-        }
         drop(coordinator);
 
-        if !queued_repos.is_empty() {
-            let queued_scope = ResolvedScope {
-                kind: scope.kind.clone(),
-                id: scope.id.clone(),
-                label: scope.label.clone(),
-                repos: scope
-                    .repos
-                    .iter()
-                    .filter(|repo| queued_repos.contains(&repo.display().to_string()))
-                    .cloned()
-                    .collect(),
-            };
-            if let Err(error) = self.engine.mark_scope_indexing(&queued_scope).await {
-                let mut coordinator = self.index_coordinator.lock().await;
-                for repo_key in &queued_repos {
-                    coordinator.pending.remove(repo_key);
-                }
-                if coordinator.pending.is_empty() && coordinator.running.is_empty() {
-                    coordinator.worker_active = false;
-                }
-                return Err(error);
+        if let Some(recovery) = recovery.as_ref()
+            && recovery.failure_recorded
+        {
+            self.finish_worker_recovery(&recovery.running_repos).await;
+            released_recovery_repos.extend(recovery.running_repos.iter().cloned());
+        }
+
+        let recovered_repos_to_mark_queued = if !released_recovery_repos.is_empty() {
+            self.recovered_pending_repos_to_mark_queued(&released_recovery_repos)
+                .await
+        } else {
+            Vec::new()
+        };
+        for repo in recovered_repos_to_mark_queued {
+            if !repos_to_mark_queued.contains(&repo) {
+                repos_to_mark_queued.push(repo);
             }
         }
 
-        if should_start_worker {
-            let server = self.clone();
-            tokio::spawn(async move {
-                server.run_background_index_worker().await;
-            });
+        if !repos_to_mark_queued.is_empty()
+            && let Err(error) = self.mark_repos_indexing_queued(&repos_to_mark_queued).await
+        {
+            let generation_to_spawn = {
+                let mut coordinator = self.index_coordinator.lock().await;
+                coordinator.remove_unqueued_pending(&repos_to_mark_queued);
+                coordinator.ensure_live_worker_for_pending(Instant::now())
+            };
+            if let Some(generation) = generation_to_spawn {
+                self.spawn_background_index_worker(generation);
+            }
+            return Err(error);
+        }
+
+        let worker_generation = {
+            let mut coordinator = self.index_coordinator.lock().await;
+            coordinator.mark_pending_snapshot_queued(&repos_to_mark_queued);
+            coordinator.ensure_live_worker_for_pending(Instant::now())
+        };
+        if let Some(generation) = worker_generation {
+            self.spawn_background_index_worker(generation);
         }
 
         if queued_repos.is_empty() && merged_repos.is_empty() {
             return Ok(IndexLaunchResult {
                 scope: scope.id,
                 label: scope.label,
-                started: false,
+                started: worker_generation.is_some(),
                 force,
                 queued_repos,
                 merged_repos,
@@ -1091,7 +1262,7 @@ impl NativeServer {
         Ok(IndexLaunchResult {
             scope: scope.id,
             label: scope.label,
-            started: should_start_worker,
+            started: worker_generation.is_some(),
             force,
             queued_repos,
             merged_repos,
@@ -1099,19 +1270,188 @@ impl NativeServer {
         })
     }
 
-    async fn run_background_index_worker(&self) {
+    async fn begin_stale_worker_recovery(&self) -> Option<WorkerRecovery> {
+        let recovery = {
+            let mut coordinator = self.index_coordinator.lock().await;
+            coordinator.begin_stale_worker_recovery(Instant::now())
+        };
+        let mut recovery = recovery?;
+
+        if recovery.running_repos.is_empty() {
+            eprintln!(
+                "[warn] replacing stale background indexing worker age={}s with pending work but no running repos",
+                recovery.age_secs
+            );
+        } else {
+            eprintln!(
+                "[warn] replacing stale background indexing worker age={}s; stale running repos: {}",
+                recovery.age_secs,
+                recovery.running_repos.join(", ")
+            );
+            recovery.failure_recorded = self
+                .mark_recovered_repos_failed(
+                    "stale-background-worker",
+                    "stale background worker",
+                    &recovery.running_repos,
+                    "background indexing worker heartbeat expired",
+                )
+                .await;
+        }
+
+        Some(recovery)
+    }
+
+    async fn finish_incomplete_recovery_if_possible(&self) -> Vec<String> {
+        let recovering_repos = {
+            let coordinator = self.index_coordinator.lock().await;
+            coordinator.recovering_repos()
+        };
+        if recovering_repos.is_empty() {
+            return Vec::new();
+        }
+        if self
+            .mark_recovered_repos_failed(
+                "incomplete-background-worker-recovery",
+                "incomplete background worker recovery",
+                &recovering_repos,
+                "background indexing worker recovery completed after retry",
+            )
+            .await
+        {
+            self.finish_worker_recovery(&recovering_repos).await;
+            return recovering_repos;
+        }
+        Vec::new()
+    }
+
+    async fn mark_repos_indexing_queued(&self, repos: &[String]) -> Result<()> {
+        if repos.is_empty() {
+            return Ok(());
+        }
+        let scope = ResolvedScope {
+            kind: crate::config::ScopeKind::Group,
+            id: "background-index-queue".to_string(),
+            label: "background index queue".to_string(),
+            repos: repos.iter().map(PathBuf::from).collect(),
+        };
+        self.engine.mark_scope_indexing(&scope).await
+    }
+
+    async fn mark_recovered_repos_failed(
+        &self,
+        scope_id: &str,
+        scope_label: &str,
+        repos: &[String],
+        reason: &str,
+    ) -> bool {
+        if repos.is_empty() {
+            return true;
+        }
+        let scope = ResolvedScope {
+            kind: crate::config::ScopeKind::Group,
+            id: scope_id.to_string(),
+            label: scope_label.to_string(),
+            repos: repos.iter().map(PathBuf::from).collect(),
+        };
+        if let Err(error) = self.engine.mark_scope_indexing_failed(&scope, reason).await {
+            eprintln!("[error] unable to mark recovered background worker repos failed: {error}");
+            return false;
+        }
+        true
+    }
+
+    async fn finish_worker_recovery(&self, recovered_repos: &[String]) {
+        let mut coordinator = self.index_coordinator.lock().await;
+        coordinator.finish_recovery(recovered_repos);
+    }
+
+    async fn recovered_pending_repos_to_mark_queued(
+        &self,
+        recovered_repos: &[String],
+    ) -> Vec<String> {
+        let coordinator = self.index_coordinator.lock().await;
+        if recovered_repos.is_empty() {
+            return coordinator.unqueued_ready_pending_repos();
+        }
+        coordinator
+            .unqueued_ready_pending_repos()
+            .into_iter()
+            .filter(|repo| recovered_repos.contains(repo))
+            .collect()
+    }
+
+    async fn finish_recovery_queue_pending_and_restart(&self, recovered_repos: &[String]) {
+        self.finish_worker_recovery(recovered_repos).await;
+        let repos_to_mark_queued = self
+            .recovered_pending_repos_to_mark_queued(recovered_repos)
+            .await;
+        if !repos_to_mark_queued.is_empty()
+            && let Err(error) = self.mark_repos_indexing_queued(&repos_to_mark_queued).await
+        {
+            eprintln!("[error] unable to mark recovered pending repos queued: {error}");
+            return;
+        }
+        let worker_generation = {
+            let mut coordinator = self.index_coordinator.lock().await;
+            coordinator.mark_pending_snapshot_queued(&repos_to_mark_queued);
+            coordinator.ensure_live_worker_for_pending(Instant::now())
+        };
+        if let Some(generation) = worker_generation {
+            eprintln!(
+                "[warn] replacing recovered background indexing worker with generation={generation}"
+            );
+            self.spawn_background_index_worker(generation);
+        }
+    }
+
+    fn spawn_background_index_worker(&self, generation: u64) {
+        let server = self.clone();
+        eprintln!("[info] starting background indexing worker generation={generation}");
+        tokio::spawn(async move {
+            let result =
+                AssertUnwindSafe(server.run_background_index_worker(generation)).catch_unwind();
+            if result.await.is_err() {
+                eprintln!("[error] background indexing worker generation={generation} panicked");
+                server
+                    .handle_worker_abort(
+                        generation,
+                        "background indexing worker panicked before completing",
+                    )
+                    .await;
+            }
+        });
+    }
+
+    async fn run_background_index_worker(&self, generation: u64) {
         loop {
             let next = {
                 let mut coordinator = self.index_coordinator.lock().await;
-                let Some(repo_key) = coordinator.pending.keys().next().cloned() else {
-                    coordinator.worker_active = false;
+                if !coordinator.heartbeat_worker(generation, Instant::now()) {
+                    eprintln!(
+                        "[warn] background indexing worker generation={generation} exiting after replacement"
+                    );
+                    return;
+                }
+                let Some(repo_key) = coordinator
+                    .pending
+                    .iter()
+                    .find(|(repo, request)| {
+                        request.snapshot_queued && !coordinator.recovering.contains(*repo)
+                    })
+                    .map(|(repo, _)| repo.clone())
+                else {
+                    if coordinator.finish_worker(generation) {
+                        eprintln!(
+                            "[info] background indexing worker generation={generation} drained queue"
+                        );
+                    }
                     return;
                 };
                 let request = coordinator
                     .pending
                     .remove(&repo_key)
                     .expect("pending repo exists");
-                coordinator.running.insert(repo_key.clone());
+                coordinator.running.insert(repo_key.clone(), generation);
                 (repo_key, request)
             };
 
@@ -1128,20 +1468,77 @@ impl NativeServer {
                 repos: vec![request.repo.clone()],
             };
 
-            let _ = self
-                .engine
-                .index_scope_background(
-                    scope,
-                    request.force,
-                    request.explicit_refresh,
-                    request.splitter,
-                    &request.custom_extensions,
-                    &request.ignore_patterns,
-                )
-                .await;
+            eprintln!(
+                "[info] background indexing worker generation={generation} indexing {repo_key}"
+            );
+            let mut heartbeat = tokio::time::interval(INDEX_WORKER_HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let index_future = self.engine.index_scope_background(
+                scope,
+                request.force,
+                request.explicit_refresh,
+                request.splitter,
+                &request.custom_extensions,
+                &request.ignore_patterns,
+            );
+            tokio::pin!(index_future);
+            let index_result = loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        self.record_worker_heartbeat(generation).await;
+                    }
+                    result = &mut index_future => {
+                        break result;
+                    }
+                }
+            };
+            if let Err(error) = index_result {
+                eprintln!(
+                    "[error] background indexing worker generation={generation} failed {repo_key}: {error}"
+                );
+            } else {
+                eprintln!(
+                    "[info] background indexing worker generation={generation} finished {repo_key}"
+                );
+            }
 
             let mut coordinator = self.index_coordinator.lock().await;
-            coordinator.running.remove(&repo_key);
+            if coordinator.running.get(&repo_key).copied() == Some(generation) {
+                coordinator.running.remove(&repo_key);
+                coordinator.heartbeat_worker(generation, Instant::now());
+            } else {
+                eprintln!(
+                    "[warn] background indexing worker generation={generation} finished stale repo {repo_key} after replacement"
+                );
+                return;
+            }
+        }
+    }
+
+    async fn record_worker_heartbeat(&self, generation: u64) {
+        let mut coordinator = self.index_coordinator.lock().await;
+        coordinator.heartbeat_worker(generation, Instant::now());
+    }
+
+    async fn handle_worker_abort(&self, generation: u64, reason: &str) {
+        let running_repos = {
+            let mut coordinator = self.index_coordinator.lock().await;
+            let Some(running_repos) = coordinator.begin_worker_abort_recovery(generation) else {
+                return;
+            };
+            running_repos
+        };
+        if self
+            .mark_recovered_repos_failed(
+                "aborted-background-worker",
+                "aborted background worker",
+                &running_repos,
+                reason,
+            )
+            .await
+        {
+            self.finish_recovery_queue_pending_and_restart(&running_repos)
+                .await;
         }
     }
 }
@@ -2145,11 +2542,11 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutlineCompactionOptions, OutlineDetail, SERVER_INSTRUCTIONS, SearchMode,
-        compact_outline_response, compact_prepare_edit_target_response,
-        compact_search_response_value, compact_symbol_search_response_value,
-        compact_text_search_response_value, default_limit, enforce_loopback_bind,
-        get_file_outline_schema, list_scopes_schema, listen_is_loopback,
+        INDEX_WORKER_STALE_AFTER, IndexCoordinatorState, OutlineCompactionOptions, OutlineDetail,
+        PendingIndexRequest, SERVER_INSTRUCTIONS, SearchMode, compact_outline_response,
+        compact_prepare_edit_target_response, compact_search_response_value,
+        compact_symbol_search_response_value, compact_text_search_response_value, default_limit,
+        enforce_loopback_bind, get_file_outline_schema, list_scopes_schema, listen_is_loopback,
         normalize_extension_filter, parse_search_mode, parse_splitter_kind,
         prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
     };
@@ -2162,6 +2559,20 @@ mod tests {
         SymbolSearchResponse, TextSearchHit, TextSearchResponse,
     };
     use serde_json::{Value, to_value};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn pending_request(path: &str) -> PendingIndexRequest {
+        PendingIndexRequest {
+            repo: PathBuf::from(path),
+            force: false,
+            explicit_refresh: false,
+            splitter: SplitterKind::Ast,
+            custom_extensions: Vec::new(),
+            ignore_patterns: Vec::new(),
+            snapshot_queued: true,
+        }
+    }
 
     #[test]
     fn search_limit_default_matches_node_contract() {
@@ -3115,5 +3526,213 @@ mod tests {
 
         assert_eq!(compact.matches[0].repo.as_deref(), Some("/tmp/repo-a"));
         assert_eq!(compact.matches[1].repo.as_deref(), Some("/tmp/repo-b"));
+    }
+
+    #[test]
+    fn coordinator_starts_worker_for_pending_without_live_worker() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/repo".to_string(), pending_request("/tmp/repo"));
+
+        let generation = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(generation, Some(1));
+        assert_eq!(
+            coordinator.worker.map(|worker| (
+                worker.generation,
+                worker.started_at,
+                worker.last_heartbeat
+            )),
+            Some((1, now, now))
+        );
+    }
+
+    #[test]
+    fn coordinator_does_not_start_duplicate_fresh_worker() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/repo".to_string(), pending_request("/tmp/repo"));
+        assert_eq!(coordinator.ensure_live_worker_for_pending(now), Some(1));
+
+        let duplicate = coordinator.ensure_live_worker_for_pending(now + Duration::from_secs(1));
+
+        assert_eq!(duplicate, None);
+        assert_eq!(coordinator.worker.map(|worker| worker.generation), Some(1));
+    }
+
+    #[test]
+    fn coordinator_replaces_stale_worker_for_pending_work() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/repo".to_string(), pending_request("/tmp/repo"));
+        let first =
+            coordinator.start_worker(now - INDEX_WORKER_STALE_AFTER - Duration::from_secs(1));
+        coordinator
+            .running
+            .insert("/tmp/running".to_string(), first);
+
+        let recovery = coordinator
+            .begin_stale_worker_recovery(now)
+            .expect("stale worker should enter recovery");
+
+        assert_eq!(recovery.running_repos, vec!["/tmp/running".to_string()]);
+        assert_eq!(recovery.age_secs, INDEX_WORKER_STALE_AFTER.as_secs() + 1);
+        assert_eq!(coordinator.worker.map(|worker| worker.generation), None);
+        assert!(coordinator.running.is_empty());
+        assert!(coordinator.recovering.contains("/tmp/running"));
+
+        coordinator.finish_recovery(&recovery.running_repos);
+        let replacement = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(replacement, Some(2));
+        assert_eq!(coordinator.worker.map(|worker| worker.generation), Some(2));
+    }
+
+    #[test]
+    fn coordinator_keeps_fresh_running_worker_alive() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        let generation = coordinator.start_worker(now);
+        coordinator
+            .running
+            .insert("/tmp/running".to_string(), generation);
+
+        let recovery = coordinator.begin_stale_worker_recovery(now + Duration::from_secs(1));
+
+        assert!(recovery.is_none());
+        assert_eq!(
+            coordinator.running.get("/tmp/running").copied(),
+            Some(generation)
+        );
+        assert_eq!(
+            coordinator.live_worker_generation(now + Duration::from_secs(1)),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    fn coordinator_recovers_stale_worker_with_only_pending_work() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/repo".to_string(), pending_request("/tmp/repo"));
+        coordinator.start_worker(now - INDEX_WORKER_STALE_AFTER - Duration::from_secs(1));
+
+        let recovery = coordinator
+            .begin_stale_worker_recovery(now)
+            .expect("stale worker should be replaced even without running repos");
+        let replacement = coordinator.ensure_live_worker_for_pending(now);
+
+        assert!(recovery.running_repos.is_empty());
+        assert_eq!(replacement, Some(2));
+    }
+
+    #[test]
+    fn coordinator_does_not_start_worker_for_unqueued_pending_snapshot() {
+        let now = Instant::now();
+        let mut request = pending_request("/tmp/repo");
+        request.snapshot_queued = false;
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator.pending.insert("/tmp/repo".to_string(), request);
+
+        let generation = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(generation, None);
+        assert_eq!(
+            coordinator.unqueued_ready_pending_repos(),
+            vec!["/tmp/repo".to_string()]
+        );
+
+        coordinator.mark_pending_snapshot_queued(&["/tmp/repo".to_string()]);
+        let generation = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(generation, Some(1));
+    }
+
+    #[test]
+    fn coordinator_removes_only_unqueued_pending_after_mark_queued_failure() {
+        let mut unqueued = pending_request("/tmp/unqueued");
+        unqueued.snapshot_queued = false;
+        let queued = pending_request("/tmp/queued");
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/unqueued".to_string(), unqueued);
+        coordinator
+            .pending
+            .insert("/tmp/queued".to_string(), queued);
+
+        coordinator
+            .remove_unqueued_pending(&["/tmp/unqueued".to_string(), "/tmp/queued".to_string()]);
+
+        assert!(!coordinator.pending.contains_key("/tmp/unqueued"));
+        assert!(coordinator.pending.contains_key("/tmp/queued"));
+    }
+
+    #[test]
+    fn coordinator_keeps_recovered_running_repo_blocked_until_finished() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/running".to_string(), pending_request("/tmp/running"));
+        let generation =
+            coordinator.start_worker(now - INDEX_WORKER_STALE_AFTER - Duration::from_secs(1));
+        coordinator
+            .running
+            .insert("/tmp/running".to_string(), generation);
+
+        let recovery = coordinator
+            .begin_stale_worker_recovery(now)
+            .expect("stale running repo should enter recovery");
+        let replacement = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(replacement, None);
+        assert!(coordinator.recovering.contains("/tmp/running"));
+
+        coordinator.finish_recovery(&recovery.running_repos);
+        let replacement = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(replacement, Some(2));
+    }
+
+    #[test]
+    fn coordinator_merges_force_before_restarting_recovered_pending_worker() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/repo".to_string(), pending_request("/tmp/repo"));
+        coordinator.start_worker(now - INDEX_WORKER_STALE_AFTER - Duration::from_secs(1));
+
+        let recovery = coordinator
+            .begin_stale_worker_recovery(now)
+            .expect("stale worker should be recovered before enqueue classification");
+        assert!(recovery.running_repos.is_empty());
+
+        let existing = coordinator
+            .pending
+            .get_mut("/tmp/repo")
+            .expect("pending repo should still be mergeable");
+        existing.force |= true;
+        existing.explicit_refresh |= true;
+
+        coordinator.finish_recovery(&recovery.running_repos);
+        let generation = coordinator.ensure_live_worker_for_pending(now);
+
+        assert_eq!(generation, Some(2));
+        let request = coordinator
+            .pending
+            .get("/tmp/repo")
+            .expect("worker has not drained pending request in this unit test");
+        assert!(request.force);
+        assert!(request.explicit_refresh);
     }
 }

@@ -522,6 +522,15 @@ pub struct RepoStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct StaleIndexingRepo {
+    pub repo: String,
+    pub repo_label: String,
+    pub index_status: Option<String>,
+    pub last_updated: Option<String>,
+    pub age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 struct RepoFile {
     absolute_path: PathBuf,
     hash: String,
@@ -1186,6 +1195,99 @@ impl Engine {
             .snapshot
             .mark_interrupted_indexing_failed(reason)
             .await
+    }
+
+    pub async fn stale_indexing_repos(
+        &self,
+        stale_after: Duration,
+    ) -> Result<Vec<StaleIndexingRepo>> {
+        let snapshot = self.inner.snapshot.read().await?;
+        let now = chrono::Utc::now();
+        let mut stale = Vec::new();
+
+        for (repo, entry) in snapshot.codebases {
+            if entry.status != "indexing" {
+                continue;
+            }
+            let age_secs = snapshot_entry_age_secs(entry.last_updated.as_deref(), now);
+            if age_secs.is_some_and(|age| age < stale_after.as_secs()) {
+                continue;
+            }
+            stale.push(StaleIndexingRepo {
+                repo: repo.clone(),
+                repo_label: repo_basename(&repo),
+                index_status: entry.index_status,
+                last_updated: entry.last_updated,
+                age_secs,
+            });
+        }
+
+        for (repo, entry) in snapshot.worktrees {
+            if entry.status != "indexing" {
+                continue;
+            }
+            let age_secs = snapshot_entry_age_secs(entry.last_updated.as_deref(), now);
+            if age_secs.is_some_and(|age| age < stale_after.as_secs()) {
+                continue;
+            }
+            stale.push(StaleIndexingRepo {
+                repo: repo.clone(),
+                repo_label: repo_basename(&repo),
+                index_status: entry.overlay_status,
+                last_updated: entry.last_updated,
+                age_secs,
+            });
+        }
+
+        stale.sort_by(|left, right| left.repo_label.cmp(&right.repo_label));
+        Ok(stale)
+    }
+
+    pub async fn mark_scope_indexing_failed(
+        &self,
+        scope: &ResolvedScope,
+        reason: &str,
+    ) -> Result<()> {
+        for repo in &scope.repos {
+            let ctx = self.repo_context(repo)?;
+            if let Some(overlay) = ctx.overlay.as_ref() {
+                let worktree_key = overlay.resolution.worktree_root.display().to_string();
+                self.inner
+                    .snapshot
+                    .update(|snapshot| {
+                        if let Some(entry) = snapshot.worktrees.get_mut(&worktree_key)
+                            && entry.status == "indexing"
+                        {
+                            entry.status = "indexfailed".to_string();
+                            entry.overlay_status = Some("failed".to_string());
+                            entry.overlay_mismatch_reason = Some(reason.to_string());
+                            entry.last_updated = Some(crate::snapshot::timestamp());
+                        }
+                    })
+                    .await?;
+                continue;
+            }
+
+            let repo_key = repo.display().to_string();
+            self.inner
+                .snapshot
+                .update(|snapshot| {
+                    if let Some(entry) = snapshot.codebases.get_mut(&repo_key)
+                        && entry.status == "indexing"
+                    {
+                        *entry = SnapshotEntry::failed(
+                            reason.to_string(),
+                            entry
+                                .indexing_percentage
+                                .or(entry.last_attempted_percentage),
+                            entry.embedding_profile.clone(),
+                            entry.embedding_fingerprint.clone(),
+                        );
+                    }
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn mark_scope_indexing(&self, scope: &ResolvedScope) -> Result<()> {
@@ -5997,6 +6099,16 @@ fn repo_basename(repo: &str) -> String {
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| repo.to_string())
+}
+
+fn snapshot_entry_age_secs(
+    last_updated: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let last_updated = last_updated?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(last_updated).ok()?;
+    let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    Some(age.num_seconds().max(0) as u64)
 }
 
 fn overall_status(repos: &[RepoStatus]) -> String {

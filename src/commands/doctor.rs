@@ -1,11 +1,13 @@
 use crate::commands::support::DEFAULT_LISTEN;
 use crate::config::{Config, ResolvedScope, ScopeKind};
-use crate::engine::{Engine, RepoStatus, StatusReport};
+use crate::engine::{Engine, RepoStatus, StaleIndexingRepo, StatusReport};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+const STALE_INDEXING_AFTER: Duration = Duration::from_secs(10 * 60);
 
 pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
     let mut failures = 0usize;
@@ -151,6 +153,17 @@ pub async fn run(config: &Config, listen: Option<&str>) -> Result<()> {
                         format_repo_status_list(&indexing_repos)
                     ),
                 );
+            }
+
+            match engine.stale_indexing_repos(STALE_INDEXING_AFTER).await {
+                Ok(stale_repos) if !stale_repos.is_empty() => {
+                    print_warning("stale indexing", format_stale_indexing_repos(&stale_repos));
+                }
+                Ok(_) => {}
+                Err(error) => print_warning(
+                    "stale indexing",
+                    format!("unable to inspect stale indexing state: {error}"),
+                ),
             }
 
             if !not_indexed_repos.is_empty() {
@@ -374,6 +387,15 @@ fn format_failed_index_repos(repos: &[&RepoStatus]) -> String {
     )
 }
 
+fn format_stale_indexing_repos(repos: &[StaleIndexingRepo]) -> String {
+    format!(
+        "{} repo(s) appear stuck in indexing state for more than {}s: {}; recover with `agent-context refresh-one --force <repo>` or restart the `agent-context` service if enqueue keeps merging without progress",
+        repos.len(),
+        STALE_INDEXING_AFTER.as_secs(),
+        format_stale_indexing_repo_list(repos)
+    )
+}
+
 fn format_repo_status_list(repos: &[&RepoStatus]) -> String {
     const MAX_REPOS: usize = 5;
     let mut names = repos
@@ -391,6 +413,33 @@ fn format_repo_status_list(repos: &[&RepoStatus]) -> String {
             }
             if let Some(error) = &repo.error_message {
                 detail.push_str(&format!(" error={error}"));
+            }
+            detail.push_str(&format!(" repo={}", repo.repo));
+            detail
+        })
+        .collect::<Vec<_>>();
+    if repos.len() > MAX_REPOS {
+        names.push(format!("... and {} more", repos.len() - MAX_REPOS));
+    }
+    names.join("; ")
+}
+
+fn format_stale_indexing_repo_list(repos: &[StaleIndexingRepo]) -> String {
+    const MAX_REPOS: usize = 5;
+    let mut names = repos
+        .iter()
+        .take(MAX_REPOS)
+        .map(|repo| {
+            let mut detail = format!(
+                "{} index_status={}",
+                repo.repo_label,
+                repo.index_status.as_deref().unwrap_or("unknown")
+            );
+            if let Some(age_secs) = repo.age_secs {
+                detail.push_str(&format!(" age={age_secs}s"));
+            }
+            if let Some(last_updated) = repo.last_updated.as_deref() {
+                detail.push_str(&format!(" last_updated={last_updated}"));
             }
             detail.push_str(&format!(" repo={}", repo.repo));
             detail
@@ -522,5 +571,23 @@ mod tests {
         assert!(message.contains("agent-context refresh-one --force <repo>"));
         assert!(message.contains("progress=20.9%"));
         assert!(message.contains("restarted while indexing"));
+    }
+
+    #[test]
+    fn stale_indexing_format_points_to_force_refresh_or_restart() {
+        let repos = vec![StaleIndexingRepo {
+            repo: "/repo/weaver".to_string(),
+            repo_label: "weaver".to_string(),
+            index_status: Some("queued".to_string()),
+            last_updated: Some("2026-06-28T16:00:00.000Z".to_string()),
+            age_secs: Some(900),
+        }];
+
+        let message = format_stale_indexing_repos(&repos);
+
+        assert!(message.contains("stuck in indexing state"));
+        assert!(message.contains("agent-context refresh-one --force <repo>"));
+        assert!(message.contains("restart the `agent-context` service"));
+        assert!(message.contains("weaver index_status=queued age=900s"));
     }
 }
