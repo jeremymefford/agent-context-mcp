@@ -909,12 +909,9 @@ impl ServerHandler for NativeServer {
                         )
                         .await
                         .map_err(internal_error)?;
-                    Ok(tool_success(
+                    Ok(search_tool_success(
                         render_search_summary_text(&result),
-                        Some(compact_search_response_value(
-                            &result,
-                            args.include_diagnostics,
-                        )),
+                        compact_search_response_value(&result, args.include_diagnostics),
                     ))
                 }
                 "search_symbols" => {
@@ -939,13 +936,13 @@ impl ServerHandler for NativeServer {
                         )
                         .await
                         .map_err(internal_error)?;
-                    Ok(tool_success(
+                    Ok(search_tool_success(
                         render_symbol_search_summary_text(&result),
-                        Some(compact_symbol_search_response_value(
+                        compact_symbol_search_response_value(
                             &result,
                             args.include_symbol_id,
                             args.include_diagnostics,
-                        )),
+                        ),
                     ))
                 }
                 "search_text" => {
@@ -976,9 +973,9 @@ impl ServerHandler for NativeServer {
                         )
                         .await
                         .map_err(internal_error)?;
-                    Ok(tool_success(
+                    Ok(search_tool_success(
                         render_text_search_summary_text(&result),
-                        Some(compact_text_search_response_value(&result)),
+                        compact_text_search_response_value(&result),
                     ))
                 }
                 "prepare_edit_target" => {
@@ -1577,6 +1574,15 @@ fn tool_success(text: String, structured: Option<Value>) -> CallToolResult {
     result.structured_content = structured;
     result.is_error = Some(false);
     result
+}
+
+fn search_tool_success(summary: String, value: Value) -> CallToolResult {
+    if value.is_object() {
+        tool_success(summary, Some(value))
+    } else {
+        let text = serde_json::to_string(&value).unwrap_or(summary);
+        tool_success(text, None)
+    }
 }
 
 fn render_index_launch_text(result: &IndexLaunchResult) -> String {
@@ -2548,7 +2554,8 @@ mod tests {
         compact_symbol_search_response_value, compact_text_search_response_value, default_limit,
         enforce_loopback_bind, get_file_outline_schema, list_scopes_schema, listen_is_loopback,
         normalize_extension_filter, parse_search_mode, parse_splitter_kind,
-        prepare_edit_target_schema, search_symbols_schema, search_text_schema, tool_list,
+        prepare_edit_target_schema, search_symbols_schema, search_text_schema, search_tool_success,
+        tool_list,
     };
     use crate::engine::splitter::SplitterKind;
     use crate::engine::symbols::OutlineNode;
@@ -2558,7 +2565,7 @@ mod tests {
         RepoSearchError, SearchHit, SearchPlanSummary, SearchResponse, SymbolSearchHit,
         SymbolSearchResponse, TextSearchHit, TextSearchResponse,
     };
-    use serde_json::{Value, to_value};
+    use serde_json::{Value, json, to_value};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -2934,6 +2941,35 @@ mod tests {
         let json = compact_text_search_response_value(&response);
         assert_eq!(json[0]["repoLabel"], "repo-a");
         assert_eq!(json[1]["repoLabel"], "repo-b");
+    }
+
+    #[test]
+    fn search_tool_success_moves_bare_arrays_to_text_content() {
+        let value = json!([{ "relativePath": "src/lib.rs", "line": 10 }]);
+
+        let result = search_tool_success("summary".to_string(), value.clone());
+
+        assert!(result.structured_content.is_none());
+        let serialized = to_value(&result).unwrap();
+        assert_eq!(
+            serialized["content"][0]["text"].as_str(),
+            Some(serde_json::to_string(&value).unwrap().as_str())
+        );
+    }
+
+    #[test]
+    fn search_tool_success_keeps_objects_as_structured_content() {
+        let value = json!({
+            "partial": true,
+            "repoErrors": [{ "repo": "/tmp/repo", "error": "boom" }],
+            "hits": []
+        });
+
+        let result = search_tool_success("summary".to_string(), value.clone());
+
+        assert_eq!(result.structured_content, Some(value));
+        let serialized = to_value(&result).unwrap();
+        assert_eq!(serialized["content"][0]["text"].as_str(), Some("summary"));
     }
 
     #[test]
