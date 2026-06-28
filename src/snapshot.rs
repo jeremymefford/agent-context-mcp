@@ -253,6 +253,7 @@ impl WorktreeSnapshotEntry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn indexed(
         canonical_root: impl Into<String>,
         repo_identity: impl Into<String>,

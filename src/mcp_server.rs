@@ -84,9 +84,7 @@ impl IndexCoordinatorState {
     }
 
     fn begin_stale_worker_recovery(&mut self, now: Instant) -> Option<WorkerRecovery> {
-        let Some(worker) = self.worker else {
-            return None;
-        };
+        let worker = self.worker?;
         if now.duration_since(worker.last_heartbeat) <= INDEX_WORKER_STALE_AFTER {
             return None;
         }

@@ -74,10 +74,11 @@ pub async fn run(config: &Config, apply: bool) -> Result<()> {
 }
 
 fn reset_paths(config: &Config) -> Vec<PathBuf> {
-    let mut ordered = Vec::new();
-    ordered.push(config.snapshot_path.clone());
-    ordered.push(config.index_root.clone());
-    ordered.push(config.merkle_dir());
+    let ordered = vec![
+        config.snapshot_path.clone(),
+        config.index_root.clone(),
+        config.merkle_dir(),
+    ];
 
     let mut seen = BTreeSet::new();
     ordered

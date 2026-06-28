@@ -2526,17 +2526,16 @@ impl Engine {
             if matches.is_empty() {
                 continue;
             }
-            if let Some(line_hint) = request.line_hint {
-                if let Some(symbol) = matches
+            if let Some(line_hint) = request.line_hint
+                && let Some(symbol) = matches
                     .iter()
                     .find(|symbol| line_hint >= symbol.start_line && line_hint <= symbol.end_line)
-                {
-                    resolved.push(ResolvedEditSymbol {
-                        repo: repo.clone(),
-                        symbol: symbol.clone(),
-                    });
-                    continue;
-                }
+            {
+                resolved.push(ResolvedEditSymbol {
+                    repo: repo.clone(),
+                    symbol: symbol.clone(),
+                });
+                continue;
             }
             if matches.len() == 1 {
                 resolved.push(ResolvedEditSymbol {
@@ -2895,12 +2894,11 @@ impl Engine {
     ) -> Result<(PathBuf, String)> {
         let ctx = self.repo_context(repo)?;
         let normalized_path = normalize_relative_path(relative_path);
-        if let Some(overlay) = ctx.overlay.as_ref() {
-            if let Ok(Some(state)) = self.load_overlay_state(overlay).await {
-                if overlay_lookup_uses_overlay(&state, &normalized_path) {
-                    return Ok((overlay.storage_root.clone(), overlay.repo_key.clone()));
-                }
-            }
+        if let Some(overlay) = ctx.overlay.as_ref()
+            && let Ok(Some(state)) = self.load_overlay_state(overlay).await
+            && overlay_lookup_uses_overlay(&state, &normalized_path)
+        {
+            return Ok((overlay.storage_root.clone(), overlay.repo_key.clone()));
         }
         Ok((
             ctx.canonical_root.clone(),
@@ -3120,20 +3118,20 @@ impl Engine {
         };
         let covering_symbol = narrowest_covering_symbol(file_symbols, selected.start_line)
             .filter(|symbol| selected.end_line <= symbol.end_line);
-        if let Some(symbol) = covering_symbol {
-            if symbol_fits_ready_window(symbol, selected, request.max_lines) {
-                return Ok(Some(ReadyEditTarget {
-                    snapshot: snapshot.clone(),
-                    start_line: symbol.start_line,
-                    end_line: symbol.end_line,
-                    resolution_type: EditResolutionType::Literal,
-                    symbol_id: Some(symbol.symbol_id.clone()),
-                    indexed_metadata,
-                    truncated: false,
-                    symbol_signature_line: Some(symbol.start_line),
-                    query: request.query.clone(),
-                }));
-            }
+        if let Some(symbol) = covering_symbol
+            && symbol_fits_ready_window(symbol, selected, request.max_lines)
+        {
+            return Ok(Some(ReadyEditTarget {
+                snapshot: snapshot.clone(),
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+                resolution_type: EditResolutionType::Literal,
+                symbol_id: Some(symbol.symbol_id.clone()),
+                indexed_metadata,
+                truncated: false,
+                symbol_signature_line: Some(symbol.start_line),
+                query: request.query.clone(),
+            }));
         }
         let (start_line, end_line, truncated) = bounded_window(
             snapshot.total_lines(),
@@ -3497,6 +3495,7 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fail_worktree_overlay(
         &self,
         overlay: &WorktreeOverlayContext,
@@ -4577,6 +4576,7 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_repo_context(
         &self,
         ctx: &RepoContext,
@@ -4763,6 +4763,7 @@ impl Engine {
         Ok(hits)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_symbol_context(
         &self,
         ctx: &RepoContext,
@@ -4862,6 +4863,7 @@ impl Engine {
         Ok(SearchContextResult { hits, warnings })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_symbol_repo(
         &self,
         storage_repo: &Path,
