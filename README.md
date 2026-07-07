@@ -49,14 +49,17 @@ That accuracy point matters. In larger repositories, the failure mode is usually
 
 - **Strong support**: Rust, TypeScript, TSX, JavaScript, JSX, Python, Go, Java
 - **Supported with more conservative symbol extraction**: C, C++, C#, Kotlin, PHP, Ruby, Swift, Scala
-- **Content-only support**: Markdown
+- **Web text/config support**: HTML, CSS, SCSS, Sass, Less, Vue, Svelte, Astro, SVG, MDX, JSON, JSONC, JSON5, YAML, TOML, web manifests, GraphQL, Prisma, robots-style text files, and common template files
+- **Content plus heading outlines**: Markdown and MDX
 
 What that means in practice:
 
 - All listed languages are indexed for code search and lexical retrieval.
 - Strong-support languages are the ones with the highest confidence for symbol search and outlines.
 - The conservative tier is still searchable, but symbol extraction is more best-effort and intentionally guarded to avoid poisoning refreshes on ambiguous syntax or generated code.
-- Markdown is useful for semantic and lexical retrieval, but it is not presented as a symbol language.
+- Web text/config files are indexed for semantic and lexical retrieval with generic text chunking unless a dedicated parser is available.
+- Markdown and MDX headings are available through file outlines and symbol search as `heading` entries.
+- Selected hidden repo config directories are traversed for supported file types, including CI files such as `.github/workflows/*.yml`, while hidden caches, VCS internals, and root dotfiles remain excluded by default.
 
 ## How It Works
 

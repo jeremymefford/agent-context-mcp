@@ -645,6 +645,17 @@ pub fn extract_symbols(
     indexed_at: &str,
     file_hash: &str,
 ) -> Result<Vec<IndexedSymbol>> {
+    if is_markdown_path(path) {
+        return Ok(extract_markdown_symbols(
+            repo,
+            relative_path,
+            text,
+            indexed_at,
+            file_hash,
+            markdown_language_for_path(path),
+        ));
+    }
+
     let Some(config) = symbol_config(path) else {
         return Ok(Vec::new());
     };
@@ -673,6 +684,242 @@ pub fn extract_symbols(
     collect_symbols(tree.root_node(), &context, &mut stack, &mut output)?;
     dedupe_symbols_in_place(&mut output);
     Ok(output)
+}
+
+#[derive(Debug)]
+struct MarkdownHeading {
+    name: String,
+    level: usize,
+    start_line: u64,
+    end_line: u64,
+    parent_index: Option<usize>,
+}
+
+fn extract_markdown_symbols(
+    repo: &str,
+    relative_path: &str,
+    text: &str,
+    indexed_at: &str,
+    file_hash: &str,
+    language: &str,
+) -> Vec<IndexedSymbol> {
+    let mut headings = Vec::new();
+    let mut stack = Vec::<(usize, usize)>::new();
+    let mut fence = None;
+    let mut front_matter_delimiter = None::<String>;
+    let mut previous_text_line = None::<(u64, String)>;
+
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index as u64 + 1;
+        let trimmed = line.trim();
+
+        if line_number == 1 && matches!(trimmed, "---" | "+++") {
+            front_matter_delimiter = Some(trimmed.to_string());
+            previous_text_line = None;
+            continue;
+        }
+        if let Some(delimiter) = front_matter_delimiter.as_deref() {
+            if trimmed == delimiter {
+                front_matter_delimiter = None;
+            }
+            previous_text_line = None;
+            continue;
+        }
+
+        if let Some((fence_char, fence_len)) = fence {
+            if is_markdown_fence_close(line, fence_char, fence_len) {
+                fence = None;
+            }
+            previous_text_line = None;
+            continue;
+        }
+        if let Some(opening_fence) = markdown_fence_open(line) {
+            fence = Some(opening_fence);
+            previous_text_line = None;
+            continue;
+        }
+
+        if let Some((level, name)) = parse_atx_heading(line) {
+            push_markdown_heading(&mut headings, &mut stack, level, name, line_number);
+            previous_text_line = None;
+            continue;
+        }
+
+        if let Some(level) = parse_setext_heading_underline(line) {
+            if let Some((start_line, name)) = previous_text_line.take() {
+                push_markdown_heading(&mut headings, &mut stack, level, name, start_line);
+            }
+            continue;
+        }
+
+        previous_text_line = (!trimmed.is_empty()).then(|| (line_number, trimmed.to_string()));
+    }
+
+    let line_count = text.lines().count() as u64;
+    for index in 0..headings.len() {
+        let mut end_line = line_count.max(headings[index].start_line);
+        for next in headings.iter().skip(index + 1) {
+            if next.level <= headings[index].level {
+                end_line = next
+                    .start_line
+                    .saturating_sub(1)
+                    .max(headings[index].start_line);
+                break;
+            }
+        }
+        headings[index].end_line = end_line;
+    }
+
+    let symbol_ids = headings
+        .iter()
+        .map(|heading| {
+            symbol_id(
+                relative_path,
+                "heading",
+                &heading.name,
+                heading.start_line,
+                heading.end_line,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    headings
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| IndexedSymbol {
+            symbol_id: symbol_ids[index].clone(),
+            repo: repo.to_string(),
+            relative_path: relative_path.to_string(),
+            name: heading.name.clone(),
+            kind: "heading".to_string(),
+            container: markdown_heading_container(&headings, heading.parent_index),
+            language: language.to_string(),
+            start_line: heading.start_line,
+            end_line: heading.end_line,
+            indexed_at: indexed_at.to_string(),
+            file_hash: file_hash.to_string(),
+            parent_symbol_id: heading
+                .parent_index
+                .map(|parent| symbol_ids[parent].clone()),
+        })
+        .collect()
+}
+
+fn push_markdown_heading(
+    headings: &mut Vec<MarkdownHeading>,
+    stack: &mut Vec<(usize, usize)>,
+    level: usize,
+    name: String,
+    start_line: u64,
+) {
+    if name.is_empty() {
+        return;
+    }
+    while stack
+        .last()
+        .is_some_and(|(stack_level, _)| *stack_level >= level)
+    {
+        let _ = stack.pop();
+    }
+    let parent_index = stack.last().map(|(_, index)| *index);
+    let index = headings.len();
+    headings.push(MarkdownHeading {
+        name,
+        level,
+        start_line,
+        end_line: start_line,
+        parent_index,
+    });
+    stack.push((level, index));
+}
+
+fn markdown_heading_container(
+    headings: &[MarkdownHeading],
+    parent_index: Option<usize>,
+) -> Option<String> {
+    let mut names = Vec::new();
+    let mut current = parent_index;
+    while let Some(index) = current {
+        let heading = &headings[index];
+        names.push(heading.name.as_str());
+        current = heading.parent_index;
+    }
+    (!names.is_empty()).then(|| {
+        names.reverse();
+        names.join("::")
+    })
+}
+
+fn parse_atx_heading(line: &str) -> Option<(usize, String)> {
+    let content = markdown_line_content(line)?;
+    let level = content.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &content[level..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((level, strip_closing_hashes(rest.trim()).to_string()))
+}
+
+fn parse_setext_heading_underline(line: &str) -> Option<usize> {
+    let content = markdown_line_content(line)?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    if content.bytes().all(|byte| byte == b'=') {
+        return Some(1);
+    }
+    if content.bytes().all(|byte| byte == b'-') {
+        return Some(2);
+    }
+    None
+}
+
+fn strip_closing_hashes(value: &str) -> &str {
+    let trimmed = value.trim_end();
+    let mut hash_start = trimmed.len();
+    for (index, ch) in trimmed.char_indices().rev() {
+        if ch == '#' {
+            hash_start = index;
+        } else {
+            break;
+        }
+    }
+    if hash_start < trimmed.len()
+        && trimmed[..hash_start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        trimmed[..hash_start].trim_end()
+    } else {
+        trimmed
+    }
+}
+
+fn markdown_fence_open(line: &str) -> Option<(char, usize)> {
+    let content = markdown_line_content(line)?.trim_start();
+    let fence_char = content.chars().next()?;
+    if !matches!(fence_char, '`' | '~') {
+        return None;
+    }
+    let fence_len = content.chars().take_while(|ch| *ch == fence_char).count();
+    (fence_len >= 3).then_some((fence_char, fence_len))
+}
+
+fn is_markdown_fence_close(line: &str, fence_char: char, fence_len: usize) -> bool {
+    let Some(content) = markdown_line_content(line).map(str::trim) else {
+        return false;
+    };
+    let closing_len = content.chars().take_while(|ch| *ch == fence_char).count();
+    closing_len >= fence_len && content[closing_len..].trim().is_empty()
+}
+
+fn markdown_line_content(line: &str) -> Option<&str> {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    (leading_spaces <= 3).then_some(&line[leading_spaces..])
 }
 
 pub fn build_outline(symbols: &[IndexedSymbol]) -> Vec<OutlineNode> {
@@ -881,12 +1128,12 @@ fn symbol_id(
 fn symbol_config(path: &Path) -> Option<SymbolConfig> {
     let extension = path.extension().and_then(|value| value.to_str())?;
     match extension {
-        "js" | "jsx" => Some(SymbolConfig {
+        "js" | "jsx" | "mjs" | "cjs" => Some(SymbolConfig {
             language: tree_sitter_javascript::LANGUAGE.into(),
             language_name: "javascript",
             rules: JS_SYMBOLS,
         }),
-        "ts" => Some(SymbolConfig {
+        "ts" | "mts" | "cts" => Some(SymbolConfig {
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             language_name: "typescript",
             rules: JS_SYMBOLS,
@@ -955,6 +1202,26 @@ fn symbol_config(path: &Path) -> Option<SymbolConfig> {
     }
 }
 
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(extension.to_lowercase().as_str(), "md" | "markdown" | "mdx")
+        })
+}
+
+fn markdown_language_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("mdx") => "mdx",
+        _ => "markdown",
+    }
+}
+
 fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
     Ok(IndexedSymbol {
         symbol_id: row.get(0)?,
@@ -1017,6 +1284,121 @@ mod tests {
 
         let outline = build_outline(&symbols);
         assert!(!outline.is_empty());
+    }
+
+    #[test]
+    fn extracts_nested_markdown_headings() {
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "README.md",
+            std::path::Path::new("README.md"),
+            "# Project\n\nIntro\n\n## Install ##\n\n### CLI\n\n## API\n",
+            "2026-01-01T00:00:00Z",
+            "hash-md",
+        )
+        .unwrap();
+
+        let names = symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Project", "Install", "CLI", "API"]);
+        assert!(symbols.iter().all(|symbol| symbol.kind == "heading"));
+        assert!(symbols.iter().all(|symbol| symbol.language == "markdown"));
+
+        let outline = build_outline(&symbols);
+        assert_eq!(outline.len(), 1);
+        assert_eq!(outline[0].name, "Project");
+        assert_eq!(outline[0].children[0].name, "Install");
+        assert_eq!(outline[0].children[0].children[0].name, "CLI");
+        assert_eq!(outline[0].children[1].name, "API");
+    }
+
+    #[test]
+    fn extracts_setext_markdown_headings() {
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "docs/guide.markdown",
+            std::path::Path::new("docs/guide.markdown"),
+            "Overview\n========\n\nDetails\n-------\n",
+            "2026-01-01T00:00:00Z",
+            "hash-md",
+        )
+        .unwrap();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "Overview");
+        assert_eq!(symbols[0].start_line, 1);
+        assert_eq!(symbols[1].name, "Details");
+        assert_eq!(symbols[1].start_line, 4);
+        assert_eq!(
+            symbols[1].parent_symbol_id,
+            Some(symbols[0].symbol_id.clone())
+        );
+    }
+
+    #[test]
+    fn markdown_headings_ignore_front_matter_and_fenced_code() {
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "README.md",
+            std::path::Path::new("README.md"),
+            "---\ntitle: Not a heading\n---\n\n```rust\n# also_not_a_heading\n```\n\n# Real Heading\n",
+            "2026-01-01T00:00:00Z",
+            "hash-md",
+        )
+        .unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Real Heading");
+        assert_eq!(symbols[0].start_line, 9);
+    }
+
+    #[test]
+    fn extracts_mdx_headings_with_mdx_language() {
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "docs/page.mdx",
+            std::path::Path::new("docs/page.mdx"),
+            "# Page\n\n<Component />\n\n## Details\n",
+            "2026-01-01T00:00:00Z",
+            "hash-mdx",
+        )
+        .unwrap();
+
+        assert_eq!(symbols.len(), 2);
+        assert!(symbols.iter().all(|symbol| symbol.language == "mdx"));
+        assert_eq!(symbols[0].name, "Page");
+        assert_eq!(
+            symbols[1].parent_symbol_id,
+            Some(symbols[0].symbol_id.clone())
+        );
+    }
+
+    #[test]
+    fn extracts_symbols_from_javascript_and_typescript_module_extensions() {
+        let js_symbols = extract_symbols(
+            "/tmp/repo",
+            "src/app.mjs",
+            std::path::Path::new("src/app.mjs"),
+            "export function boot() { return true; }",
+            "2026-01-01T00:00:00Z",
+            "hash-mjs",
+        )
+        .unwrap();
+        let ts_symbols = extract_symbols(
+            "/tmp/repo",
+            "src/app.mts",
+            std::path::Path::new("src/app.mts"),
+            "export interface Config { enabled: boolean }\nexport function boot(): Config { return { enabled: true }; }",
+            "2026-01-01T00:00:00Z",
+            "hash-mts",
+        )
+        .unwrap();
+
+        assert!(js_symbols.iter().any(|symbol| symbol.name == "boot"));
+        assert!(ts_symbols.iter().any(|symbol| symbol.name == "Config"));
+        assert!(ts_symbols.iter().any(|symbol| symbol.name == "boot"));
     }
 
     #[test]

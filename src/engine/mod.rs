@@ -53,6 +53,31 @@ const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
 const OVERLAY_CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_overlay_";
 const OVERLAY_SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_overlay_";
 const OVERLAY_STORAGE_ROOT_PREFIX: &str = "/__agent_context_overlay";
+const USEFUL_HIDDEN_DIRS: &[&str] = &[
+    ".github",
+    ".gitlab",
+    ".circleci",
+    ".buildkite",
+    ".devcontainer",
+    ".vscode",
+    ".cursor",
+    ".codex",
+];
+const BLOCKED_HIDDEN_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    ".venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".cache",
+];
 const WORKTREE_EMBEDDING_INHERIT: &str = "inherit";
 const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
 const REMOVED_REPO_INDEX_STATUS: &str = "removed";
@@ -6922,12 +6947,14 @@ fn scan_repo(
     let mut files = BTreeMap::new();
 
     let mut builder = WalkBuilder::new(repo);
-    builder.hidden(true);
+    builder.hidden(false);
     builder.git_ignore(true);
     builder.git_exclude(true);
     builder.git_global(true);
     builder.follow_links(false);
     builder.require_git(false);
+    let repo_filter_root = repo.to_path_buf();
+    builder.filter_entry(move |entry| walker_entry_is_allowed(&repo_filter_root, entry.path()));
 
     for entry in builder.build() {
         let entry = match entry {
@@ -6947,6 +6974,9 @@ fn scan_repo(
             .display()
             .to_string()
             .replace('\\', "/");
+        if !hidden_path_is_allowed(Path::new(&relative_path)) {
+            continue;
+        }
         if ignore_set.is_match(&relative_path) {
             continue;
         }
@@ -6976,6 +7006,31 @@ fn scan_repo(
     }
 
     Ok(files)
+}
+
+fn walker_entry_is_allowed(repo: &Path, entry_path: &Path) -> bool {
+    let Ok(relative_path) = entry_path.strip_prefix(repo) else {
+        return false;
+    };
+    hidden_path_is_allowed(relative_path)
+}
+
+fn hidden_path_is_allowed(relative_path: &Path) -> bool {
+    for component in relative_path.components() {
+        let Some(name) = component.as_os_str().to_str() else {
+            continue;
+        };
+        if !name.starts_with('.') {
+            continue;
+        }
+        if BLOCKED_HIDDEN_DIRS.contains(&name) {
+            return false;
+        }
+        if !USEFUL_HIDDEN_DIRS.contains(&name) {
+            return false;
+        }
+    }
+    true
 }
 
 fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
@@ -7084,12 +7139,14 @@ fn collect_live_candidate_files(
 
     let mut files = Vec::new();
     let mut builder = WalkBuilder::new(&walk_root);
-    builder.hidden(true);
+    builder.hidden(false);
     builder.git_ignore(true);
     builder.git_exclude(true);
     builder.git_global(true);
     builder.follow_links(false);
     builder.require_git(false);
+    let repo_filter_root = repo.to_path_buf();
+    builder.filter_entry(move |entry| walker_entry_is_allowed(&repo_filter_root, entry.path()));
 
     for entry in builder.build() {
         let entry = match entry {
@@ -7108,6 +7165,9 @@ fn collect_live_candidate_files(
             continue;
         };
         let relative_path = relative_path.display().to_string().replace('\\', "/");
+        if !hidden_path_is_allowed(Path::new(&relative_path)) {
+            continue;
+        }
         if !path_matches_prefix(&relative_path, normalized_prefix.as_deref()) {
             continue;
         }
@@ -8115,6 +8175,83 @@ mod tests {
                 "src/pipeline/worker.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn scan_repo_traverses_useful_hidden_dirs_only() {
+        let repo = temp_dir("hidden-scan-repo");
+        fs::create_dir_all(repo.join(".github").join("workflows")).unwrap();
+        fs::create_dir_all(repo.join(".devcontainer")).unwrap();
+        fs::create_dir_all(repo.join(".git").join("hooks")).unwrap();
+        fs::create_dir_all(repo.join(".venv").join("lib")).unwrap();
+
+        fs::write(
+            repo.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(".devcontainer").join("devcontainer.json"),
+            "{\"name\":\"dev\"}\n",
+        )
+        .unwrap();
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: []\n").unwrap();
+        fs::write(repo.join(".env"), "TOKEN=secret\n").unwrap();
+        fs::write(
+            repo.join(".git").join("hooks").join("pre-commit.py"),
+            "print('no')\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(".venv").join("lib").join("site.py"),
+            "print('no')\n",
+        )
+        .unwrap();
+
+        let files = scan_repo(&repo, &[], &[]).unwrap();
+
+        assert!(files.contains_key(".github/workflows/ci.yml"));
+        assert!(files.contains_key(".devcontainer/devcontainer.json"));
+        assert!(!files.contains_key(".gitlab-ci.yml"));
+        assert!(!files.contains_key(".env"));
+        assert!(!files.contains_key(".git/hooks/pre-commit.py"));
+        assert!(!files.contains_key(".venv/lib/site.py"));
+    }
+
+    #[test]
+    fn scan_repo_honors_ignores_inside_allowed_hidden_dirs() {
+        let repo = temp_dir("hidden-ignore-repo");
+        fs::create_dir_all(repo.join(".github").join("workflows")).unwrap();
+        fs::write(
+            repo.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\n",
+        )
+        .unwrap();
+
+        let files = scan_repo(&repo, &[], &[String::from(".github/workflows/*.yml")]).unwrap();
+
+        assert!(!files.contains_key(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn collect_live_candidate_files_traverses_allowed_hidden_dirs() {
+        let repo = temp_dir("hidden-candidates-repo");
+        fs::create_dir_all(repo.join(".github").join("workflows")).unwrap();
+        fs::create_dir_all(repo.join(".cache")).unwrap();
+        fs::write(
+            repo.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\n",
+        )
+        .unwrap();
+        fs::write(repo.join(".cache").join("ci.yml"), "name: cache\n").unwrap();
+
+        let scoped =
+            collect_live_candidate_files(&repo, Some(".github/workflows"), Some("yaml"), &[])
+                .unwrap();
+        let repo_wide = collect_live_candidate_files(&repo, None, Some("yaml"), &[]).unwrap();
+
+        assert_eq!(scoped, vec![".github/workflows/ci.yml".to_string()]);
+        assert_eq!(repo_wide, vec![".github/workflows/ci.yml".to_string()]);
     }
 
     #[test]

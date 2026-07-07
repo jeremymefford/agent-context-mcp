@@ -100,9 +100,23 @@ pub struct CodeChunk {
 pub fn default_supported_extensions() -> BTreeSet<String> {
     [
         ".ts",
+        ".mts",
+        ".cts",
         ".tsx",
         ".js",
+        ".mjs",
+        ".cjs",
         ".jsx",
+        ".html",
+        ".htm",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".vue",
+        ".svelte",
+        ".astro",
+        ".svg",
         ".py",
         ".java",
         ".cpp",
@@ -121,6 +135,25 @@ pub fn default_supported_extensions() -> BTreeSet<String> {
         ".mm",
         ".md",
         ".markdown",
+        ".mdx",
+        ".json",
+        ".jsonc",
+        ".json5",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".webmanifest",
+        ".graphql",
+        ".gql",
+        ".prisma",
+        ".ejs",
+        ".hbs",
+        ".handlebars",
+        ".pug",
+        ".tpl",
+        ".gotmpl",
+        ".njk",
+        ".txt",
         ".ipynb",
     ]
     .into_iter()
@@ -163,8 +196,17 @@ pub fn split_text(path: &Path, text: &str, kind: SplitterKind) -> Result<Vec<Cod
 
 pub fn language_for_extension(extension: &str) -> &'static str {
     match extension {
-        ".ts" | ".tsx" => "typescript",
-        ".js" | ".jsx" => "javascript",
+        ".ts" | ".tsx" | ".mts" | ".cts" => "typescript",
+        ".js" | ".jsx" | ".mjs" | ".cjs" => "javascript",
+        ".html" | ".htm" => "html",
+        ".css" => "css",
+        ".scss" => "scss",
+        ".sass" => "sass",
+        ".less" => "less",
+        ".vue" => "vue",
+        ".svelte" => "svelte",
+        ".astro" => "astro",
+        ".svg" => "svg",
         ".py" => "python",
         ".java" => "java",
         ".cpp" | ".hpp" => "cpp",
@@ -180,6 +222,22 @@ pub fn language_for_extension(extension: &str) -> &'static str {
         ".m" | ".mm" => "objective-c",
         ".ipynb" => "jupyter",
         ".md" | ".markdown" => "markdown",
+        ".mdx" => "mdx",
+        ".json" => "json",
+        ".jsonc" => "jsonc",
+        ".json5" => "json5",
+        ".yaml" | ".yml" => "yaml",
+        ".toml" => "toml",
+        ".webmanifest" => "json",
+        ".graphql" | ".gql" => "graphql",
+        ".prisma" => "prisma",
+        ".ejs" => "ejs",
+        ".hbs" | ".handlebars" => "handlebars",
+        ".pug" => "pug",
+        ".tpl" => "template",
+        ".gotmpl" => "gotmpl",
+        ".njk" => "nunjucks",
+        ".txt" => "text",
         _ => "text",
     }
 }
@@ -197,7 +255,7 @@ fn langchain_chunks(path: &Path, text: &str, language: &str) -> Result<Vec<CodeC
         .context("building text-splitter chunk config")?;
     let line_starts = line_start_offsets(text);
 
-    if language == "markdown" {
+    if matches!(language, "markdown" | "mdx") {
         let splitter = MarkdownSplitter::new(config);
         return Ok(build_chunks_from_indices(
             splitter.chunk_char_indices(text),
@@ -236,12 +294,12 @@ struct AstConfig {
 fn ast_config(path: &Path) -> Option<AstConfig> {
     let ext = extension_for(path);
     match ext.as_str() {
-        ".js" | ".jsx" => Some(AstConfig {
+        ".js" | ".jsx" | ".mjs" | ".cjs" => Some(AstConfig {
             language: tree_sitter_javascript::LANGUAGE.into(),
             node_types: JS_NODES,
             language_name: "javascript",
         }),
-        ".ts" => Some(AstConfig {
+        ".ts" | ".mts" | ".cts" => Some(AstConfig {
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             node_types: TS_NODES,
             language_name: "typescript",
@@ -297,8 +355,8 @@ fn ast_config(path: &Path) -> Option<AstConfig> {
 
 fn semantic_language_for_path(path: &Path) -> Option<Language> {
     match extension_for(path).as_str() {
-        ".js" | ".jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        ".ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        ".js" | ".jsx" | ".mjs" | ".cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        ".ts" | ".mts" | ".cts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ".tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         ".py" => Some(tree_sitter_python::LANGUAGE.into()),
         ".java" => Some(tree_sitter_java::LANGUAGE.into()),
@@ -466,7 +524,7 @@ fn add_overlap(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SplitterKind, split_text};
+    use super::{SplitterKind, default_supported_extensions, language_for_extension, split_text};
     use std::path::Path;
 
     fn repeated_block(prefix: &str, count: usize) -> String {
@@ -491,6 +549,76 @@ mod tests {
                 .iter()
                 .any(|chunk| chunk.content.contains("real_code"))
         );
+    }
+
+    #[test]
+    fn default_extensions_include_common_web_project_files() {
+        let extensions = default_supported_extensions();
+        for extension in [
+            ".html",
+            ".css",
+            ".scss",
+            ".vue",
+            ".svelte",
+            ".astro",
+            ".svg",
+            ".mdx",
+            ".json",
+            ".jsonc",
+            ".json5",
+            ".yaml",
+            ".toml",
+            ".webmanifest",
+            ".graphql",
+            ".prisma",
+            ".ejs",
+            ".hbs",
+            ".pug",
+            ".tpl",
+            ".gotmpl",
+            ".njk",
+            ".txt",
+            ".mjs",
+            ".mts",
+        ] {
+            assert!(
+                extensions.contains(extension),
+                "{extension} should be indexed"
+            );
+        }
+    }
+
+    #[test]
+    fn language_labels_cover_common_web_project_files() {
+        for (extension, language) in [
+            (".html", "html"),
+            (".css", "css"),
+            (".scss", "scss"),
+            (".vue", "vue"),
+            (".svelte", "svelte"),
+            (".astro", "astro"),
+            (".svg", "svg"),
+            (".mdx", "mdx"),
+            (".json", "json"),
+            (".jsonc", "jsonc"),
+            (".json5", "json5"),
+            (".yaml", "yaml"),
+            (".toml", "toml"),
+            (".webmanifest", "json"),
+            (".graphql", "graphql"),
+            (".prisma", "prisma"),
+            (".ejs", "ejs"),
+            (".hbs", "handlebars"),
+            (".pug", "pug"),
+            (".tpl", "template"),
+            (".gotmpl", "gotmpl"),
+            (".njk", "nunjucks"),
+            (".txt", "text"),
+            (".mjs", "javascript"),
+            (".mts", "typescript"),
+        ] {
+            assert_eq!(language_for_extension(extension), language);
+        }
     }
 
     #[test]
