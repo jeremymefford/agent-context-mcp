@@ -293,6 +293,10 @@ ollama pull embeddinggemma
 curl http://localhost:11434/api/embed -d '{"model":"embeddinggemma","input":"hello world"}'
 ```
 
+Some Ollama embedding models support a `dimensions` request parameter. Set
+`embedding.profiles.<name>.ollama.dimensions` when you want `agent-context` to
+store/query a smaller vector width than the model's default output.
+
 </details>
 
 If you have never used an embedding provider before:

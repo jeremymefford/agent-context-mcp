@@ -55,6 +55,7 @@ struct OllamaClient {
     http: reqwest::Client,
     model: String,
     base_url: String,
+    dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +88,7 @@ impl EmbeddingClient {
             EmbeddingProvider::Ollama => EmbeddingInner::Ollama(OllamaClient::new(
                 config.model.clone(),
                 config.ollama.base_url.clone(),
+                config.ollama.dimensions,
             )?),
         };
 
@@ -354,7 +356,7 @@ impl OpenAiClient {
 }
 
 impl OllamaClient {
-    fn new(model: String, base_url: String) -> Result<Self> {
+    fn new(model: String, base_url: String, dimensions: Option<usize>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let http = reqwest::Client::builder()
@@ -367,6 +369,7 @@ impl OllamaClient {
             http,
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
+            dimensions,
         })
     }
 
@@ -376,11 +379,7 @@ impl OllamaClient {
         }
 
         let url = format!("{}/api/embed", self.base_url);
-        let payload = json!({
-            "model": self.model,
-            "input": texts,
-            "truncate": true,
-        });
+        let payload = ollama_embed_payload(&self.model, texts, self.dimensions);
 
         let response = send_with_retry(
             &self.http,
@@ -404,6 +403,22 @@ impl OllamaClient {
 
         Ok(payload.embeddings)
     }
+}
+
+fn ollama_embed_payload(
+    model: &str,
+    texts: &[String],
+    dimensions: Option<usize>,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "model": model,
+        "input": texts,
+        "truncate": true,
+    });
+    if let Some(dimensions) = dimensions {
+        payload["dimensions"] = json!(dimensions);
+    }
+    payload
 }
 
 async fn send_with_retry<F>(
@@ -517,7 +532,8 @@ fn known_dimension(provider: &str, model: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{known_dimension, retry_delay};
+    use super::{known_dimension, ollama_embed_payload, retry_delay};
+    use serde_json::json;
 
     #[test]
     fn knows_openai_embedding_dimensions() {
@@ -534,5 +550,21 @@ mod tests {
     #[test]
     fn retry_delay_grows_per_attempt() {
         assert!(retry_delay(1) >= retry_delay(0));
+    }
+
+    #[test]
+    fn ollama_payload_includes_optional_dimensions() {
+        let texts = vec!["hello".to_string()];
+        let payload = ollama_embed_payload("qwen3-embedding:8b-q8_0", &texts, Some(1024));
+
+        assert_eq!(
+            payload,
+            json!({
+                "model": "qwen3-embedding:8b-q8_0",
+                "input": ["hello"],
+                "truncate": true,
+                "dimensions": 1024,
+            })
+        );
     }
 }

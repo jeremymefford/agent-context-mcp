@@ -122,6 +122,7 @@ pub struct OpenAiProviderConfig {
 #[derive(Debug, Clone, Default)]
 pub struct OllamaProviderConfig {
     pub base_url: String,
+    pub dimensions: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +315,8 @@ struct RawOpenAiProviderConfig {
 struct RawOllamaProviderConfig {
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -891,6 +894,13 @@ fn build_legacy_embedding_profile(
             .and_then(|value| value.ollama.as_ref())
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+        dimensions: raw
+            .embedding
+            .as_ref()
+            .and_then(|value| value.ollama.as_ref())
+            .and_then(|value| value.dimensions)
+            .map(validate_ollama_dimensions)
+            .transpose()?,
     };
 
     Ok(EmbeddingProfileConfig {
@@ -952,6 +962,12 @@ fn build_embedding_profile_config(
             .as_ref()
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+        dimensions: raw
+            .ollama
+            .as_ref()
+            .and_then(|value| value.dimensions)
+            .map(validate_ollama_dimensions)
+            .transpose()?,
     };
 
     Ok(EmbeddingProfileConfig {
@@ -990,6 +1006,13 @@ fn parse_provider(value: &str) -> Result<EmbeddingProvider> {
             bail!("unsupported embedding provider `{other}`; expected voyage, openai, or ollama")
         }
     }
+}
+
+fn validate_ollama_dimensions(dimensions: usize) -> Result<usize> {
+    if dimensions == 0 {
+        bail!("embedding ollama dimensions must be greater than zero");
+    }
+    Ok(dimensions)
 }
 
 fn default_config_path_candidates() -> Result<Vec<PathBuf>> {
@@ -1498,6 +1521,7 @@ mod tests {
 
                 [embedding.ollama]
                 base_url = "http://localhost:11434"
+                dimensions = 1024
 
                 [milvus]
                 address = "localhost:19530"
@@ -1515,6 +1539,7 @@ mod tests {
             .unwrap();
         assert_eq!(profile.provider, EmbeddingProvider::Ollama);
         assert_eq!(profile.ollama.base_url, "http://localhost:11434");
+        assert_eq!(profile.ollama.dimensions, Some(1024));
         assert_eq!(config.worktrees.mode, WorktreeMode::Overlay);
         assert_eq!(config.worktrees.max_overlay_files, 500);
         assert_eq!(config.worktrees.max_overlay_bytes, 25 * 1024 * 1024);
@@ -1540,6 +1565,7 @@ mod tests {
 
                 [embedding.profiles.local.ollama]
                 base_url = "http://127.0.0.1:11435"
+                dimensions = 2048
 
                 [[embedding.assignments]]
                 repo = "./repos/local-app"
@@ -1573,6 +1599,10 @@ mod tests {
         assert_eq!(
             config.embedding.profile("local").unwrap().ollama.base_url,
             "http://127.0.0.1:11435"
+        );
+        assert_eq!(
+            config.embedding.profile("local").unwrap().ollama.dimensions,
+            Some(2048)
         );
     }
 
