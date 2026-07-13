@@ -181,7 +181,11 @@ impl EmbeddingClient {
                 client.embed(&[text.to_string()], Some("query")).await
             }
             EmbeddingInner::OpenAi(client) => client.embed(&[text.to_string()]).await,
-            EmbeddingInner::Ollama(client) => client.embed(&[text.to_string()]).await,
+            EmbeddingInner::Ollama(client) => {
+                client
+                    .embed(&[qwen3_coding_agent_query(&client.model, text)])
+                    .await
+            }
         }?;
         values
             .into_iter()
@@ -452,6 +456,20 @@ fn ollama_width_fingerprint(
     format!("request={requested}:truncate={truncate}")
 }
 
+const QWEN3_CODING_AGENT_RETRIEVAL_INSTRUCTION: &str = "Given a coding-agent query, retrieve the most relevant code, configuration, documentation, or tests needed to understand, modify, or verify the requested behavior.";
+
+fn qwen3_coding_agent_query(model: &str, query: &str) -> String {
+    if model
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("qwen3-embedding")
+    {
+        format!("Instruct: {QWEN3_CODING_AGENT_RETRIEVAL_INSTRUCTION}\nQuery: {query}")
+    } else {
+        query.to_string()
+    }
+}
+
 fn ollama_embed_payload(
     model: &str,
     texts: &[String],
@@ -601,7 +619,7 @@ fn known_dimension(provider: &str, model: &str) -> Option<usize> {
 mod tests {
     use super::{
         known_dimension, ollama_embed_payload, ollama_runtime_error, ollama_width_fingerprint,
-        retry_delay, retry_delay_for, truncate_ollama_embeddings,
+        qwen3_coding_agent_query, retry_delay, retry_delay_for, truncate_ollama_embeddings,
     };
     use serde_json::json;
 
@@ -661,6 +679,18 @@ mod tests {
         assert_eq!(
             ollama_width_fingerprint(Some(4096), Some(1024)),
             "request=4096:truncate=1024"
+        );
+    }
+
+    #[test]
+    fn qwen3_queries_are_tuned_for_coding_agent_retrieval() {
+        assert_eq!(
+            qwen3_coding_agent_query("qwen3-embedding:8b-q8_0", "find indexing retries"),
+            "Instruct: Given a coding-agent query, retrieve the most relevant code, configuration, documentation, or tests needed to understand, modify, or verify the requested behavior.\nQuery: find indexing retries"
+        );
+        assert_eq!(
+            qwen3_coding_agent_query("nomic-embed-text", "find indexing retries"),
+            "find indexing retries"
         );
     }
 }
