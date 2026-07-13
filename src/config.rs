@@ -123,6 +123,7 @@ pub struct OpenAiProviderConfig {
 pub struct OllamaProviderConfig {
     pub base_url: String,
     pub dimensions: Option<usize>,
+    pub truncate_dimensions: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +318,8 @@ struct RawOllamaProviderConfig {
     base_url: Option<String>,
     #[serde(default)]
     dimensions: Option<usize>,
+    #[serde(default)]
+    truncate_dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -887,6 +890,21 @@ fn build_legacy_embedding_profile(
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
     };
+    let ollama_dimensions = raw
+        .embedding
+        .as_ref()
+        .and_then(|value| value.ollama.as_ref())
+        .and_then(|value| value.dimensions)
+        .map(validate_ollama_dimensions)
+        .transpose()?;
+    let ollama_truncate_dimensions = raw
+        .embedding
+        .as_ref()
+        .and_then(|value| value.ollama.as_ref())
+        .and_then(|value| value.truncate_dimensions)
+        .map(validate_ollama_dimensions)
+        .transpose()?;
+    validate_ollama_truncate_dimensions(ollama_dimensions, ollama_truncate_dimensions)?;
     let ollama = OllamaProviderConfig {
         base_url: raw
             .embedding
@@ -894,13 +912,8 @@ fn build_legacy_embedding_profile(
             .and_then(|value| value.ollama.as_ref())
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
-        dimensions: raw
-            .embedding
-            .as_ref()
-            .and_then(|value| value.ollama.as_ref())
-            .and_then(|value| value.dimensions)
-            .map(validate_ollama_dimensions)
-            .transpose()?,
+        dimensions: ollama_dimensions,
+        truncate_dimensions: ollama_truncate_dimensions,
     };
 
     Ok(EmbeddingProfileConfig {
@@ -956,18 +969,27 @@ fn build_embedding_profile_config(
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
     };
+    let ollama_dimensions = raw
+        .ollama
+        .as_ref()
+        .and_then(|value| value.dimensions)
+        .map(validate_ollama_dimensions)
+        .transpose()?;
+    let ollama_truncate_dimensions = raw
+        .ollama
+        .as_ref()
+        .and_then(|value| value.truncate_dimensions)
+        .map(validate_ollama_dimensions)
+        .transpose()?;
+    validate_ollama_truncate_dimensions(ollama_dimensions, ollama_truncate_dimensions)?;
     let ollama = OllamaProviderConfig {
         base_url: raw
             .ollama
             .as_ref()
             .and_then(|value| value.base_url.clone())
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
-        dimensions: raw
-            .ollama
-            .as_ref()
-            .and_then(|value| value.dimensions)
-            .map(validate_ollama_dimensions)
-            .transpose()?,
+        dimensions: ollama_dimensions,
+        truncate_dimensions: ollama_truncate_dimensions,
     };
 
     Ok(EmbeddingProfileConfig {
@@ -1013,6 +1035,20 @@ fn validate_ollama_dimensions(dimensions: usize) -> Result<usize> {
         bail!("embedding ollama dimensions must be greater than zero");
     }
     Ok(dimensions)
+}
+
+fn validate_ollama_truncate_dimensions(
+    dimensions: Option<usize>,
+    truncate_dimensions: Option<usize>,
+) -> Result<()> {
+    if let (Some(dimensions), Some(truncate_dimensions)) = (dimensions, truncate_dimensions)
+        && truncate_dimensions > dimensions
+    {
+        bail!(
+            "embedding ollama truncate_dimensions ({truncate_dimensions}) cannot exceed requested dimensions ({dimensions})"
+        );
+    }
+    Ok(())
 }
 
 fn default_config_path_candidates() -> Result<Vec<PathBuf>> {
@@ -1521,7 +1557,8 @@ mod tests {
 
                 [embedding.ollama]
                 base_url = "http://localhost:11434"
-                dimensions = 1024
+                dimensions = 4096
+                truncate_dimensions = 1024
 
                 [milvus]
                 address = "localhost:19530"
@@ -1539,7 +1576,8 @@ mod tests {
             .unwrap();
         assert_eq!(profile.provider, EmbeddingProvider::Ollama);
         assert_eq!(profile.ollama.base_url, "http://localhost:11434");
-        assert_eq!(profile.ollama.dimensions, Some(1024));
+        assert_eq!(profile.ollama.dimensions, Some(4096));
+        assert_eq!(profile.ollama.truncate_dimensions, Some(1024));
         assert_eq!(config.worktrees.mode, WorktreeMode::Overlay);
         assert_eq!(config.worktrees.max_overlay_files, 500);
         assert_eq!(config.worktrees.max_overlay_bytes, 25 * 1024 * 1024);
@@ -1565,7 +1603,8 @@ mod tests {
 
                 [embedding.profiles.local.ollama]
                 base_url = "http://127.0.0.1:11435"
-                dimensions = 2048
+                dimensions = 4096
+                truncate_dimensions = 1024
 
                 [[embedding.assignments]]
                 repo = "./repos/local-app"
@@ -1602,7 +1641,16 @@ mod tests {
         );
         assert_eq!(
             config.embedding.profile("local").unwrap().ollama.dimensions,
-            Some(2048)
+            Some(4096)
+        );
+        assert_eq!(
+            config
+                .embedding
+                .profile("local")
+                .unwrap()
+                .ollama
+                .truncate_dimensions,
+            Some(1024)
         );
     }
 

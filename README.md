@@ -294,8 +294,10 @@ curl http://localhost:11434/api/embed -d '{"model":"embeddinggemma","input":"hel
 ```
 
 Some Ollama embedding models support a `dimensions` request parameter. Set
-`embedding.profiles.<name>.ollama.dimensions` when you want `agent-context` to
-store/query a smaller vector width than the model's default output.
+`embedding.profiles.<name>.ollama.dimensions` to request a specific model output
+width. Set `truncate_dimensions` as well when you want `agent-context` to retain
+only the leading dimensions locally; for example, request Qwen's 4096-dimensional
+output and locally store/search its first 1024 dimensions.
 
 </details>
 

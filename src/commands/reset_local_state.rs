@@ -129,6 +129,7 @@ mod tests {
                         ollama: OllamaProviderConfig {
                             base_url: "http://127.0.0.1:11434".to_string(),
                             dimensions: None,
+                            truncate_dimensions: None,
                         },
                     },
                 )]),

@@ -56,6 +56,7 @@ struct OllamaClient {
     model: String,
     base_url: String,
     dimensions: Option<usize>,
+    truncate_dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +90,7 @@ impl EmbeddingClient {
                 config.model.clone(),
                 config.ollama.base_url.clone(),
                 config.ollama.dimensions,
+                config.ollama.truncate_dimensions,
             )?),
         };
 
@@ -131,12 +133,19 @@ impl EmbeddingClient {
     }
 
     pub async fn fingerprint(&self) -> Result<String> {
-        Ok(format!(
+        let fingerprint = format!(
             "{}:{}:{}",
             self.provider_name(),
             self.model(),
             self.dimension().await?
-        ))
+        );
+        match self.inner.as_ref() {
+            EmbeddingInner::Ollama(client) => Ok(format!(
+                "{fingerprint}:{}",
+                ollama_width_fingerprint(client.dimensions, client.truncate_dimensions)
+            )),
+            EmbeddingInner::Voyage(_) | EmbeddingInner::OpenAi(_) => Ok(fingerprint),
+        }
     }
 
     pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -356,7 +365,12 @@ impl OpenAiClient {
 }
 
 impl OllamaClient {
-    fn new(model: String, base_url: String, dimensions: Option<usize>) -> Result<Self> {
+    fn new(
+        model: String,
+        base_url: String,
+        dimensions: Option<usize>,
+        truncate_dimensions: Option<usize>,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let http = reqwest::Client::builder()
@@ -370,6 +384,7 @@ impl OllamaClient {
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
             dimensions,
+            truncate_dimensions,
         })
     }
 
@@ -401,8 +416,40 @@ impl OllamaClient {
             );
         }
 
-        Ok(payload.embeddings)
+        truncate_ollama_embeddings(payload.embeddings, self.truncate_dimensions)
     }
+}
+
+fn truncate_ollama_embeddings(
+    mut embeddings: Vec<Vec<f32>>,
+    truncate_dimensions: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
+    let Some(truncate_dimensions) = truncate_dimensions else {
+        return Ok(embeddings);
+    };
+    for embedding in &mut embeddings {
+        if embedding.len() < truncate_dimensions {
+            bail!(
+                "Ollama returned {} dimensions, fewer than configured truncate_dimensions {truncate_dimensions}",
+                embedding.len()
+            );
+        }
+        embedding.truncate(truncate_dimensions);
+    }
+    Ok(embeddings)
+}
+
+fn ollama_width_fingerprint(
+    requested_dimensions: Option<usize>,
+    truncate_dimensions: Option<usize>,
+) -> String {
+    let requested = requested_dimensions
+        .map(|dimensions| dimensions.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let truncate = truncate_dimensions
+        .map(|dimensions| dimensions.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!("request={requested}:truncate={truncate}")
 }
 
 fn ollama_embed_payload(
@@ -553,7 +600,8 @@ fn known_dimension(provider: &str, model: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        known_dimension, ollama_embed_payload, ollama_runtime_error, retry_delay, retry_delay_for,
+        known_dimension, ollama_embed_payload, ollama_runtime_error, ollama_width_fingerprint,
+        retry_delay, retry_delay_for, truncate_ollama_embeddings,
     };
     use serde_json::json;
 
@@ -596,6 +644,23 @@ mod tests {
                 "truncate": true,
                 "dimensions": 1024,
             })
+        );
+    }
+
+    #[test]
+    fn truncates_ollama_embeddings_after_receiving_the_requested_width() {
+        let embeddings = truncate_ollama_embeddings(vec![vec![1.0; 4096]], Some(1024)).unwrap();
+
+        assert_eq!(embeddings[0].len(), 1024);
+        let error = truncate_ollama_embeddings(vec![vec![1.0; 512]], Some(1024)).unwrap_err();
+        assert!(error.to_string().contains("fewer than configured"));
+    }
+
+    #[test]
+    fn ollama_fingerprint_records_requested_and_retained_widths() {
+        assert_eq!(
+            ollama_width_fingerprint(Some(4096), Some(1024)),
+            "request=4096:truncate=1024"
         );
     }
 }
