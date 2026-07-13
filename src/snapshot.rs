@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
@@ -192,13 +192,17 @@ impl SnapshotStore {
         self.write_unlocked(&snapshot).await
     }
 
-    pub async fn mark_interrupted_indexing_failed(&self, reason: &str) -> Result<usize> {
+    pub async fn mark_interrupted_indexing_failed_except(
+        &self,
+        reason: &str,
+        resumable: &BTreeSet<String>,
+    ) -> Result<usize> {
         let _guard = self.lock.lock().await;
         let mut snapshot = self.read_unlocked().await?;
         let mut healed = 0usize;
 
-        for entry in snapshot.codebases.values_mut() {
-            if entry.status == "indexing" {
+        for (repo, entry) in &mut snapshot.codebases {
+            if entry.status == "indexing" && !resumable.contains(repo) {
                 *entry = SnapshotEntry::failed(
                     reason.to_string(),
                     entry
@@ -210,8 +214,8 @@ impl SnapshotStore {
                 healed += 1;
             }
         }
-        for entry in snapshot.worktrees.values_mut() {
-            if entry.status == "indexing" {
+        for (repo, entry) in &mut snapshot.worktrees {
+            if entry.status == "indexing" && !resumable.contains(repo) {
                 entry.status = "indexfailed".to_string();
                 entry.overlay_status = Some("failed".to_string());
                 entry.overlay_mismatch_reason = Some(reason.to_string());

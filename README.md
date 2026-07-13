@@ -434,7 +434,7 @@ Indexing and serving:
 - `agent-context list-tools`
 - `agent-context serve --listen 127.0.0.1:8765 --config ~/Library/Application\ Support/agent-context/config.toml`
 
-`refresh-one` is enqueue-only. It returns quickly after handing the request to the local `agent-context serve` process, and repeated requests for a repo already pending or running are merged instead of triggering back-to-back scans. Use `--listen` if your local service is not on `127.0.0.1:8765`.
+`refresh-one` is enqueue-only. It returns quickly after handing the request to the local `agent-context serve` process, and repeated requests for a repo already pending or running are merged instead of triggering back-to-back scans. The service persists accepted queued and running requests beside `snapshot.json`, so a normal service restart resumes them from the queue instead of discarding the remaining work. Invalid or no-longer-configured persisted repos are dropped; untracked legacy `indexing` entries are marked failed so status remains actionable. Use `--listen` if your local service is not on `127.0.0.1:8765`.
 
 ## Configuration
 

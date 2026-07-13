@@ -47,17 +47,20 @@ use tokio_util::sync::CancellationToken;
 
 const INDEX_WORKER_STALE_AFTER: Duration = Duration::from_secs(300);
 const INDEX_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const BACKGROUND_INDEX_TRANSIENT_RETRIES: u8 = 2;
 
 #[derive(Clone)]
 struct NativeServer {
     engine: Engine,
     index_coordinator: Arc<Mutex<IndexCoordinatorState>>,
+    index_queue: Arc<IndexQueueStore>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct IndexCoordinatorState {
     pending: BTreeMap<String, PendingIndexRequest>,
     running: BTreeMap<String, u64>,
+    active_requests: BTreeMap<String, PendingIndexRequest>,
     recovering: BTreeSet<String>,
     worker: Option<IndexWorkerState>,
     next_worker_generation: u64,
@@ -112,6 +115,12 @@ impl IndexCoordinatorState {
         let running_repos = std::mem::take(&mut self.running)
             .into_keys()
             .collect::<Vec<_>>();
+        for repo in &running_repos {
+            if let Some(mut request) = self.active_requests.remove(repo) {
+                request.snapshot_queued = false;
+                self.pending.insert(repo.clone(), request);
+            }
+        }
         self.recovering.extend(running_repos.iter().cloned());
         self.finish_worker(generation);
         Some(running_repos)
@@ -192,6 +201,21 @@ impl IndexCoordinatorState {
         }
         false
     }
+
+    fn persisted_queue(&self) -> PersistedIndexQueue {
+        PersistedIndexQueue {
+            pending: self
+                .pending
+                .iter()
+                .map(|(repo, request)| (repo.clone(), PersistedIndexRequest::from(request)))
+                .collect(),
+            running: self
+                .active_requests
+                .iter()
+                .map(|(repo, request)| (repo.clone(), PersistedIndexRequest::from(request)))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +227,166 @@ struct PendingIndexRequest {
     custom_extensions: Vec<String>,
     ignore_patterns: Vec<String>,
     snapshot_queued: bool,
+    retry_attempt: u8,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PersistedIndexQueue {
+    #[serde(default)]
+    pending: BTreeMap<String, PersistedIndexRequest>,
+    #[serde(default)]
+    running: BTreeMap<String, PersistedIndexRequest>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedIndexRequest {
+    repo: PathBuf,
+    force: bool,
+    explicit_refresh: bool,
+    splitter: String,
+    #[serde(default)]
+    custom_extensions: Vec<String>,
+    #[serde(default)]
+    ignore_patterns: Vec<String>,
+    #[serde(default)]
+    retry_attempt: u8,
+}
+
+impl From<&PendingIndexRequest> for PersistedIndexRequest {
+    fn from(request: &PendingIndexRequest) -> Self {
+        Self {
+            repo: request.repo.clone(),
+            force: request.force,
+            explicit_refresh: request.explicit_refresh,
+            splitter: match request.splitter {
+                SplitterKind::Ast => "ast",
+                SplitterKind::LangChain => "langchain",
+            }
+            .to_string(),
+            custom_extensions: request.custom_extensions.clone(),
+            ignore_patterns: request.ignore_patterns.clone(),
+            retry_attempt: request.retry_attempt,
+        }
+    }
+}
+
+impl PersistedIndexRequest {
+    fn into_pending(self) -> Result<PendingIndexRequest> {
+        let splitter = match self.splitter.as_str() {
+            "ast" => SplitterKind::Ast,
+            "langchain" => SplitterKind::LangChain,
+            other => bail!("unknown persisted splitter `{other}`"),
+        };
+        Ok(PendingIndexRequest {
+            repo: self.repo,
+            force: self.force,
+            explicit_refresh: self.explicit_refresh,
+            splitter,
+            custom_extensions: self.custom_extensions,
+            ignore_patterns: self.ignore_patterns,
+            snapshot_queued: false,
+            retry_attempt: self.retry_attempt,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct IndexQueueStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl IndexQueueStore {
+    fn new(snapshot_path: &std::path::Path) -> Self {
+        Self {
+            path: snapshot_path.with_file_name("index-queue.json"),
+            lock: Mutex::new(()),
+        }
+    }
+
+    async fn load(&self) -> Result<PersistedIndexQueue> {
+        let _guard = self.lock.lock().await;
+        if !self.path.exists() {
+            return Ok(PersistedIndexQueue::default());
+        }
+        let text = tokio::fs::read_to_string(&self.path)
+            .await
+            .with_context(|| format!("reading index queue at {}", self.path.display()))?;
+        serde_json::from_str(&text).context("parsing index queue json")
+    }
+
+    async fn write(&self, queue: &PersistedIndexQueue) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating index queue dir {}", parent.display()))?;
+        }
+        let temp_path = self.path.with_extension("tmp");
+        let text = serde_json::to_string_pretty(queue).context("serializing index queue json")?;
+        tokio::fs::write(&temp_path, format!("{text}\n"))
+            .await
+            .with_context(|| format!("writing index queue temp file {}", temp_path.display()))?;
+        tokio::fs::rename(&temp_path, &self.path)
+            .await
+            .with_context(|| format!("replacing index queue at {}", self.path.display()))
+    }
+}
+
+fn restore_persisted_index_queue(
+    config: &Config,
+    queue: PersistedIndexQueue,
+) -> (IndexCoordinatorState, BTreeSet<String>) {
+    let mut coordinator = IndexCoordinatorState::default();
+    let mut resumable = BTreeSet::new();
+
+    for request in queue
+        .pending
+        .into_values()
+        .chain(queue.running.into_values())
+    {
+        let request = match request.into_pending() {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("[warn] dropping invalid persisted index request: {error}");
+                continue;
+            }
+        };
+        let repo_key = request.repo.display().to_string();
+        match config.is_configured_repo_or_worktree(&request.repo) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "[info] dropping persisted index request for unconfigured repo {repo_key}"
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[warn] unable to validate persisted index request for {repo_key}: {error}"
+                );
+                continue;
+            }
+        }
+
+        if let Some(existing) = coordinator.pending.get_mut(&repo_key) {
+            existing.force |= request.force;
+            existing.explicit_refresh |= request.explicit_refresh;
+            existing.retry_attempt = existing.retry_attempt.max(request.retry_attempt);
+            if !request.custom_extensions.is_empty() {
+                existing.custom_extensions = request.custom_extensions;
+            }
+            if !request.ignore_patterns.is_empty() {
+                existing.ignore_patterns = request.ignore_patterns;
+            }
+        } else {
+            coordinator.pending.insert(repo_key.clone(), request);
+        }
+        resumable.insert(repo_key);
+    }
+
+    (coordinator, resumable)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -579,8 +763,21 @@ pub async fn serve(
 ) -> Result<()> {
     enforce_loopback_bind(listen, allow_remote_unauthenticated)?;
     let engine = Engine::new(config).await?;
+    let index_queue = Arc::new(IndexQueueStore::new(&config.snapshot_path));
+    let persisted_queue = match index_queue.load().await {
+        Ok(queue) => queue,
+        Err(error) => {
+            eprintln!("[error] unable to load persisted index queue: {error}");
+            PersistedIndexQueue::default()
+        }
+    };
+    let (index_coordinator, resumable_repos) =
+        restore_persisted_index_queue(config, persisted_queue);
     let interrupted_indexes = engine
-        .mark_interrupted_indexing_failed("agent-context restarted while indexing was in progress")
+        .mark_interrupted_indexing_failed_except(
+            "agent-context restarted while indexing was in progress",
+            &resumable_repos,
+        )
         .await?;
     if interrupted_indexes > 0 {
         eprintln!(
@@ -589,8 +786,34 @@ pub async fn serve(
     }
     let server = NativeServer {
         engine,
-        index_coordinator: Arc::new(Mutex::new(IndexCoordinatorState::default())),
+        index_coordinator: Arc::new(Mutex::new(index_coordinator)),
+        index_queue,
     };
+    if !resumable_repos.is_empty() {
+        let repos = resumable_repos.into_iter().collect::<Vec<_>>();
+        match server.mark_repos_indexing_queued(&repos).await {
+            Ok(()) => {
+                let worker_generation = {
+                    let mut coordinator = server.index_coordinator.lock().await;
+                    coordinator.mark_pending_snapshot_queued(&repos);
+                    coordinator.ensure_live_worker_for_pending(Instant::now())
+                };
+                server
+                    .persist_index_queue_or_log("startup queue recovery")
+                    .await;
+                eprintln!(
+                    "[info] resumed {} background index request(s) from the persisted queue",
+                    repos.len()
+                );
+                if let Some(generation) = worker_generation {
+                    server.spawn_background_index_worker(generation);
+                }
+            }
+            Err(error) => eprintln!(
+                "[error] unable to resume persisted index queue; retaining it for the next restart: {error}"
+            ),
+        }
+    }
     let cancellation = CancellationToken::new();
 
     if let Some(interval_secs) = config.freshness.audit_interval_secs {
@@ -1122,6 +1345,20 @@ impl ServerHandler for NativeServer {
 }
 
 impl NativeServer {
+    async fn persist_index_queue(&self) -> Result<()> {
+        let queue = {
+            let coordinator = self.index_coordinator.lock().await;
+            coordinator.persisted_queue()
+        };
+        self.index_queue.write(&queue).await
+    }
+
+    async fn persist_index_queue_or_log(&self, context: &str) {
+        if let Err(error) = self.persist_index_queue().await {
+            eprintln!("[error] unable to persist index queue after {context}: {error}");
+        }
+    }
+
     fn list_scopes(&self, include_repos: bool) -> ListScopesResult {
         let config = self.engine.config();
         ListScopesResult {
@@ -1151,6 +1388,7 @@ impl NativeServer {
         let mut released_recovery_repos = self.finish_incomplete_recovery_if_possible().await;
         let recovery = self.begin_stale_worker_recovery().await;
         let mut coordinator = self.index_coordinator.lock().await;
+        let coordinator_before_enqueue = coordinator.clone();
         let mut queued_repos = Vec::new();
         let mut merged_repos = Vec::new();
         let mut already_running = Vec::new();
@@ -1188,6 +1426,7 @@ impl NativeServer {
                         custom_extensions: custom_extensions.clone(),
                         ignore_patterns: ignore_patterns.clone(),
                         snapshot_queued,
+                        retry_attempt: 0,
                     },
                 );
                 if !coordinator.recovering.contains(&repo_key)
@@ -1197,6 +1436,12 @@ impl NativeServer {
                 }
                 queued_repos.push(repo_key);
             }
+        }
+        // Persist before changing the snapshot so a restart can always resume accepted work.
+        let queue = coordinator.persisted_queue();
+        if let Err(error) = self.index_queue.write(&queue).await {
+            *coordinator = coordinator_before_enqueue;
+            return Err(error);
         }
         drop(coordinator);
 
@@ -1227,6 +1472,7 @@ impl NativeServer {
                 coordinator.remove_unqueued_pending(&repos_to_mark_queued);
                 coordinator.ensure_live_worker_for_pending(Instant::now())
             };
+            self.persist_index_queue_or_log("queue rollback").await;
             if let Some(generation) = generation_to_spawn {
                 self.spawn_background_index_worker(generation);
             }
@@ -1238,6 +1484,7 @@ impl NativeServer {
             coordinator.mark_pending_snapshot_queued(&repos_to_mark_queued);
             coordinator.ensure_live_worker_for_pending(Instant::now())
         };
+        self.persist_index_queue_or_log("queue acceptance").await;
         if let Some(generation) = worker_generation {
             self.spawn_background_index_worker(generation);
         }
@@ -1391,6 +1638,8 @@ impl NativeServer {
             coordinator.mark_pending_snapshot_queued(&repos_to_mark_queued);
             coordinator.ensure_live_worker_for_pending(Instant::now())
         };
+        self.persist_index_queue_or_log("background worker recovery")
+            .await;
         if let Some(generation) = worker_generation {
             eprintln!(
                 "[warn] replacing recovered background indexing worker with generation={generation}"
@@ -1447,8 +1696,14 @@ impl NativeServer {
                     .remove(&repo_key)
                     .expect("pending repo exists");
                 coordinator.running.insert(repo_key.clone(), generation);
+                coordinator
+                    .active_requests
+                    .insert(repo_key.clone(), request.clone());
                 (repo_key, request)
             };
+
+            self.persist_index_queue_or_log("starting background index work")
+                .await;
 
             let (repo_key, request) = next;
             let label = request
@@ -1487,26 +1742,80 @@ impl NativeServer {
                     }
                 }
             };
-            if let Err(error) = index_result {
-                eprintln!(
+            let retry_reason = match &index_result {
+                Ok(result) => result
+                    .repos
+                    .iter()
+                    .filter_map(|repo| repo.error.as_deref())
+                    .find(|error| retryable_background_index_error(error))
+                    .map(str::to_string),
+                Err(error) if retryable_background_index_error(&error.to_string()) => {
+                    Some(error.to_string())
+                }
+                _ => None,
+            };
+            match &index_result {
+                Err(error) => eprintln!(
                     "[error] background indexing worker generation={generation} failed {repo_key}: {error}"
-                );
-            } else {
-                eprintln!(
+                ),
+                Ok(result) if result.has_errors => eprintln!(
+                    "[error] background indexing worker generation={generation} completed {repo_key} with index errors"
+                ),
+                Ok(_) => eprintln!(
                     "[info] background indexing worker generation={generation} finished {repo_key}"
+                ),
+            }
+
+            let mut retry_request = retry_reason.and_then(|reason| {
+                if request.retry_attempt >= BACKGROUND_INDEX_TRANSIENT_RETRIES {
+                    eprintln!(
+                        "[error] background indexing worker generation={generation} exhausted transient retries for {repo_key}: {reason}"
+                    );
+                    return None;
+                }
+                let mut retry = request.clone();
+                retry.retry_attempt = retry.retry_attempt.saturating_add(1);
+                retry.snapshot_queued = true;
+                eprintln!(
+                    "[warn] background indexing worker generation={generation} will retry {repo_key} after transient embedding failure (attempt {}/{})",
+                    retry.retry_attempt,
+                    BACKGROUND_INDEX_TRANSIENT_RETRIES
                 );
+                Some(retry)
+            });
+
+            if retry_request.is_some()
+                && let Err(error) = self
+                    .mark_repos_indexing_queued(std::slice::from_ref(&repo_key))
+                    .await
+            {
+                eprintln!(
+                    "[error] background indexing worker generation={generation} could not queue retry for {repo_key}: {error}"
+                );
+                retry_request = None;
             }
 
             let mut coordinator = self.index_coordinator.lock().await;
             if coordinator.running.get(&repo_key).copied() == Some(generation) {
                 coordinator.running.remove(&repo_key);
+                coordinator.active_requests.remove(&repo_key);
+                if let Some(request) = retry_request {
+                    coordinator.pending.insert(repo_key.clone(), request);
+                }
                 coordinator.heartbeat_worker(generation, Instant::now());
             } else {
                 eprintln!(
                     "[warn] background indexing worker generation={generation} finished stale repo {repo_key} after replacement"
                 );
+                coordinator.active_requests.remove(&repo_key);
+                drop(coordinator);
+                self.persist_index_queue_or_log("late stale worker completion")
+                    .await;
                 return;
             }
+            drop(coordinator);
+            self.persist_index_queue_or_log("finishing background index work")
+                .await;
         }
     }
 
@@ -1523,19 +1832,23 @@ impl NativeServer {
             };
             running_repos
         };
-        if self
-            .mark_recovered_repos_failed(
-                "aborted-background-worker",
-                "aborted background worker",
-                &running_repos,
-                reason,
-            )
-            .await
-        {
-            self.finish_recovery_queue_pending_and_restart(&running_repos)
-                .await;
-        }
+        eprintln!(
+            "[error] background indexing worker generation={generation} aborted: {reason}; re-queueing {} repo(s)",
+            running_repos.len()
+        );
+        self.persist_index_queue_or_log("background worker abort")
+            .await;
+        self.finish_recovery_queue_pending_and_restart(&running_repos)
+            .await;
     }
+}
+
+fn retryable_background_index_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("ollama embeddings")
+        && (error.contains("connection reset by peer")
+            || error.contains("connection refused")
+            || (error.contains("/tokenize") && error.contains("read tcp")))
 }
 
 fn build_tool(
@@ -2565,7 +2878,7 @@ mod tests {
     };
     use serde_json::{Value, json, to_value};
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn pending_request(path: &str) -> PendingIndexRequest {
         PendingIndexRequest {
@@ -2576,6 +2889,7 @@ mod tests {
             custom_extensions: Vec::new(),
             ignore_patterns: Vec::new(),
             snapshot_queued: true,
+            retry_attempt: 0,
         }
     }
 
@@ -3629,6 +3943,32 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_keeps_stale_active_work_persisted_for_restart_recovery() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        let generation =
+            coordinator.start_worker(now - INDEX_WORKER_STALE_AFTER - Duration::from_secs(1));
+        coordinator
+            .running
+            .insert("/tmp/running".to_string(), generation);
+        coordinator
+            .active_requests
+            .insert("/tmp/running".to_string(), pending_request("/tmp/running"));
+
+        let recovery = coordinator
+            .begin_stale_worker_recovery(now)
+            .expect("stale worker should enter recovery");
+
+        assert_eq!(recovery.running_repos, vec!["/tmp/running".to_string()]);
+        assert!(
+            coordinator
+                .persisted_queue()
+                .running
+                .contains_key("/tmp/running")
+        );
+    }
+
+    #[test]
     fn coordinator_keeps_fresh_running_worker_alive() {
         let now = Instant::now();
         let mut coordinator = IndexCoordinatorState::default();
@@ -3768,5 +4108,69 @@ mod tests {
             .expect("worker has not drained pending request in this unit test");
         assert!(request.force);
         assert!(request.explicit_refresh);
+    }
+
+    #[test]
+    fn coordinator_persists_active_work_separately_from_pending() {
+        let mut coordinator = IndexCoordinatorState::default();
+        let mut running = pending_request("/tmp/running");
+        running.force = true;
+        running.retry_attempt = 1;
+        coordinator
+            .active_requests
+            .insert("/tmp/running".to_string(), running);
+        coordinator
+            .pending
+            .insert("/tmp/pending".to_string(), pending_request("/tmp/pending"));
+
+        let journal = coordinator.persisted_queue();
+
+        assert!(journal.pending.contains_key("/tmp/pending"));
+        let running = journal.running.get("/tmp/running").unwrap();
+        assert!(running.force);
+        assert_eq!(running.retry_attempt, 1);
+    }
+
+    #[test]
+    fn coordinator_requeues_active_work_after_worker_abort() {
+        let now = Instant::now();
+        let mut coordinator = IndexCoordinatorState::default();
+        let generation = coordinator.start_worker(now);
+        let request = pending_request("/tmp/running");
+        coordinator
+            .running
+            .insert("/tmp/running".to_string(), generation);
+        coordinator
+            .active_requests
+            .insert("/tmp/running".to_string(), request);
+
+        let recovered = coordinator
+            .begin_worker_abort_recovery(generation)
+            .expect("active worker should enter recovery");
+
+        assert_eq!(recovered, vec!["/tmp/running".to_string()]);
+        assert!(coordinator.running.is_empty());
+        assert!(coordinator.active_requests.is_empty());
+        assert!(!coordinator.pending["/tmp/running"].snapshot_queued);
+    }
+
+    #[tokio::test]
+    async fn index_queue_store_round_trips_running_requests() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-context-index-queue-{nanos}"));
+        let store = super::IndexQueueStore::new(&root.join("snapshot.json"));
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .active_requests
+            .insert("/tmp/running".to_string(), pending_request("/tmp/running"));
+
+        store.write(&coordinator.persisted_queue()).await.unwrap();
+        let restored = store.load().await.unwrap();
+
+        assert!(restored.running.contains_key("/tmp/running"));
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

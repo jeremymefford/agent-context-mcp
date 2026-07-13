@@ -447,9 +447,9 @@ where
 
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                if is_retryable_status(status) && attempt + 1 < MAX_RETRIES {
+                if is_retryable_response(operation, status, &body) && attempt + 1 < MAX_RETRIES {
                     last_error = Some(format!("{operation} failed with {status}: {body}"));
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    tokio::time::sleep(retry_delay_for(operation, attempt)).await;
                     continue;
                 }
                 bail!("{operation} failed with {status}: {body}");
@@ -457,7 +457,7 @@ where
             Err(error) => {
                 if is_retryable_transport_error(&error) && attempt + 1 < MAX_RETRIES {
                     last_error = Some(format!("{operation} transport error: {error}"));
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    tokio::time::sleep(retry_delay_for(operation, attempt)).await;
                     continue;
                 }
                 return Err(error).with_context(|| operation.to_string());
@@ -491,6 +491,17 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     )
 }
 
+fn is_retryable_response(operation: &str, status: reqwest::StatusCode, body: &str) -> bool {
+    is_retryable_status(status) || (operation == "Ollama embeddings" && ollama_runtime_error(body))
+}
+
+fn ollama_runtime_error(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("connection reset by peer")
+        || body.contains("connection refused")
+        || (body.contains("/tokenize") && body.contains("read tcp"))
+}
+
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
@@ -503,6 +514,15 @@ fn retry_delay(attempt: usize) -> Duration {
         .subsec_millis() as u64
         % 250;
     Duration::from_millis(base_ms.saturating_add(jitter_ms))
+}
+
+fn retry_delay_for(operation: &str, attempt: usize) -> Duration {
+    if operation == "Ollama embeddings" {
+        // Ollama can briefly lose its model-side tokenizer while returning a 400 to the client.
+        let seconds = 2_u64.saturating_mul(1_u64 << attempt.min(3));
+        return Duration::from_secs(seconds);
+    }
+    retry_delay(attempt)
 }
 
 fn request_id(operation: &str, attempt: usize) -> String {
@@ -532,7 +552,9 @@ fn known_dimension(provider: &str, model: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{known_dimension, ollama_embed_payload, retry_delay};
+    use super::{
+        known_dimension, ollama_embed_payload, ollama_runtime_error, retry_delay, retry_delay_for,
+    };
     use serde_json::json;
 
     #[test]
@@ -550,6 +572,15 @@ mod tests {
     #[test]
     fn retry_delay_grows_per_attempt() {
         assert!(retry_delay(1) >= retry_delay(0));
+    }
+
+    #[test]
+    fn retries_ollama_tokenizer_connection_resets_with_longer_backoff() {
+        assert!(ollama_runtime_error(
+            "Post \\\"http://127.0.0.1:55994/tokenize\\\": read tcp: connection reset by peer"
+        ));
+        assert!(!ollama_runtime_error("invalid dimensions"));
+        assert!(retry_delay_for("Ollama embeddings", 0) > retry_delay(0));
     }
 
     #[test]

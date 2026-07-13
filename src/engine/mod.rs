@@ -1215,10 +1215,14 @@ impl Engine {
         })
     }
 
-    pub async fn mark_interrupted_indexing_failed(&self, reason: &str) -> Result<usize> {
+    pub async fn mark_interrupted_indexing_failed_except(
+        &self,
+        reason: &str,
+        resumable: &std::collections::BTreeSet<String>,
+    ) -> Result<usize> {
         self.inner
             .snapshot
-            .mark_interrupted_indexing_failed(reason)
+            .mark_interrupted_indexing_failed_except(reason, resumable)
             .await
     }
 
