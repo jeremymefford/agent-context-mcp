@@ -40,6 +40,20 @@ base_url = "http://127.0.0.1:11434"
 # repo = "/absolute/path/to/repo"
 # profile = "local"
 
+[indexing]
+# conservative preserves the existing scan surface.
+# aggressive also excludes generated output, dependency/vendor directories, package lockfiles,
+# fixtures/testdata/snapshots, and files with ".generated." in their name.
+exclusion_profile = "conservative"
+# exclude_patterns = ["third_party/**"]
+
+# Add repo-relative exclusions or narrowly restore paths excluded by the profile.
+# Include patterns cannot override Git ignores or protected hidden directories.
+# [[indexing.repo_rules]]
+# repo = "/absolute/path/to/repo"
+# exclude_patterns = ["fixtures/large/**"]
+# include_patterns = ["vendor/required.rs"]
+
 [worktrees]
 # ignore = do not auto-resolve Git worktrees unless explicitly configured as repos
 # overlay = reuse the canonical repo index and index only changed/new worktree files

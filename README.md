@@ -469,6 +469,18 @@ base_url = "http://127.0.0.1:1234/v1"
 repo = "/absolute/path/to/local-repo"
 profile = "local"
 
+[indexing]
+# conservative preserves the existing scan surface.
+# aggressive also excludes generated output, dependency/vendor directories, package lockfiles,
+# fixtures/testdata/snapshots, and files with ".generated." in their name.
+exclusion_profile = "conservative"
+# exclude_patterns = ["third_party/**"]
+
+# [[indexing.repo_rules]]
+# repo = "/absolute/path/to/repo"
+# exclude_patterns = ["fixtures/large/**"]
+# include_patterns = ["vendor/required.rs"]
+
 [worktrees]
 mode = "overlay"
 auto_discover = true
@@ -510,6 +522,12 @@ api_key_env = "VOYAGE_API_KEY"
 ```
 
 See the full template in [config.example.toml](config.example.toml).
+
+### Indexing Exclusions
+
+`[indexing]` controls the repository-relative paths eligible for indexing and exact-text live fallback. The default `conservative` profile preserves the current behavior. `aggressive` is intended for large application repositories and excludes common generated and low-signal content: build outputs, dependency/vendor directories, package lockfiles, fixture/testdata/snapshot directories, and files with `.generated.` in the filename. It leaves normal source files, `build.rs`, and tests eligible for indexing.
+
+Use `exclude_patterns` for global repo-relative globs. `[[indexing.repo_rules]]` adds exclusions for one configured repo; its `include_patterns` can restore a specific path excluded by the profile or configured patterns. Include patterns never override Git ignore rules, protected VCS/cache directories, extension support, or binary-file filtering. After changing exclusions, a normal refresh removes formerly indexed paths while preserving unchanged eligible embeddings, so a full reindex is unnecessary.
 
 ### Git Worktrees
 

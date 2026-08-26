@@ -6,7 +6,10 @@ pub mod milvus;
 pub mod splitter;
 pub mod symbols;
 
-use crate::config::{Config, ResolvedScope, ScopeKind, WorktreeMode, WorktreeResolution};
+use crate::config::{
+    Config, ExclusionProfile, RepoIndexPolicy, ResolvedScope, ScopeKind, WorktreeMode,
+    WorktreeResolution,
+};
 use crate::snapshot::{Snapshot, SnapshotEntry, SnapshotStore, WorktreeSnapshotEntry};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
@@ -77,6 +80,34 @@ const BLOCKED_HIDDEN_DIRS: &[&str] = &[
     ".nuxt",
     ".turbo",
     ".cache",
+];
+const AGGRESSIVE_EXCLUDED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "coverage",
+    "fixtures",
+    "fixture",
+    "testdata",
+    "snapshots",
+    "generated",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".cache",
+];
+const AGGRESSIVE_EXCLUDED_FILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "cargo.lock",
+    "poetry.lock",
+    "uv.lock",
+    "composer.lock",
+    "gemfile.lock",
 ];
 const WORKTREE_EMBEDDING_INHERIT: &str = "inherit";
 const VECTOR_FLUSH_FILE_CHANGE_THRESHOLD: u64 = 32;
@@ -2254,11 +2285,14 @@ impl Engine {
         if let Some(file) = &request.file {
             return Ok(vec![normalize_relative_path(file)]);
         }
+        let policy_repo = self.repo_context(repo)?.canonical_root;
+        let indexing_policy = self.inner.config.indexing.policy_for_repo(&policy_repo);
 
         if search_text_scans_live_repo(request) {
             let language = request.language.clone();
             let extension_filter = request.extension_filter.clone();
             let repo_path = repo.to_path_buf();
+            let indexing_policy = indexing_policy.clone();
             return self
                 .run_search_lexical_blocking("search_text_repo_candidates", move || {
                     collect_live_candidate_files(
@@ -2266,6 +2300,7 @@ impl Engine {
                         None,
                         language.as_deref(),
                         &extension_filter,
+                        &indexing_policy,
                     )
                 })
                 .await;
@@ -2282,6 +2317,7 @@ impl Engine {
         let language = request.language.clone();
         let extension_filter = request.extension_filter.clone();
         let repo_path = repo.to_path_buf();
+        let indexing_policy = indexing_policy.clone();
         let fallback: Vec<String> = self
             .run_search_lexical_blocking("search_text_fallback_candidates", move || {
                 collect_live_candidate_files(
@@ -2289,6 +2325,7 @@ impl Engine {
                     path_prefix.as_deref(),
                     language.as_deref(),
                     &extension_filter,
+                    &indexing_policy,
                 )
             })
             .await?;
@@ -3719,21 +3756,33 @@ impl Engine {
             let worktree_root = ctx.requested_root.clone();
             let canonical_custom_extensions = custom_extensions.to_vec();
             let canonical_ignore_patterns = ignore_patterns.to_vec();
+            let canonical_indexing_policy = self
+                .inner
+                .config
+                .indexing
+                .policy_for_repo(&ctx.canonical_root);
             let canonical_files = run_low_priority_blocking("scan_canonical_for_overlay", move || {
                 scan_repo(
                     &canonical_root,
                     &canonical_custom_extensions,
                     &canonical_ignore_patterns,
+                    &canonical_indexing_policy,
                 )
             })
             .await?;
             let worktree_custom_extensions = custom_extensions.to_vec();
             let worktree_ignore_patterns = ignore_patterns.to_vec();
+            let worktree_indexing_policy = self
+                .inner
+                .config
+                .indexing
+                .policy_for_repo(&ctx.canonical_root);
             let worktree_files = run_low_priority_blocking("scan_worktree_overlay", move || {
                 scan_repo(
                     &worktree_root,
                     &worktree_custom_extensions,
                     &worktree_ignore_patterns,
+                    &worktree_indexing_policy,
                 )
             })
             .await?;
@@ -4024,8 +4073,14 @@ impl Engine {
         let repo_path = repo.to_path_buf();
         let custom_extensions = custom_extensions.to_vec();
         let ignore_patterns = ignore_patterns.to_vec();
+        let indexing_policy = self.inner.config.indexing.policy_for_repo(repo);
         let current_files = run_low_priority_blocking("scan_repo", move || {
-            scan_repo(&repo_path, &custom_extensions, &ignore_patterns)
+            scan_repo(
+                &repo_path,
+                &custom_extensions,
+                &ignore_patterns,
+                &indexing_policy,
+            )
         })
         .await?;
         let current_hashes = current_files
@@ -6935,6 +6990,7 @@ fn scan_repo(
     repo: &Path,
     custom_extensions: &[String],
     ignore_patterns: &[String],
+    policy: &RepoIndexPolicy,
 ) -> Result<BTreeMap<String, RepoFile>> {
     let mut supported_extensions = default_supported_extensions();
     for extension in custom_extensions {
@@ -6948,6 +7004,7 @@ fn scan_repo(
 
     let all_ignore_patterns = collect_ignore_patterns(repo, ignore_patterns)?;
     let ignore_set = build_ignore_set(&all_ignore_patterns)?;
+    let exclusion_matcher = ExclusionMatcher::new(policy)?;
     let mut files = BTreeMap::new();
 
     let mut builder = WalkBuilder::new(repo);
@@ -6958,7 +7015,14 @@ fn scan_repo(
     builder.follow_links(false);
     builder.require_git(false);
     let repo_filter_root = repo.to_path_buf();
-    builder.filter_entry(move |entry| walker_entry_is_allowed(&repo_filter_root, entry.path()));
+    let entry_exclusion_matcher = exclusion_matcher.clone();
+    builder.filter_entry(move |entry| {
+        walker_entry_is_allowed(&repo_filter_root, entry.path())
+            && !entry.file_type().is_some_and(|file_type| {
+                file_type.is_dir()
+                    && entry_exclusion_matcher.should_prune_dir(&repo_filter_root, entry.path())
+            })
+    });
 
     for entry in builder.build() {
         let entry = match entry {
@@ -6982,6 +7046,9 @@ fn scan_repo(
             continue;
         }
         if ignore_set.is_match(&relative_path) {
+            continue;
+        }
+        if exclusion_matcher.path_is_excluded(&relative_path) {
             continue;
         }
 
@@ -7010,6 +7077,66 @@ fn scan_repo(
     }
 
     Ok(files)
+}
+
+#[derive(Clone)]
+struct ExclusionMatcher {
+    exclusion_profile: ExclusionProfile,
+    exclude_patterns: GlobSet,
+    include_patterns: GlobSet,
+    has_include_patterns: bool,
+}
+
+impl ExclusionMatcher {
+    fn new(policy: &RepoIndexPolicy) -> Result<Self> {
+        Ok(Self {
+            exclusion_profile: policy.exclusion_profile,
+            exclude_patterns: build_ignore_set(&policy.exclude_patterns)?,
+            include_patterns: build_ignore_set(&policy.include_patterns)?,
+            has_include_patterns: !policy.include_patterns.is_empty(),
+        })
+    }
+
+    fn path_is_excluded(&self, relative_path: &str) -> bool {
+        if self.include_patterns.is_match(relative_path) {
+            return false;
+        }
+        if self.exclude_patterns.is_match(relative_path) {
+            return true;
+        }
+        self.exclusion_profile == ExclusionProfile::Aggressive
+            && aggressive_path_is_excluded(Path::new(relative_path))
+    }
+
+    fn should_prune_dir(&self, repo: &Path, entry_path: &Path) -> bool {
+        if self.exclusion_profile != ExclusionProfile::Aggressive || self.has_include_patterns {
+            return false;
+        }
+        let Ok(relative_path) = entry_path.strip_prefix(repo) else {
+            return false;
+        };
+        relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| AGGRESSIVE_EXCLUDED_DIRS.contains(&name))
+    }
+}
+
+fn aggressive_path_is_excluded(relative_path: &Path) -> bool {
+    if relative_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| AGGRESSIVE_EXCLUDED_DIRS.contains(&name))
+    }) {
+        return true;
+    }
+    let Some(file_name) = relative_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower_file_name = file_name.to_ascii_lowercase();
+    AGGRESSIVE_EXCLUDED_FILES.contains(&lower_file_name.as_str())
+        || lower_file_name.contains(".generated.")
 }
 
 fn walker_entry_is_allowed(repo: &Path, entry_path: &Path) -> bool {
@@ -7122,6 +7249,7 @@ fn collect_live_candidate_files(
     path_prefix: Option<&str>,
     language: Option<&str>,
     extension_filter: &[String],
+    policy: &RepoIndexPolicy,
 ) -> Result<Vec<String>> {
     let normalized_prefix = path_prefix
         .map(normalize_relative_path)
@@ -7140,6 +7268,9 @@ fn collect_live_candidate_files(
     } else {
         repo.to_path_buf()
     };
+    let all_ignore_patterns = collect_ignore_patterns(repo, &[])?;
+    let ignore_set = build_ignore_set(&all_ignore_patterns)?;
+    let exclusion_matcher = ExclusionMatcher::new(policy)?;
 
     let mut files = Vec::new();
     let mut builder = WalkBuilder::new(&walk_root);
@@ -7150,7 +7281,14 @@ fn collect_live_candidate_files(
     builder.follow_links(false);
     builder.require_git(false);
     let repo_filter_root = repo.to_path_buf();
-    builder.filter_entry(move |entry| walker_entry_is_allowed(&repo_filter_root, entry.path()));
+    let entry_exclusion_matcher = exclusion_matcher.clone();
+    builder.filter_entry(move |entry| {
+        walker_entry_is_allowed(&repo_filter_root, entry.path())
+            && !entry.file_type().is_some_and(|file_type| {
+                file_type.is_dir()
+                    && entry_exclusion_matcher.should_prune_dir(&repo_filter_root, entry.path())
+            })
+    });
 
     for entry in builder.build() {
         let entry = match entry {
@@ -7170,6 +7308,10 @@ fn collect_live_candidate_files(
         };
         let relative_path = relative_path.display().to_string().replace('\\', "/");
         if !hidden_path_is_allowed(Path::new(&relative_path)) {
+            continue;
+        }
+        if ignore_set.is_match(&relative_path) || exclusion_matcher.path_is_excluded(&relative_path)
+        {
             continue;
         }
         if !path_matches_prefix(&relative_path, normalized_prefix.as_deref()) {
@@ -7800,7 +7942,9 @@ mod tests {
         validate_search_text_fallback_size, vector_flush_needed, vector_release_needed,
         worktree_overlay_context_from_snapshot,
     };
-    use crate::config::{ResolvedScope, ScopeKind, SearchConfig};
+    use crate::config::{
+        ExclusionProfile, RepoIndexPolicy, ResolvedScope, ScopeKind, SearchConfig,
+    };
     use crate::engine::live_files::LiveFileStore;
     use crate::engine::symbols::IndexedSymbol;
     use crate::snapshot::{Snapshot, WorktreeSnapshotEntry};
@@ -7825,6 +7969,22 @@ mod tests {
         let path = temp_file_path(name);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn conservative_index_policy() -> RepoIndexPolicy {
+        RepoIndexPolicy {
+            exclusion_profile: ExclusionProfile::Conservative,
+            exclude_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+        }
+    }
+
+    fn aggressive_index_policy() -> RepoIndexPolicy {
+        RepoIndexPolicy {
+            exclusion_profile: ExclusionProfile::Aggressive,
+            exclude_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+        }
     }
 
     #[test]
@@ -8162,12 +8322,20 @@ mod tests {
         )
         .unwrap();
 
+        let policy = conservative_index_policy();
         let rust_only =
-            collect_live_candidate_files(&repo, Some("src/pipeline"), Some("rust"), &[]).unwrap();
-        let explicit_python =
-            collect_live_candidate_files(&repo, Some("src/pipeline"), None, &[String::from(".py")])
+            collect_live_candidate_files(&repo, Some("src/pipeline"), Some("rust"), &[], &policy)
                 .unwrap();
-        let repo_wide = collect_live_candidate_files(&repo, None, Some("rust"), &[]).unwrap();
+        let explicit_python = collect_live_candidate_files(
+            &repo,
+            Some("src/pipeline"),
+            None,
+            &[String::from(".py")],
+            &policy,
+        )
+        .unwrap();
+        let repo_wide =
+            collect_live_candidate_files(&repo, None, Some("rust"), &[], &policy).unwrap();
 
         assert_eq!(rust_only, vec!["src/pipeline/worker.rs".to_string()]);
         assert_eq!(explicit_python, vec!["src/pipeline/worker.py".to_string()]);
@@ -8212,7 +8380,8 @@ mod tests {
         )
         .unwrap();
 
-        let files = scan_repo(&repo, &[], &[]).unwrap();
+        let policy = conservative_index_policy();
+        let files = scan_repo(&repo, &[], &[], &policy).unwrap();
 
         assert!(files.contains_key(".github/workflows/ci.yml"));
         assert!(files.contains_key(".devcontainer/devcontainer.json"));
@@ -8232,7 +8401,14 @@ mod tests {
         )
         .unwrap();
 
-        let files = scan_repo(&repo, &[], &[String::from(".github/workflows/*.yml")]).unwrap();
+        let policy = conservative_index_policy();
+        let files = scan_repo(
+            &repo,
+            &[],
+            &[String::from(".github/workflows/*.yml")],
+            &policy,
+        )
+        .unwrap();
 
         assert!(!files.contains_key(".github/workflows/ci.yml"));
     }
@@ -8249,13 +8425,124 @@ mod tests {
         .unwrap();
         fs::write(repo.join(".cache").join("ci.yml"), "name: cache\n").unwrap();
 
-        let scoped =
-            collect_live_candidate_files(&repo, Some(".github/workflows"), Some("yaml"), &[])
-                .unwrap();
-        let repo_wide = collect_live_candidate_files(&repo, None, Some("yaml"), &[]).unwrap();
+        let policy = conservative_index_policy();
+        let scoped = collect_live_candidate_files(
+            &repo,
+            Some(".github/workflows"),
+            Some("yaml"),
+            &[],
+            &policy,
+        )
+        .unwrap();
+        let repo_wide =
+            collect_live_candidate_files(&repo, None, Some("yaml"), &[], &policy).unwrap();
 
         assert_eq!(scoped, vec![".github/workflows/ci.yml".to_string()]);
         assert_eq!(repo_wide, vec![".github/workflows/ci.yml".to_string()]);
+    }
+
+    #[test]
+    fn aggressive_policy_excludes_high_volume_paths_but_keeps_source_and_tests() {
+        let repo = temp_dir("aggressive-scan-repo");
+        for path in [
+            "src/lib.rs",
+            "build.rs",
+            "tests/example.rs",
+            "target/debug/generated.rs",
+            "node_modules/package/index.js",
+            "vendor/sqlite/extension.c",
+            "generated/catalog.json",
+            "fixtures/media.toml",
+            "testdata/example.json",
+            "snapshots/render.json",
+            "package-lock.json",
+            "src/catalog.generated.rs",
+        ] {
+            let file = repo.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fn indexed() {}\n").unwrap();
+        }
+
+        let policy = aggressive_index_policy();
+        let files = scan_repo(&repo, &[], &[], &policy).unwrap();
+
+        assert!(files.contains_key("src/lib.rs"));
+        assert!(files.contains_key("build.rs"));
+        assert!(files.contains_key("tests/example.rs"));
+        for excluded in [
+            "target/debug/generated.rs",
+            "node_modules/package/index.js",
+            "vendor/sqlite/extension.c",
+            "generated/catalog.json",
+            "fixtures/media.toml",
+            "testdata/example.json",
+            "snapshots/render.json",
+            "package-lock.json",
+            "src/catalog.generated.rs",
+        ] {
+            assert!(
+                !files.contains_key(excluded),
+                "{excluded} should be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn aggressive_policy_include_pattern_restores_specific_path() {
+        let repo = temp_dir("aggressive-include-repo");
+        for path in ["vendor/kept.rs", "vendor/omitted.rs"] {
+            let file = repo.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fn indexed() {}\n").unwrap();
+        }
+        let mut policy = aggressive_index_policy();
+        policy.include_patterns.push("vendor/kept.rs".to_string());
+
+        let files = scan_repo(&repo, &[], &[], &policy).unwrap();
+
+        assert!(files.contains_key("vendor/kept.rs"));
+        assert!(!files.contains_key("vendor/omitted.rs"));
+    }
+
+    #[test]
+    fn conservative_policy_preserves_vendor_and_lockfiles() {
+        let repo = temp_dir("conservative-scan-repo");
+        for path in ["vendor/required.rs", "package-lock.json"] {
+            let file = repo.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fn indexed() {}\n").unwrap();
+        }
+
+        let policy = conservative_index_policy();
+        let files = scan_repo(&repo, &[], &[], &policy).unwrap();
+
+        assert!(files.contains_key("vendor/required.rs"));
+        assert!(files.contains_key("package-lock.json"));
+    }
+
+    #[test]
+    fn live_candidates_apply_aggressive_policy_and_contextignore() {
+        let repo = temp_dir("aggressive-live-candidates");
+        for path in [
+            "src/lib.rs",
+            "target/debug/generated.rs",
+            "vendor/kept.rs",
+            "ignored.rs",
+        ] {
+            let file = repo.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fn indexed() {}\n").unwrap();
+        }
+        fs::write(repo.join(".contextignore"), "ignored.rs\n").unwrap();
+        let mut policy = aggressive_index_policy();
+        policy.include_patterns.push("vendor/kept.rs".to_string());
+
+        let files = collect_live_candidate_files(&repo, None, Some("rust"), &[], &policy).unwrap();
+
+        assert_eq!(
+            files,
+            vec!["src/lib.rs".to_string(), "vendor/kept.rs".to_string()]
+        );
     }
 
     #[test]
@@ -8897,13 +9184,15 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().expect("create runtime");
         let mut runs: Vec<(usize, u64, std::time::Duration)> = Vec::new();
+        let policy = conservative_index_policy();
 
         for _ in 0..2 {
             let repo_path = path.clone();
+            let scan_policy = policy.clone();
             let started = std::time::Instant::now();
             let files = runtime
                 .block_on(run_low_priority_blocking("bench_scan_repo", move || {
-                    scan_repo(&repo_path, &[], &[])
+                    scan_repo(&repo_path, &[], &[], &scan_policy)
                 }))
                 .expect("scan_repo should succeed");
             let elapsed = started.elapsed();

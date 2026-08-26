@@ -108,8 +108,8 @@ mod tests {
     use super::reset_paths;
     use crate::config::{
         Config, EmbeddingConfig, EmbeddingProfileConfig, EmbeddingProvider, FreshnessConfig,
-        GroupConfig, MilvusConfig, OllamaProviderConfig, OpenAiProviderConfig, SearchConfig,
-        VoyageProviderConfig, WorktreeConfig,
+        GroupConfig, IndexingConfig, MilvusConfig, OllamaProviderConfig, OpenAiProviderConfig,
+        SearchConfig, VoyageProviderConfig, WorktreeConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -154,6 +154,7 @@ mod tests {
             }],
             freshness: FreshnessConfig::default(),
             search: SearchConfig::default(),
+            indexing: IndexingConfig::default(),
             worktrees: WorktreeConfig::default(),
             worktree_canonicals: BTreeMap::new(),
         }

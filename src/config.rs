@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use globset::Glob;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +37,7 @@ pub struct Config {
     pub groups: Vec<GroupConfig>,
     pub freshness: FreshnessConfig,
     pub search: SearchConfig,
+    pub indexing: IndexingConfig,
     pub worktrees: WorktreeConfig,
     pub(crate) worktree_canonicals: BTreeMap<String, PathBuf>,
 }
@@ -84,6 +86,52 @@ pub struct WorktreeConfig {
     pub max_overlay_files: usize,
     pub max_overlay_bytes: u64,
     pub embedding_profile: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExclusionProfile {
+    #[default]
+    Conservative,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepoIndexRule {
+    pub exclude_patterns: Vec<String>,
+    pub include_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IndexingConfig {
+    pub exclusion_profile: ExclusionProfile,
+    pub exclude_patterns: Vec<String>,
+    pub repo_rules: BTreeMap<String, RepoIndexRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoIndexPolicy {
+    pub exclusion_profile: ExclusionProfile,
+    pub exclude_patterns: Vec<String>,
+    pub include_patterns: Vec<String>,
+}
+
+impl IndexingConfig {
+    pub fn policy_for_repo(&self, repo: &Path) -> RepoIndexPolicy {
+        let repo_key = repo.display().to_string();
+        let rule = self.repo_rules.get(&repo_key);
+        let mut exclude_patterns = self.exclude_patterns.clone();
+        if let Some(rule) = rule {
+            exclude_patterns.extend(rule.exclude_patterns.clone());
+        }
+
+        RepoIndexPolicy {
+            exclusion_profile: self.exclusion_profile,
+            exclude_patterns,
+            include_patterns: rule
+                .map(|rule| rule.include_patterns.clone())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 impl Default for WorktreeConfig {
@@ -205,6 +253,8 @@ struct RawConfig {
     #[serde(default)]
     search: Option<SearchConfig>,
     #[serde(default)]
+    indexing: Option<RawIndexingConfig>,
+    #[serde(default)]
     worktrees: Option<RawWorktreeConfig>,
     #[serde(default)]
     snapshot_path: Option<String>,
@@ -264,6 +314,25 @@ struct RawWorktreeConfig {
     max_overlay_bytes: Option<String>,
     #[serde(default)]
     embedding_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawIndexingConfig {
+    #[serde(default)]
+    exclusion_profile: Option<String>,
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
+    #[serde(default)]
+    repo_rules: Vec<RawRepoIndexRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRepoIndexRule {
+    repo: String,
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
+    #[serde(default)]
+    include_patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -483,6 +552,7 @@ impl Config {
         }
 
         let embedding = build_embedding_config(&raw, config_dir, &groups)?;
+        let indexing = build_indexing_config(raw.indexing.as_ref(), config_dir, &groups)?;
         let worktrees = build_worktree_config(raw.worktrees.as_ref(), &embedding)?;
         let worktree_canonicals = if worktrees.mode == WorktreeMode::Overlay {
             build_worktree_canonical_map(&groups)?
@@ -501,6 +571,7 @@ impl Config {
             groups: std::mem::take(&mut groups),
             freshness,
             search,
+            indexing,
             worktrees,
             worktree_canonicals,
         })
@@ -1099,6 +1170,90 @@ fn validate_search_config(search: &SearchConfig) -> Result<()> {
     Ok(())
 }
 
+fn build_indexing_config(
+    raw: Option<&RawIndexingConfig>,
+    config_dir: &Path,
+    groups: &[GroupConfig],
+) -> Result<IndexingConfig> {
+    let Some(raw) = raw else {
+        return Ok(IndexingConfig::default());
+    };
+    let exclusion_profile = raw
+        .exclusion_profile
+        .as_deref()
+        .map(parse_exclusion_profile)
+        .transpose()?
+        .unwrap_or_default();
+    let exclude_patterns =
+        validate_indexing_patterns(&raw.exclude_patterns, "indexing.exclude_patterns")?;
+    let configured_repos = groups
+        .iter()
+        .flat_map(|group| group.repos.iter().cloned())
+        .collect::<HashSet<_>>();
+    let mut repo_rules = BTreeMap::new();
+
+    for raw_rule in &raw.repo_rules {
+        let repo = normalize_path_from(&raw_rule.repo, config_dir)?;
+        let repo_key = repo.display().to_string();
+        if !configured_repos.contains(&repo_key) {
+            bail!(
+                "indexing rule repo `{}` is not present in any configured group",
+                raw_rule.repo
+            );
+        }
+        if repo_rules.contains_key(&repo_key) {
+            bail!("duplicate indexing rule for repo `{repo_key}`");
+        }
+        let context = format!("indexing.repo_rules for `{repo_key}`");
+        repo_rules.insert(
+            repo_key,
+            RepoIndexRule {
+                exclude_patterns: validate_indexing_patterns(
+                    &raw_rule.exclude_patterns,
+                    &format!("{context}.exclude_patterns"),
+                )?,
+                include_patterns: validate_indexing_patterns(
+                    &raw_rule.include_patterns,
+                    &format!("{context}.include_patterns"),
+                )?,
+            },
+        );
+    }
+
+    Ok(IndexingConfig {
+        exclusion_profile,
+        exclude_patterns,
+        repo_rules,
+    })
+}
+
+fn parse_exclusion_profile(value: &str) -> Result<ExclusionProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "conservative" => Ok(ExclusionProfile::Conservative),
+        "aggressive" => Ok(ExclusionProfile::Aggressive),
+        other => bail!(
+            "unsupported indexing.exclusion_profile `{other}`; expected conservative or aggressive"
+        ),
+    }
+}
+
+fn validate_indexing_patterns(patterns: &[String], context: &str) -> Result<Vec<String>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                bail!("{context} must not contain empty patterns");
+            }
+            if pattern.starts_with('/') || pattern.split('/').any(|part| part == "..") {
+                bail!("{context} pattern `{pattern}` must be repo-relative");
+            }
+            Glob::new(pattern).with_context(|| format!("invalid {context} pattern `{pattern}`"))?;
+            Ok(pattern.to_string())
+        })
+        .collect()
+}
+
 fn build_worktree_config(
     raw: Option<&RawWorktreeConfig>,
     embedding: &EmbeddingConfig,
@@ -1443,7 +1598,9 @@ fn validate_groups(groups: &[GroupConfig]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, EmbeddingProvider, WorktreeMode, normalize_absolute_path};
+    use super::{
+        Config, EmbeddingProvider, ExclusionProfile, WorktreeMode, normalize_absolute_path,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1505,6 +1662,93 @@ mod tests {
             config.groups[0].repos,
             vec![root.join("repos/app").display().to_string()]
         );
+    }
+
+    #[test]
+    fn parses_indexing_profile_and_repo_rules() {
+        let root = temp_dir("indexing-rules");
+        let config_path = write_config(
+            &root,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [indexing]
+                exclusion_profile = "aggressive"
+                exclude_patterns = ["third_party/**"]
+
+                [[indexing.repo_rules]]
+                repo = "./repos/app"
+                exclude_patterns = ["fixtures/large/**"]
+                include_patterns = ["vendor/required.rs"]
+
+                [[groups]]
+                id = "workspace"
+                repos = ["./repos/app"]
+            "#,
+        );
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        let policy = config.indexing.policy_for_repo(&root.join("repos/app"));
+
+        assert_eq!(policy.exclusion_profile, ExclusionProfile::Aggressive);
+        assert_eq!(
+            policy.exclude_patterns,
+            vec!["third_party/**", "fixtures/large/**"]
+        );
+        assert_eq!(policy.include_patterns, vec!["vendor/required.rs"]);
+    }
+
+    #[test]
+    fn rejects_invalid_or_unconfigured_indexing_rules() {
+        let dir = temp_dir("invalid-indexing-rules");
+        let invalid_repo = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [[indexing.repo_rules]]
+                repo = "/tmp/not-configured"
+                exclude_patterns = ["generated/**"]
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/configured"]
+            "#,
+        );
+        let error = Config::load_from_path(&invalid_repo).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not present in any configured group")
+        );
+
+        let invalid_pattern = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [indexing]
+                exclude_patterns = ["/absolute/**"]
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/configured"]
+            "#,
+        );
+        let error = Config::load_from_path(&invalid_pattern).unwrap_err();
+        assert!(error.to_string().contains("must be repo-relative"));
     }
 
     #[test]
@@ -1582,6 +1826,10 @@ mod tests {
         assert_eq!(config.worktrees.max_overlay_files, 500);
         assert_eq!(config.worktrees.max_overlay_bytes, 25 * 1024 * 1024);
         assert_eq!(config.worktrees.embedding_profile, "inherit");
+        assert_eq!(
+            config.indexing.exclusion_profile,
+            ExclusionProfile::Conservative
+        );
     }
 
     #[test]
