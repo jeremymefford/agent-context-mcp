@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
+
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct SnapshotStore {
@@ -173,14 +176,10 @@ impl SnapshotStore {
                 .with_context(|| format!("creating snapshot dir {}", parent.display()))?;
         }
 
-        let temp_path = self.path.with_extension("tmp");
         let text = serde_json::to_string_pretty(snapshot).context("serializing snapshot json")?;
-        tokio::fs::write(&temp_path, format!("{text}\n"))
+        atomic_replace(&self.path, format!("{text}\n").as_bytes())
             .await
-            .with_context(|| format!("writing snapshot temp file {}", temp_path.display()))?;
-        tokio::fs::rename(&temp_path, &self.path)
-            .await
-            .with_context(|| format!("replacing snapshot {}", self.path.display()))?;
+            .with_context(|| format!("writing snapshot {}", self.path.display()))?;
         Ok(())
     }
 
@@ -231,6 +230,28 @@ impl SnapshotStore {
 
         Ok(healed)
     }
+}
+
+pub(crate) async fn atomic_replace(path: &Path, contents: &[u8]) -> Result<()> {
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+
+    if let Err(error) = tokio::fs::write(&temp_path, contents).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(error)
+            .with_context(|| format!("writing atomic temp file {}", temp_path.display()));
+    }
+    if let Err(error) = tokio::fs::rename(&temp_path, path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(error).with_context(|| {
+            format!(
+                "replacing {} from atomic temp file {}",
+                path.display(),
+                temp_path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 impl WorktreeSnapshotEntry {
@@ -410,4 +431,46 @@ fn default_index_format_version() -> String {
 
 fn default_search_root_version() -> String {
     "v1".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_replace;
+    use serde_json::Value;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn concurrent_atomic_replacements_do_not_share_temp_files() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-context-atomic-write-{nanos}"));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("state.json");
+
+        let mut writes = Vec::new();
+        for value in 0..32 {
+            let path = path.clone();
+            writes.push(tokio::spawn(async move {
+                let body = format!(r#"{{"value":{value}}}"#);
+                atomic_replace(&path, body.as_bytes()).await
+            }));
+        }
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["value"].as_u64().is_some());
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec!["state.json"]);
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 }

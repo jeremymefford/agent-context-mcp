@@ -1550,7 +1550,7 @@ impl Engine {
                                 relationship_count: None,
                                 full_reindex: force,
                                 changes: RepoChangeSummary::default(),
-                                error: Some(error.to_string()),
+                                error: Some(format!("{error:#}")),
                             });
                         }
                     },
@@ -1565,7 +1565,7 @@ impl Engine {
                             relationship_count: None,
                             full_reindex: force,
                             changes: RepoChangeSummary::default(),
-                            error: Some(error.to_string()),
+                            error: Some(format!("{error:#}")),
                         });
                     }
                 }
@@ -1609,7 +1609,7 @@ impl Engine {
                         relationship_count: None,
                         full_reindex: force,
                         changes: RepoChangeSummary::default(),
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     });
                 }
             }

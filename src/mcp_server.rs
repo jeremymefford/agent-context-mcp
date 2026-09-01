@@ -13,6 +13,7 @@ use crate::engine::{
     SymbolSearchResponse, SymbolSearchScopeRequest, TextSearchHit, TextSearchResponse,
     TextSearchScopeRequest, render_clear_text, render_search_explanation_text, render_status_text,
 };
+use crate::snapshot::atomic_replace;
 use anyhow::{Context, Result, bail};
 use axum::{
     Router,
@@ -328,14 +329,10 @@ impl IndexQueueStore {
                 .await
                 .with_context(|| format!("creating index queue dir {}", parent.display()))?;
         }
-        let temp_path = self.path.with_extension("tmp");
         let text = serde_json::to_string_pretty(queue).context("serializing index queue json")?;
-        tokio::fs::write(&temp_path, format!("{text}\n"))
+        atomic_replace(&self.path, format!("{text}\n").as_bytes())
             .await
-            .with_context(|| format!("writing index queue temp file {}", temp_path.display()))?;
-        tokio::fs::rename(&temp_path, &self.path)
-            .await
-            .with_context(|| format!("replacing index queue at {}", self.path.display()))
+            .with_context(|| format!("writing index queue at {}", self.path.display()))
     }
 }
 
@@ -876,7 +873,7 @@ pub async fn serve(
     let persisted_queue = match index_queue.load().await {
         Ok(queue) => queue,
         Err(error) => {
-            eprintln!("[error] unable to load persisted index queue: {error}");
+            eprintln!("[error] unable to load persisted index queue: {error:#}");
             PersistedIndexQueue::default()
         }
     };
@@ -919,7 +916,7 @@ pub async fn serve(
                 }
             }
             Err(error) => eprintln!(
-                "[error] unable to resume persisted index queue; retaining it for the next restart: {error}"
+                "[error] unable to resume persisted index queue; retaining it for the next restart: {error:#}"
             ),
         }
     }
@@ -1726,7 +1723,7 @@ impl NativeServer {
 
     async fn persist_index_queue_or_log(&self, context: &str) {
         if let Err(error) = self.persist_index_queue().await {
-            eprintln!("[error] unable to persist index queue after {context}: {error}");
+            eprintln!("[error] unable to persist index queue after {context}: {error:#}");
         }
     }
 
@@ -2120,18 +2117,29 @@ impl NativeServer {
                     .filter_map(|repo| repo.error.as_deref())
                     .find(|error| retryable_background_index_error(error))
                     .map(str::to_string),
-                Err(error) if retryable_background_index_error(&error.to_string()) => {
-                    Some(error.to_string())
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    retryable_background_index_error(&message).then_some(message)
                 }
-                _ => None,
             };
             match &index_result {
                 Err(error) => eprintln!(
-                    "[error] background indexing worker generation={generation} failed {repo_key}: {error}"
+                    "[error] background indexing worker generation={generation} failed {repo_key}: {error:#}"
                 ),
-                Ok(result) if result.has_errors => eprintln!(
-                    "[error] background indexing worker generation={generation} completed {repo_key} with index errors"
-                ),
+                Ok(result) if result.has_errors => {
+                    eprintln!(
+                        "[error] background indexing worker generation={generation} completed {repo_key} with index errors"
+                    );
+                    for repo in result.repos.iter().filter(|repo| repo.error.is_some()) {
+                        eprintln!(
+                            "[error] background indexing worker generation={generation} repo={} index_status={} graph_status={} error={}",
+                            repo.repo,
+                            repo.index_status.as_deref().unwrap_or("unknown"),
+                            repo.graph_status.as_deref().unwrap_or("unknown"),
+                            repo.error.as_deref().unwrap_or("unknown indexing error")
+                        );
+                    }
+                }
                 Ok(_) => eprintln!(
                     "[info] background indexing worker generation={generation} finished {repo_key}"
                 ),
@@ -5348,6 +5356,40 @@ mod tests {
         let restored = store.load().await.unwrap();
 
         assert!(restored.running.contains_key("/tmp/running"));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_index_queue_stores_do_not_collide_on_temp_files() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-context-index-queue-race-{nanos}"));
+        let snapshot_path = root.join("snapshot.json");
+        let first = super::IndexQueueStore::new(&snapshot_path);
+        let second = super::IndexQueueStore::new(&snapshot_path);
+        let mut first_coordinator = IndexCoordinatorState::default();
+        first_coordinator
+            .pending
+            .insert("/tmp/first".to_string(), pending_request("/tmp/first"));
+        let mut second_coordinator = IndexCoordinatorState::default();
+        second_coordinator
+            .pending
+            .insert("/tmp/second".to_string(), pending_request("/tmp/second"));
+        let first_queue = first_coordinator.persisted_queue();
+        let second_queue = second_coordinator.persisted_queue();
+
+        let (first_result, second_result) =
+            tokio::join!(first.write(&first_queue), second.write(&second_queue));
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let restored = first.load().await.unwrap();
+        assert!(
+            restored.pending.contains_key("/tmp/first")
+                || restored.pending.contains_key("/tmp/second")
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }
