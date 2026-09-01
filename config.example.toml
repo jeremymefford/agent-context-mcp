@@ -46,11 +46,14 @@ base_url = "http://127.0.0.1:11434"
 # fixtures/testdata/snapshots, and files with ".generated." in their name.
 exclusion_profile = "conservative"
 # exclude_patterns = ["third_party/**"]
+# Features enabled for repositories without an override. Omit this setting to enable all three.
+default_features = ["lexical", "semantic", "graph"]
 
 # Add repo-relative exclusions or narrowly restore paths excluded by the profile.
 # Include patterns cannot override Git ignores or protected hidden directories.
 # [[indexing.repo_rules]]
 # repo = "/absolute/path/to/repo"
+# features = ["lexical", "semantic"]
 # exclude_patterns = ["fixtures/large/**"]
 # include_patterns = ["vendor/required.rs"]
 

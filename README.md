@@ -545,9 +545,11 @@ profile = "local"
 # fixtures/testdata/snapshots, and files with ".generated." in their name.
 exclusion_profile = "conservative"
 # exclude_patterns = ["third_party/**"]
+default_features = ["lexical", "semantic", "graph"]
 
 # [[indexing.repo_rules]]
 # repo = "/absolute/path/to/repo"
+# features = ["lexical", "semantic"]
 # exclude_patterns = ["fixtures/large/**"]
 # include_patterns = ["vendor/required.rs"]
 
@@ -593,9 +595,30 @@ api_key_env = "VOYAGE_API_KEY"
 
 See the full template in [config.example.toml](config.example.toml).
 
-### Indexing Exclusions
+### Per-Repository Index Features and Exclusions
 
-`[indexing]` controls the repository-relative paths eligible for indexing and exact-text live fallback. The default `conservative` profile preserves the current behavior. `aggressive` is intended for large application repositories and excludes common generated and low-signal content: build outputs, dependency/vendor directories, package lockfiles, fixture/testdata/snapshot directories, and files with `.generated.` in the filename. It leaves normal source files, `build.rs`, and tests eligible for indexing.
+`[indexing]` controls both the index surfaces and the repository-relative paths eligible for indexing. `default_features` selects any combination of `lexical`, `semantic`, and `graph`; omitting it preserves the prior behavior by enabling all three. A `features` array on `[[indexing.repo_rules]]` replaces that default for one configured repository. An empty array disables all indexed surfaces for that repository.
+
+```toml
+[indexing]
+default_features = ["lexical", "semantic"]
+
+[[indexing.repo_rules]]
+repo = "/absolute/path/to/high-value-repo"
+features = ["lexical", "semantic", "graph"]
+
+[[indexing.repo_rules]]
+repo = "/absolute/path/to/search-only-repo"
+features = ["lexical"]
+```
+
+- `lexical` builds Tantivy chunk and symbol indexes for exact/token/fuzzy retrieval.
+- `semantic` embeds chunks and symbols and stores their vectors in Milvus.
+- `graph` extracts structural symbols and relationships into SQLite and Tantivy for impact analysis.
+
+Search and graph tools honor the effective feature selection, worktree overlays inherit the canonical repository selection, and `get_indexing_status` exposes the three effective booleans for every repository. On the next refresh, a newly enabled surface is backfilled independently while already-enabled surfaces process only ordinary file changes; enabling `graph` therefore does not re-embed unchanged code. Disabling a surface stops querying it and clears its local state where possible without reindexing other repositories. Semantic-disabled repositories neither embed content nor query Milvus during normal indexing and search. Any vector collections left by a transition are treated as stale by vector hygiene and can be reclaimed by the existing maintenance path.
+
+The default `conservative` exclusion profile preserves the current scan behavior. `aggressive` is intended for large application repositories and excludes common generated and low-signal content: build outputs, dependency/vendor directories, package lockfiles, fixture/testdata/snapshot directories, and files with `.generated.` in the filename. It leaves normal source files, `build.rs`, and tests eligible for indexing.
 
 Use `exclude_patterns` for global repo-relative globs. `[[indexing.repo_rules]]` adds exclusions for one configured repo; its `include_patterns` can restore a specific path excluded by the profile or configured patterns. Include patterns never override Git ignore rules, protected VCS/cache directories, extension support, or binary-file filtering. After changing exclusions, a normal refresh removes formerly indexed paths while preserving unchanged eligible embeddings, so a full reindex is unnecessary.
 

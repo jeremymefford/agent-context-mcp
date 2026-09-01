@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use globset::Glob;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -99,12 +99,14 @@ pub enum ExclusionProfile {
 pub struct RepoIndexRule {
     pub exclude_patterns: Vec<String>,
     pub include_patterns: Vec<String>,
+    pub features: Option<IndexFeatures>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexingConfig {
     pub exclusion_profile: ExclusionProfile,
     pub exclude_patterns: Vec<String>,
+    pub default_features: IndexFeatures,
     pub repo_rules: BTreeMap<String, RepoIndexRule>,
 }
 
@@ -113,6 +115,51 @@ pub struct RepoIndexPolicy {
     pub exclusion_profile: ExclusionProfile,
     pub exclude_patterns: Vec<String>,
     pub include_patterns: Vec<String>,
+    pub features: IndexFeatures,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexFeatures {
+    pub lexical: bool,
+    pub semantic: bool,
+    pub graph: bool,
+}
+
+impl IndexFeatures {
+    pub const fn all() -> Self {
+        Self {
+            lexical: true,
+            semantic: true,
+            graph: true,
+        }
+    }
+
+    pub const fn any(self) -> bool {
+        self.lexical || self.semantic || self.graph
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self {
+            lexical: self.lexical && other.lexical,
+            semantic: self.semantic && other.semantic,
+            graph: self.graph && other.graph,
+        }
+    }
+
+    pub const fn difference(self, other: Self) -> Self {
+        Self {
+            lexical: self.lexical && !other.lexical,
+            semantic: self.semantic && !other.semantic,
+            graph: self.graph && !other.graph,
+        }
+    }
+}
+
+impl Default for IndexFeatures {
+    fn default() -> Self {
+        Self::all()
+    }
 }
 
 impl IndexingConfig {
@@ -130,6 +177,9 @@ impl IndexingConfig {
             include_patterns: rule
                 .map(|rule| rule.include_patterns.clone())
                 .unwrap_or_default(),
+            features: rule
+                .and_then(|rule| rule.features)
+                .unwrap_or(self.default_features),
         }
     }
 }
@@ -323,6 +373,8 @@ struct RawIndexingConfig {
     #[serde(default)]
     exclude_patterns: Vec<String>,
     #[serde(default)]
+    default_features: Option<Vec<String>>,
+    #[serde(default)]
     repo_rules: Vec<RawRepoIndexRule>,
 }
 
@@ -333,6 +385,8 @@ struct RawRepoIndexRule {
     exclude_patterns: Vec<String>,
     #[serde(default)]
     include_patterns: Vec<String>,
+    #[serde(default)]
+    features: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1186,6 +1240,12 @@ fn build_indexing_config(
         .unwrap_or_default();
     let exclude_patterns =
         validate_indexing_patterns(&raw.exclude_patterns, "indexing.exclude_patterns")?;
+    let default_features = raw
+        .default_features
+        .as_deref()
+        .map(|features| parse_index_features(features, "indexing.default_features"))
+        .transpose()?
+        .unwrap_or_default();
     let configured_repos = groups
         .iter()
         .flat_map(|group| group.repos.iter().cloned())
@@ -1216,6 +1276,11 @@ fn build_indexing_config(
                     &raw_rule.include_patterns,
                     &format!("{context}.include_patterns"),
                 )?,
+                features: raw_rule
+                    .features
+                    .as_deref()
+                    .map(|features| parse_index_features(features, &format!("{context}.features")))
+                    .transpose()?,
             },
         );
     }
@@ -1223,8 +1288,33 @@ fn build_indexing_config(
     Ok(IndexingConfig {
         exclusion_profile,
         exclude_patterns,
+        default_features,
         repo_rules,
     })
+}
+
+fn parse_index_features(values: &[String], context: &str) -> Result<IndexFeatures> {
+    let mut features = IndexFeatures {
+        lexical: false,
+        semantic: false,
+        graph: false,
+    };
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let name = value.trim().to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            bail!("{context} contains duplicate feature `{name}`");
+        }
+        match name.as_str() {
+            "lexical" => features.lexical = true,
+            "semantic" => features.semantic = true,
+            "graph" => features.graph = true,
+            _ => bail!(
+                "unsupported {context} feature `{name}`; expected lexical, semantic, or graph"
+            ),
+        }
+    }
+    Ok(features)
 }
 
 fn parse_exclusion_profile(value: &str) -> Result<ExclusionProfile> {
@@ -1599,7 +1689,8 @@ fn validate_groups(groups: &[GroupConfig]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, EmbeddingProvider, ExclusionProfile, WorktreeMode, normalize_absolute_path,
+        Config, EmbeddingProvider, ExclusionProfile, IndexFeatures, WorktreeMode,
+        normalize_absolute_path,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1679,15 +1770,21 @@ mod tests {
                 [indexing]
                 exclusion_profile = "aggressive"
                 exclude_patterns = ["third_party/**"]
+                default_features = ["lexical", "semantic"]
 
                 [[indexing.repo_rules]]
                 repo = "./repos/app"
                 exclude_patterns = ["fixtures/large/**"]
                 include_patterns = ["vendor/required.rs"]
+                features = ["lexical", "graph"]
+
+                [[indexing.repo_rules]]
+                repo = "./repos/disabled"
+                features = []
 
                 [[groups]]
                 id = "workspace"
-                repos = ["./repos/app"]
+                repos = ["./repos/app", "./repos/default", "./repos/disabled"]
             "#,
         );
 
@@ -1700,6 +1797,32 @@ mod tests {
             vec!["third_party/**", "fixtures/large/**"]
         );
         assert_eq!(policy.include_patterns, vec!["vendor/required.rs"]);
+        assert_eq!(
+            policy.features,
+            IndexFeatures {
+                lexical: true,
+                semantic: false,
+                graph: true,
+            }
+        );
+        assert_eq!(
+            config
+                .indexing
+                .policy_for_repo(&root.join("repos/default"))
+                .features,
+            IndexFeatures {
+                lexical: true,
+                semantic: true,
+                graph: false,
+            }
+        );
+        assert!(
+            !config
+                .indexing
+                .policy_for_repo(&root.join("repos/disabled"))
+                .features
+                .any()
+        );
     }
 
     #[test]
@@ -1749,6 +1872,30 @@ mod tests {
         );
         let error = Config::load_from_path(&invalid_pattern).unwrap_err();
         assert!(error.to_string().contains("must be repo-relative"));
+
+        let invalid_feature = write_config(
+            &dir,
+            r#"
+                [embedding]
+                provider = "voyage"
+
+                [milvus]
+                address = "localhost:19530"
+
+                [indexing]
+                default_features = ["lexical", "magic"]
+
+                [[groups]]
+                id = "workspace"
+                repos = ["/tmp/configured"]
+            "#,
+        );
+        let error = Config::load_from_path(&invalid_feature).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected lexical, semantic, or graph")
+        );
     }
 
     #[test]

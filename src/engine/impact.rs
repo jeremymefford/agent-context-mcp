@@ -634,6 +634,15 @@ impl Engine {
 
     async fn graph_view_for_repo(&self, repo: &Path, require_ready: bool) -> Result<GraphView> {
         let ctx = self.repo_context(repo)?;
+        if !self.index_features_for_repo(&ctx.canonical_root).graph {
+            if require_ready {
+                bail!(
+                    "relationship graph indexing is disabled for `{}`; enable the `graph` feature and refresh this repository",
+                    ctx.canonical_root.display()
+                );
+            }
+            return Ok(disabled_graph_view(repo));
+        }
         let graph = self.inner.graph_store.clone();
 
         if let Some(overlay) = ctx.overlay.as_ref() {
@@ -721,6 +730,15 @@ impl Engine {
         require_ready: bool,
     ) -> Result<GraphView> {
         let ctx = self.repo_context(repo)?;
+        if !self.index_features_for_repo(&ctx.canonical_root).graph {
+            if require_ready {
+                bail!(
+                    "relationship graph indexing is disabled for `{}`; enable the `graph` feature and refresh this repository",
+                    ctx.canonical_root.display()
+                );
+            }
+            return Ok(disabled_graph_view(repo));
+        }
         let live_hashes = self.current_graph_hashes(repo).await?;
         let live_root = build_root_hash(&live_hashes);
         let graph = self.inner.graph_store.clone();
@@ -1132,6 +1150,17 @@ fn stale_paths(live: &BTreeMap<String, String>, indexed: &BTreeMap<String, Strin
         .filter(|path| live.get(*path) != indexed.get(*path))
         .cloned()
         .collect()
+}
+
+fn disabled_graph_view(repo: &Path) -> GraphView {
+    GraphView {
+        sources: Vec::new(),
+        coverage: RepoRelationshipCoverage {
+            repo: repo.display().to_string(),
+            graph_status: "disabled".to_string(),
+            ..RepoRelationshipCoverage::default()
+        },
+    }
 }
 
 fn merge_coverage(primary: &mut RepoRelationshipCoverage, canonical: &RepoRelationshipCoverage) {

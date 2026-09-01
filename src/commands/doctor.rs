@@ -502,6 +502,7 @@ mod tests {
             repo: format!("/repo/{status}"),
             repo_label: status.to_string(),
             collection_name: format!("collection_{status}"),
+            features: crate::config::IndexFeatures::all(),
             status: status.to_string(),
             indexed_files: None,
             total_chunks: None,

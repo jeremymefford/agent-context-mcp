@@ -10,8 +10,8 @@ pub mod splitter;
 pub mod symbols;
 
 use crate::config::{
-    Config, ExclusionProfile, RepoIndexPolicy, ResolvedScope, ScopeKind, WorktreeMode,
-    WorktreeResolution,
+    Config, ExclusionProfile, IndexFeatures, RepoIndexPolicy, ResolvedScope, ScopeKind,
+    WorktreeMode, WorktreeResolution,
 };
 use crate::snapshot::{Snapshot, SnapshotEntry, SnapshotStore, WorktreeSnapshotEntry};
 use anyhow::{Context, Result, bail};
@@ -568,6 +568,7 @@ pub struct RepoStatus {
     pub repo: String,
     pub repo_label: String,
     pub collection_name: String,
+    pub features: IndexFeatures,
     pub status: String,
     pub indexed_files: Option<u64>,
     pub total_chunks: Option<u64>,
@@ -686,6 +687,8 @@ struct MerkleSnapshot {
     root_hash: Option<String>,
     #[serde(default, rename = "merkleDAG")]
     merkle_dag: Option<Value>,
+    #[serde(default)]
+    features: IndexFeatures,
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +903,7 @@ impl SearchPlan {
 struct ProcessFilesResult {
     indexed_paths: HashSet<String>,
     processed_files: u64,
+    total_chunks: u64,
     status: IndexCompletionStatus,
 }
 
@@ -943,7 +947,7 @@ struct SymbolFusionConfig<'a> {
 
 #[derive(Clone, Copy)]
 struct IndexCollections<'a> {
-    chunk: &'a str,
+    chunk: Option<&'a str>,
     symbol: Option<&'a str>,
 }
 
@@ -952,8 +956,9 @@ struct ProcessFilesPlan<'a> {
     repo: &'a Path,
     storage_repo: &'a Path,
     repo_key: &'a str,
-    profile_name: &'a str,
+    profile_name: Option<&'a str>,
     collections: IndexCollections<'a>,
+    features: IndexFeatures,
     splitter: SplitterKind,
     total_files: usize,
     mode: IndexExecutionMode,
@@ -1070,6 +1075,10 @@ impl Engine {
 
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    pub fn index_features_for_repo(&self, repo: &Path) -> IndexFeatures {
+        self.inner.config.indexing.policy_for_repo(repo).features
     }
 
     fn embedding_profile_name_for_repo<'a>(&'a self, repo: &Path) -> Result<&'a str> {
@@ -1205,13 +1214,23 @@ impl Engine {
     ) -> Result<RepoEmbeddingIdentityStatus> {
         let repo_key = repo.display().to_string();
         let entry = snapshot.codebases.get(&repo_key);
-        let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-        let configured_fingerprint = self.inner.embedding.fingerprint(&profile_name).await.ok();
+        let semantic_enabled = self.index_features_for_repo(repo).semantic;
+        let profile_name = if semantic_enabled {
+            self.embedding_profile_name_for_repo(repo)?.to_string()
+        } else {
+            "disabled".to_string()
+        };
+        let configured_fingerprint = if semantic_enabled {
+            self.inner.embedding.fingerprint(&profile_name).await.ok()
+        } else {
+            None
+        };
         Ok(repo_embedding_identity_status_for_snapshot(
             snapshot,
             entry,
             &profile_name,
             configured_fingerprint,
+            semantic_enabled,
         ))
     }
 
@@ -1232,7 +1251,13 @@ impl Engine {
     }
 
     pub async fn vector_hygiene_report(&self) -> Result<VectorHygieneReport> {
-        let repos = self.inner.config.all_repos()?;
+        let repos = self
+            .inner
+            .config
+            .all_repos()?
+            .into_iter()
+            .filter(|repo| self.index_features_for_repo(repo).semantic)
+            .collect::<Vec<_>>();
         let snapshot = self.inner.snapshot.read().await?;
         let expected = expected_vector_collections(&repos, &snapshot);
         let mut agent_context_collections = self
@@ -1550,8 +1575,11 @@ impl Engine {
         }
 
         if !existing_repos.is_empty() {
-            self.ensure_index_identity(force).await?;
-            self.persist_index_identity().await?;
+            let semantic_enabled = existing_repos
+                .iter()
+                .any(|repo| self.index_features_for_repo(repo).semantic);
+            self.ensure_index_identity(force, semantic_enabled).await?;
+            self.persist_index_identity(semantic_enabled).await?;
         }
 
         for repo in existing_repos {
@@ -1691,7 +1719,9 @@ impl Engine {
         let mut usages = BTreeMap::<String, QueryProfileUsage>::new();
         for ctx in scope_contexts {
             let repo_key = ctx.requested_root.display().to_string();
-            if blocked_repos.contains_key(&repo_key) {
+            if blocked_repos.contains_key(&repo_key)
+                || !self.index_features_for_repo(&ctx.canonical_root).semantic
+            {
                 continue;
             }
             let canonical_profile = self
@@ -1770,7 +1800,11 @@ impl Engine {
         let mut query_vectors: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
         let mut overlay_query_errors: HashMap<String, String> = HashMap::new();
 
+        let semantic_requested = plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0;
         for ctx in &scope_contexts {
+            if !semantic_requested || !self.index_features_for_repo(&ctx.canonical_root).semantic {
+                continue;
+            }
             let identity = self
                 .repo_embedding_identity_status(&snapshot, &ctx.canonical_root)
                 .await?;
@@ -1950,6 +1984,10 @@ impl Engine {
         let mut overlay_query_errors: HashMap<String, String> = HashMap::new();
 
         for ctx in &scope_contexts {
+            if semantic_share <= 0.0 || !self.index_features_for_repo(&ctx.canonical_root).semantic
+            {
+                continue;
+            }
             let identity = self
                 .repo_embedding_identity_status(&snapshot, &ctx.canonical_root)
                 .await?;
@@ -2373,9 +2411,12 @@ impl Engine {
                 .await;
         }
 
-        let files = self
-            .search_text_index_candidate_files(repo, request)
-            .await?;
+        let files = if indexing_policy.features.lexical {
+            self.search_text_index_candidate_files(repo, request)
+                .await?
+        } else {
+            Vec::new()
+        };
         if !files.is_empty() {
             return Ok(files);
         }
@@ -3502,10 +3543,19 @@ impl Engine {
 
     pub async fn status_scope(&self, scope: ResolvedScope) -> Result<StatusReport> {
         let snapshot = self.inner.snapshot.read().await?;
+        let semantic_enabled = scope
+            .repos
+            .iter()
+            .any(|repo| self.index_features_for_repo(repo).semantic);
+        let configured_embedding_fingerprints = if semantic_enabled {
+            self.configured_embedding_fingerprints().await?
+        } else {
+            BTreeMap::new()
+        };
         let identity_status = index_identity_status_for_snapshot(
             &snapshot,
             self.inner.config.embedding.default_profile_name(),
-            &self.configured_embedding_fingerprints().await?,
+            &configured_embedding_fingerprints,
         );
         let mut repos = Vec::new();
         let mut indexed_files = 0u64;
@@ -3596,8 +3646,22 @@ impl Engine {
     }
 
     #[allow(dead_code)]
-    async fn ensure_index_identity(&self, allow_rebuild: bool) -> Result<()> {
-        let status = self.index_identity_status().await?;
+    async fn ensure_index_identity(
+        &self,
+        allow_rebuild: bool,
+        include_embeddings: bool,
+    ) -> Result<()> {
+        let snapshot = self.inner.snapshot.read().await?;
+        let configured_embedding_fingerprints = if include_embeddings {
+            self.configured_embedding_fingerprints().await?
+        } else {
+            BTreeMap::new()
+        };
+        let status = index_identity_status_for_snapshot(
+            &snapshot,
+            self.inner.config.embedding.default_profile_name(),
+            &configured_embedding_fingerprints,
+        );
         if status.compatible || allow_rebuild {
             return Ok(());
         }
@@ -3611,23 +3675,30 @@ impl Engine {
     }
 
     #[allow(dead_code)]
-    async fn persist_index_identity(&self) -> Result<()> {
-        let configured_embedding_fingerprints = self.configured_embedding_fingerprints().await?;
-        let default_profile = self
-            .inner
-            .config
-            .embedding
-            .default_profile_name()
-            .to_string();
-        let legacy_fingerprint = configured_embedding_fingerprints
-            .get(&default_profile)
-            .cloned();
+    async fn persist_index_identity(&self, include_embeddings: bool) -> Result<()> {
+        let legacy_fingerprint = if include_embeddings {
+            let configured_embedding_fingerprints =
+                self.configured_embedding_fingerprints().await?;
+            let default_profile = self
+                .inner
+                .config
+                .embedding
+                .default_profile_name()
+                .to_string();
+            configured_embedding_fingerprints
+                .get(&default_profile)
+                .cloned()
+        } else {
+            None
+        };
         self.inner
             .snapshot
             .update(|snapshot| {
                 snapshot.index_format_version = INDEX_FORMAT_VERSION.to_string();
                 snapshot.search_root_version = SEARCH_ROOT_VERSION.to_string();
-                snapshot.embedding_fingerprint = legacy_fingerprint.clone();
+                if include_embeddings {
+                    snapshot.embedding_fingerprint = legacy_fingerprint.clone();
+                }
             })
             .await?;
         Ok(())
@@ -3702,59 +3773,72 @@ impl Engine {
         };
         let worktree_key = ctx.requested_root.display().to_string();
         let canonical_key = ctx.canonical_root.display().to_string();
-        let profile_name = match self.overlay_profile_name(&ctx) {
-            Ok(name) => name.to_string(),
-            Err(error) => {
-                return self
-                    .fail_worktree_overlay(
-                        overlay,
-                        &worktree_key,
-                        &canonical_key,
-                        error.to_string(),
-                        None,
-                        None,
-                        force,
-                        RepoChangeSummary::default(),
-                        "failed",
-                    )
-                    .await;
+        let features = self.index_features_for_repo(&ctx.canonical_root);
+        let profile_name = if features.semantic {
+            match self.overlay_profile_name(&ctx) {
+                Ok(name) => name.to_string(),
+                Err(error) => {
+                    return self
+                        .fail_worktree_overlay(
+                            overlay,
+                            &worktree_key,
+                            &canonical_key,
+                            error.to_string(),
+                            None,
+                            None,
+                            force,
+                            RepoChangeSummary::default(),
+                            "failed",
+                        )
+                        .await;
+                }
             }
+        } else {
+            "disabled".to_string()
         };
-        let configured_embedding_fingerprint = match self.overlay_fingerprint(&ctx).await {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                return self
-                    .fail_worktree_overlay(
-                        overlay,
-                        &worktree_key,
-                        &canonical_key,
-                        error.to_string(),
-                        Some(profile_name.clone()),
-                        None,
-                        force,
-                        RepoChangeSummary::default(),
-                        "failed",
-                    )
-                    .await;
+        let configured_embedding_fingerprint = if features.semantic {
+            match self.overlay_fingerprint(&ctx).await {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return self
+                        .fail_worktree_overlay(
+                            overlay,
+                            &worktree_key,
+                            &canonical_key,
+                            error.to_string(),
+                            Some(profile_name.clone()),
+                            None,
+                            force,
+                            RepoChangeSummary::default(),
+                            "failed",
+                        )
+                        .await;
+                }
             }
+        } else {
+            String::new()
         };
-        let configured_embedding_dimension = match self.overlay_dimension(&ctx).await {
-            Ok(dimension) => dimension,
-            Err(error) => {
-                return self
-                    .fail_worktree_overlay(
-                        overlay,
-                        &worktree_key,
-                        &canonical_key,
-                        error.to_string(),
-                        Some(profile_name.clone()),
-                        Some(configured_embedding_fingerprint.clone()),
-                        force,
-                        RepoChangeSummary::default(),
-                        "failed",
-                    )
-                    .await;
+        let configured_embedding_dimension = if features.semantic {
+            match self.overlay_dimension(&ctx).await {
+                Ok(dimension) => dimension,
+                Err(error) => {
+                    return self
+                        .fail_worktree_overlay(
+                            overlay,
+                            &worktree_key,
+                            &canonical_key,
+                            error.to_string(),
+                            Some(profile_name.clone()),
+                            Some(configured_embedding_fingerprint.clone()),
+                            force,
+                            RepoChangeSummary::default(),
+                            "failed",
+                        )
+                        .await;
+                }
             }
+        } else {
+            0
         };
 
         if !ctx.canonical_root.exists() {
@@ -3768,8 +3852,10 @@ impl Engine {
                     &worktree_key,
                     &canonical_key,
                     message,
-                    Some(profile_name.clone()),
-                    Some(configured_embedding_fingerprint.clone()),
+                    features.semantic.then_some(profile_name.clone()),
+                    features
+                        .semantic
+                        .then_some(configured_embedding_fingerprint.clone()),
                     false,
                     RepoChangeSummary::default(),
                     "canonical_missing",
@@ -3795,8 +3881,10 @@ impl Engine {
                         &worktree_key,
                         &canonical_key,
                         message,
-                        Some(profile_name.clone()),
-                        Some(configured_embedding_fingerprint.clone()),
+                        features.semantic.then_some(profile_name.clone()),
+                        features
+                            .semantic
+                            .then_some(configured_embedding_fingerprint.clone()),
                         false,
                         RepoChangeSummary::default(),
                         "canonical_missing",
@@ -3814,8 +3902,10 @@ impl Engine {
                         canonical_key.clone(),
                         overlay.resolution.repo_identity.clone(),
                         overlay.resolution.overlay_id.clone(),
-                        Some(profile_name.clone()),
-                        Some(configured_embedding_fingerprint.clone()),
+                        features.semantic.then_some(profile_name.clone()),
+                        features
+                            .semantic
+                            .then_some(configured_embedding_fingerprint.clone()),
                     ),
                 );
                 if let Some(entry) = snapshot.worktrees.get_mut(&worktree_key) {
@@ -3902,7 +3992,8 @@ impl Engine {
                 || overlay_bytes > self.inner.config.worktrees.max_overlay_bytes;
 
             if over_cap {
-                self.clear_worktree_overlay_indexes(overlay).await?;
+                self.clear_worktree_overlay_indexes(overlay, features.semantic)
+                    .await?;
                 let state = OverlayIndexState {
                     canonical_root: canonical_key.clone(),
                     worktree_root: worktree_key.clone(),
@@ -3915,8 +4006,10 @@ impl Engine {
                     deleted_files,
                     overlay_bytes,
                     overlay_status: Some("too_large".to_string()),
-                    embedding_profile: Some(profile_name.clone()),
-                    embedding_fingerprint: Some(configured_embedding_fingerprint.clone()),
+                    embedding_profile: features.semantic.then_some(profile_name.clone()),
+                    embedding_fingerprint: features
+                        .semantic
+                        .then_some(configured_embedding_fingerprint.clone()),
                 };
                 self.save_overlay_state(&state).await?;
                 self.inner
@@ -3932,8 +4025,10 @@ impl Engine {
                                 changed_files,
                                 deleted_files,
                                 overlay_bytes,
-                                Some(profile_name.clone()),
-                                Some(configured_embedding_fingerprint.clone()),
+                                features.semantic.then_some(profile_name.clone()),
+                                features
+                                    .semantic
+                                    .then_some(configured_embedding_fingerprint.clone()),
                             ),
                         );
                         if let Some(entry) = snapshot.worktrees.get_mut(&worktree_key) {
@@ -3956,10 +4051,13 @@ impl Engine {
                 });
             }
 
-            self.clear_worktree_overlay_indexes(overlay).await?;
-            self.set_graph_state(&overlay.repo_key, "updating", None)
+            self.clear_worktree_overlay_indexes(overlay, features.semantic)
                 .await?;
-            if !to_index.is_empty() {
+            if features.graph {
+                self.set_graph_state(&overlay.repo_key, "updating", None)
+                    .await?;
+            }
+            if features.semantic && !to_index.is_empty() {
                 self.inner
                     .milvus
                     .create_hybrid_collection(
@@ -3984,12 +4082,15 @@ impl Engine {
                         repo: &ctx.requested_root,
                         storage_repo: &overlay.storage_root,
                         repo_key: &overlay.repo_key,
-                        profile_name: &profile_name,
+                        profile_name: features.semantic.then_some(profile_name.as_str()),
                         collections: IndexCollections {
-                            chunk: &overlay.chunk_collection,
-                            symbol: (!to_index.is_empty())
+                            chunk: features
+                                .semantic
+                                .then_some(overlay.chunk_collection.as_str()),
+                            symbol: (features.semantic && !to_index.is_empty())
                                 .then_some(overlay.symbol_collection.as_str()),
                         },
+                        features,
                         splitter,
                         total_files: 0,
                         mode,
@@ -4014,33 +4115,46 @@ impl Engine {
                 deleted_files,
                 overlay_bytes,
                 overlay_status: Some("completed".to_string()),
-                embedding_profile: Some(profile_name.clone()),
-                embedding_fingerprint: Some(configured_embedding_fingerprint.clone()),
+                embedding_profile: features.semantic.then_some(profile_name.clone()),
+                embedding_fingerprint: features
+                    .semantic
+                    .then_some(configured_embedding_fingerprint.clone()),
             };
-            let suppressed_paths = overlay_suppressed_paths(&state);
-            self.resolve_overlay_graph(
-                &overlay.storage_root,
-                &overlay.repo_key,
-                &canonical_key,
-                &suppressed_paths,
-            )
-            .await?;
-            let graph_root_hash = build_root_hash(&overlay_indexed_hashes(&canonical_hashes, &state));
-            self.set_graph_state(&overlay.repo_key, "ready", Some(&graph_root_hash))
+            if features.graph {
+                let suppressed_paths = overlay_suppressed_paths(&state);
+                self.resolve_overlay_graph(
+                    &overlay.storage_root,
+                    &overlay.repo_key,
+                    &canonical_key,
+                    &suppressed_paths,
+                )
                 .await?;
-            let overlay_storage_root = overlay.storage_root.clone();
-            let local_index = self.inner.local_index.clone();
-            let chunk_coverage =
-                run_low_priority_blocking("count_overlay_chunk_coverage", move || {
-                    local_index.chunk_coverage(&overlay_storage_root)
-                })
-                .await?;
-            let coverage = IndexCoverage {
-                indexed_files: chunk_coverage.indexed_files,
-                total_chunks: chunk_coverage.total_chunks,
+                let graph_root_hash =
+                    build_root_hash(&overlay_indexed_hashes(&canonical_hashes, &state));
+                self.set_graph_state(&overlay.repo_key, "ready", Some(&graph_root_hash))
+                    .await?;
+            }
+            let coverage = if features.lexical {
+                let overlay_storage_root = overlay.storage_root.clone();
+                let local_index = self.inner.local_index.clone();
+                let chunk_coverage =
+                    run_low_priority_blocking("count_overlay_chunk_coverage", move || {
+                        local_index.chunk_coverage(&overlay_storage_root)
+                    })
+                    .await?;
+                IndexCoverage {
+                    indexed_files: chunk_coverage.indexed_files,
+                    total_chunks: chunk_coverage.total_chunks,
+                }
+            } else {
+                IndexCoverage {
+                    indexed_files: processing.indexed_paths.len() as u64,
+                    total_chunks: processing.total_chunks,
+                }
             };
             let index_status = index_status_for_coverage(processing.status, coverage);
-            if !to_index.is_empty()
+            if features.semantic
+                && !to_index.is_empty()
                 && let Err(error) = self
                     .maintain_vector_collections(
                         &[
@@ -4067,8 +4181,10 @@ impl Engine {
                             changed_files,
                             deleted_files,
                             overlay_bytes,
-                            Some(profile_name.clone()),
-                            Some(configured_embedding_fingerprint.clone()),
+                            features.semantic.then_some(profile_name.clone()),
+                            features
+                                .semantic
+                                .then_some(configured_embedding_fingerprint.clone()),
                         ),
                     );
                 })
@@ -4078,7 +4194,11 @@ impl Engine {
                 indexed_files: Some(coverage.indexed_files),
                 total_chunks: Some(coverage.total_chunks),
                 index_status: Some(index_status),
-                graph_status: Some("ready".to_string()),
+                graph_status: Some(if features.graph {
+                    "ready".to_string()
+                } else {
+                    "disabled".to_string()
+                }),
                 relationship_count: None,
                 full_reindex: false,
                 changes,
@@ -4134,15 +4254,31 @@ impl Engine {
                 .await;
         }
         let repo_key = repo.display().to_string();
-        let profile_name = self.embedding_profile_name_for_repo(repo)?.to_string();
-        let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await?;
-        let configured_embedding_dimension = self.embedding_dimension_for_repo(repo).await?;
+        let features = self.index_features_for_repo(repo);
+        let profile_name = features
+            .semantic
+            .then(|| {
+                self.embedding_profile_name_for_repo(repo)
+                    .map(str::to_string)
+            })
+            .transpose()?;
+        let configured_embedding_fingerprint = if features.semantic {
+            Some(self.embedding_fingerprint_for_repo(repo).await?)
+        } else {
+            None
+        };
+        let configured_embedding_dimension = if features.semantic {
+            Some(self.embedding_dimension_for_repo(repo).await?)
+        } else {
+            None
+        };
         let snapshot_before = self.inner.snapshot.read().await?;
         let repo_identity = repo_embedding_identity_status_for_snapshot(
             &snapshot_before,
             snapshot_before.codebases.get(&repo_key),
-            &profile_name,
-            Some(configured_embedding_fingerprint.clone()),
+            profile_name.as_deref().unwrap_or("disabled"),
+            configured_embedding_fingerprint.clone(),
+            features.semantic,
         );
         drop(snapshot_before);
         self.inner
@@ -4153,8 +4289,8 @@ impl Engine {
                     SnapshotEntry::indexing(
                         0.0,
                         "running",
-                        Some(profile_name.clone()),
-                        Some(configured_embedding_fingerprint.clone()),
+                        profile_name.clone(),
+                        configured_embedding_fingerprint.clone(),
                     ),
                 );
             })
@@ -4181,27 +4317,44 @@ impl Engine {
             .map(|(path, file)| (path.clone(), file.hash.clone()))
             .collect::<BTreeMap<_, _>>();
 
-        let collection_exists = self
-            .inner
-            .milvus
-            .refresh_collection_presence(&collection_name)
-            .await?;
-        let symbol_collection_exists = self
-            .inner
-            .milvus
-            .refresh_collection_presence(&symbol_collection_name)
-            .await?;
-        let previous_snapshot = if force || !collection_exists || repo_identity.reason.is_some() {
+        let stored_snapshot = load_merkle_snapshot(&merkle_path)
+            .await
+            .ok()
+            .filter(MerkleSnapshot::is_compatible);
+        let semantic_storage_relevant = features.semantic;
+        let collection_exists = if semantic_storage_relevant {
+            self.inner
+                .milvus
+                .refresh_collection_presence(&collection_name)
+                .await?
+        } else {
+            false
+        };
+        let symbol_collection_exists = if semantic_storage_relevant {
+            self.inner
+                .milvus
+                .refresh_collection_presence(&symbol_collection_name)
+                .await?
+        } else {
+            false
+        };
+        let stored_features = stored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.features)
+            .unwrap_or_default();
+        let previous_snapshot = if force
+            || (features.semantic && stored_features.semantic && !collection_exists)
+            || repo_identity.reason.is_some()
+        {
             None
         } else {
-            load_merkle_snapshot(&merkle_path)
-                .await
-                .ok()
-                .filter(MerkleSnapshot::is_compatible)
+            stored_snapshot
         };
-        let full_reindex = force || !collection_exists || previous_snapshot.is_none();
+        let full_reindex = force || previous_snapshot.is_none();
 
-        self.set_graph_state(&repo_key, "updating", None).await?;
+        if features.graph {
+            self.set_graph_state(&repo_key, "updating", None).await?;
+        }
 
         let outcome = async {
             if full_reindex {
@@ -4232,23 +4385,27 @@ impl Engine {
                     graph_store.clear_repo(&repo_key_for_graph)
                 })
                 .await?;
-                self.set_graph_state(&repo_key, "updating", None).await?;
-                self.inner
-                    .milvus
-                    .create_hybrid_collection(
-                        &collection_name,
-                        configured_embedding_dimension,
-                        &format!("codebasePath:{}", repo.display()),
-                    )
-                    .await?;
-                self.inner
-                    .milvus
-                    .create_hybrid_collection(
-                        &symbol_collection_name,
-                        configured_embedding_dimension,
-                        &format!("symbolCodebasePath:{}", repo.display()),
-                    )
-                    .await?;
+                if features.graph {
+                    self.set_graph_state(&repo_key, "updating", None).await?;
+                }
+                if let Some(dimension) = configured_embedding_dimension {
+                    self.inner
+                        .milvus
+                        .create_hybrid_collection(
+                            &collection_name,
+                            dimension,
+                            &format!("codebasePath:{}", repo.display()),
+                        )
+                        .await?;
+                    self.inner
+                        .milvus
+                        .create_hybrid_collection(
+                            &symbol_collection_name,
+                            dimension,
+                            &format!("symbolCodebasePath:{}", repo.display()),
+                        )
+                        .await?;
+                }
                 let files = current_files.values().cloned().collect::<Vec<_>>();
                 let processing = self
                     .process_files(
@@ -4256,11 +4413,14 @@ impl Engine {
                             repo,
                             storage_repo: repo,
                             repo_key: &repo_key,
-                            profile_name: &profile_name,
+                            profile_name: profile_name.as_deref(),
                             collections: IndexCollections {
-                                chunk: &collection_name,
-                                symbol: Some(&symbol_collection_name),
+                                chunk: features.semantic.then_some(collection_name.as_str()),
+                                symbol: features
+                                    .semantic
+                                    .then_some(symbol_collection_name.as_str()),
                             },
+                            features,
                             splitter,
                             total_files: current_files.len(),
                             mode,
@@ -4273,59 +4433,139 @@ impl Engine {
                     .filter(|(path, _)| processing.indexed_paths.contains(*path))
                     .map(|(path, hash)| (path.clone(), hash.clone()))
                     .collect::<BTreeMap<_, _>>();
-                self.resolve_graph(repo, &repo_key, &[]).await?;
-                save_merkle_snapshot(&merkle_path, &indexed_hashes).await?;
-                let graph_root_hash = build_root_hash(&indexed_hashes);
-                self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
-                    .await?;
+                if features.graph {
+                    self.resolve_graph(repo, &repo_key, &[]).await?;
+                }
+                save_merkle_snapshot(&merkle_path, &indexed_hashes, features).await?;
+                if features.graph {
+                    let graph_root_hash = build_root_hash(&indexed_hashes);
+                    self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
+                        .await?;
+                }
                 let changes = RepoChangeSummary {
                     added: processing.processed_files,
                     modified: 0,
                     removed: 0,
                 };
-                let repo_path = repo.to_path_buf();
-                let local_index = self.inner.local_index.clone();
-                let chunk_coverage =
-                    run_low_priority_blocking("count_repo_chunk_coverage", move || {
-                        local_index.chunk_coverage(&repo_path)
-                    })
-                    .await?;
-                let coverage = IndexCoverage {
-                    indexed_files: chunk_coverage.indexed_files,
-                    total_chunks: chunk_coverage.total_chunks,
+                let coverage = if features.lexical {
+                    let repo_path = repo.to_path_buf();
+                    let local_index = self.inner.local_index.clone();
+                    let chunk_coverage =
+                        run_low_priority_blocking("count_repo_chunk_coverage", move || {
+                            local_index.chunk_coverage(&repo_path)
+                        })
+                        .await?;
+                    IndexCoverage {
+                        indexed_files: chunk_coverage.indexed_files,
+                        total_chunks: chunk_coverage.total_chunks,
+                    }
+                } else {
+                    IndexCoverage {
+                        indexed_files: indexed_hashes.len() as u64,
+                        total_chunks: if features.semantic {
+                            processing.total_chunks
+                        } else {
+                            0
+                        },
+                    }
                 };
                 Ok::<(ProcessFilesResult, RepoChangeSummary, IndexCoverage), anyhow::Error>((
                     processing, changes, coverage,
                 ))
             } else {
-                let symbol_collection_ready = if symbol_collection_exists {
+                let previous_snapshot = previous_snapshot.expect("checked above");
+                let previous_features = previous_snapshot.features;
+                let newly_enabled = features.difference(previous_features);
+                let retained_features = features.intersection(previous_features);
+
+                if previous_features.lexical != features.lexical {
+                    let repo_path = repo.to_path_buf();
+                    let local_index = self.inner.local_index.clone();
+                    run_low_priority_blocking("reset_repo_local_index_features", move || {
+                        local_index.clear_repo(&repo_path)
+                    })
+                    .await?;
+                }
+                if previous_features.graph != features.graph {
+                    let graph_store = self.inner.graph_store.clone();
+                    let repo_key_for_graph = repo_key.clone();
+                    run_low_priority_blocking("reset_repo_graph_features", move || {
+                        graph_store.clear_repo(&repo_key_for_graph)
+                    })
+                    .await?;
+                    if features.graph {
+                        self.set_graph_state(&repo_key, "updating", None).await?;
+                    }
+                }
+                if !features.any() {
+                    let symbol_store = self.inner.symbol_store.clone();
+                    let repo_key_for_symbols = repo_key.clone();
+                    run_low_priority_blocking("clear_disabled_repo_symbols", move || {
+                        symbol_store.clear_repo(&repo_key_for_symbols)
+                    })
+                    .await?;
+                }
+
+                let symbol_collection_ready = if !features.semantic {
+                    false
+                } else if newly_enabled.semantic {
+                    if collection_exists {
+                        self.inner.milvus.drop_collection(&collection_name).await?;
+                    }
+                    if symbol_collection_exists {
+                        self.inner
+                            .milvus
+                            .drop_collection(&symbol_collection_name)
+                            .await?;
+                    }
+                    let dimension = configured_embedding_dimension
+                        .context("semantic indexing enabled without an embedding dimension")?;
+                    self.inner
+                        .milvus
+                        .create_hybrid_collection(
+                            &collection_name,
+                            dimension,
+                            &format!("codebasePath:{}", repo.display()),
+                        )
+                        .await?;
+                    self.inner
+                        .milvus
+                        .create_hybrid_collection(
+                            &symbol_collection_name,
+                            dimension,
+                            &format!("symbolCodebasePath:{}", repo.display()),
+                        )
+                        .await?;
+                    true
+                } else if symbol_collection_exists {
                     true
                 } else {
                     self.inner
                         .milvus
                         .create_hybrid_collection(
                             &symbol_collection_name,
-                            configured_embedding_dimension,
+                            configured_embedding_dimension.context(
+                                "semantic indexing enabled without an embedding dimension",
+                            )?,
                             &format!("symbolCodebasePath:{}", repo.display()),
                         )
                         .await?;
                     true
                 };
-                let previous_snapshot = previous_snapshot.expect("checked above");
                 let previous_hashes = previous_snapshot
                     .file_hashes
                     .into_iter()
                     .collect::<BTreeMap<_, _>>();
                 let diff = diff_files(&previous_hashes, &current_hashes);
 
-                for relative_path in diff.removed.iter().chain(diff.modified.iter()) {
-                    let ids = self
-                        .inner
-                        .milvus
-                        .query_ids_for_path(&collection_name, relative_path)
-                        .await?;
-                    self.inner.milvus.delete_ids(&collection_name, &ids).await?;
-                    if symbol_collection_ready {
+                if features.semantic {
+                    for relative_path in diff.removed.iter().chain(diff.modified.iter()) {
+                        let ids = self
+                            .inner
+                            .milvus
+                            .query_ids_for_path(&collection_name, relative_path)
+                            .await?;
+                        self.inner.milvus.delete_ids(&collection_name, &ids).await?;
                         let symbol_ids = self
                             .inner
                             .milvus
@@ -4344,33 +4584,39 @@ impl Engine {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !deleted_paths.is_empty() {
-                    let repo_path = repo.to_path_buf();
-                    let local_index = self.inner.local_index.clone();
-                    let paths = deleted_paths.clone();
-                    run_low_priority_blocking("delete_local_paths", move || {
-                        local_index.delete_paths(&repo_path, &paths)
-                    })
-                    .await?;
-                    let symbol_store = self.inner.symbol_store.clone();
-                    let repo_key_for_symbols = repo_key.clone();
-                    let symbol_paths = deleted_paths.clone();
-                    run_low_priority_blocking("delete_symbol_rows", move || {
-                        for path in symbol_paths {
-                            symbol_store.delete_file(&repo_key_for_symbols, &path)?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                    let graph_store = self.inner.graph_store.clone();
-                    let repo_key_for_graph = repo_key.clone();
-                    let graph_paths = deleted_paths.clone();
-                    run_low_priority_blocking("delete_graph_rows", move || {
-                        for path in graph_paths {
-                            graph_store.delete_file(&repo_key_for_graph, &path)?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
+                    if features.lexical {
+                        let repo_path = repo.to_path_buf();
+                        let local_index = self.inner.local_index.clone();
+                        let paths = deleted_paths.clone();
+                        run_low_priority_blocking("delete_local_paths", move || {
+                            local_index.delete_paths(&repo_path, &paths)
+                        })
+                        .await?;
+                    }
+                    if features.any() {
+                        let symbol_store = self.inner.symbol_store.clone();
+                        let repo_key_for_symbols = repo_key.clone();
+                        let symbol_paths = deleted_paths.clone();
+                        run_low_priority_blocking("delete_symbol_rows", move || {
+                            for path in symbol_paths {
+                                symbol_store.delete_file(&repo_key_for_symbols, &path)?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    if features.graph {
+                        let graph_store = self.inner.graph_store.clone();
+                        let repo_key_for_graph = repo_key.clone();
+                        let graph_paths = deleted_paths.clone();
+                        run_low_priority_blocking("delete_graph_rows", move || {
+                            for path in graph_paths {
+                                graph_store.delete_file(&repo_key_for_graph, &path)?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                    }
                 }
 
                 let to_index = diff
@@ -4379,18 +4625,21 @@ impl Engine {
                     .chain(diff.modified.iter())
                     .filter_map(|path| current_files.get(path).cloned())
                     .collect::<Vec<_>>();
-                let processing = self
+                let mut processing = self
                     .process_files(
                         ProcessFilesPlan {
                             repo,
                             storage_repo: repo,
                             repo_key: &repo_key,
-                            profile_name: &profile_name,
+                            profile_name: profile_name.as_deref(),
                             collections: IndexCollections {
-                                chunk: &collection_name,
-                                symbol: symbol_collection_ready
+                                chunk: retained_features
+                                    .semantic
+                                    .then_some(collection_name.as_str()),
+                                symbol: (retained_features.semantic && symbol_collection_ready)
                                     .then_some(symbol_collection_name.as_str()),
                             },
+                            features: retained_features,
                             splitter,
                             total_files: to_index.len(),
                             mode,
@@ -4398,6 +4647,47 @@ impl Engine {
                         &to_index,
                     )
                     .await?;
+                let mut graph_indexed_paths = if retained_features.graph {
+                    processing.indexed_paths.clone()
+                } else {
+                    HashSet::new()
+                };
+                if newly_enabled.any() {
+                    let files = current_files.values().cloned().collect::<Vec<_>>();
+                    let backfill = self
+                        .process_files(
+                            ProcessFilesPlan {
+                                repo,
+                                storage_repo: repo,
+                                repo_key: &repo_key,
+                                profile_name: profile_name.as_deref(),
+                                collections: IndexCollections {
+                                    chunk: newly_enabled
+                                        .semantic
+                                        .then_some(collection_name.as_str()),
+                                    symbol: (newly_enabled.semantic && symbol_collection_ready)
+                                        .then_some(symbol_collection_name.as_str()),
+                                },
+                                features: newly_enabled,
+                                splitter,
+                                total_files: current_files.len(),
+                                mode,
+                            },
+                            &files,
+                        )
+                        .await?;
+                    if newly_enabled.graph {
+                        graph_indexed_paths.extend(backfill.indexed_paths.iter().cloned());
+                    }
+                    processing.indexed_paths.extend(backfill.indexed_paths);
+                    processing.processed_files = processing.indexed_paths.len() as u64;
+                    processing.total_chunks = processing
+                        .total_chunks
+                        .saturating_add(backfill.total_chunks);
+                    if backfill.status == IndexCompletionStatus::LimitReached {
+                        processing.status = IndexCompletionStatus::LimitReached;
+                    }
+                }
                 let mut persisted_hashes = previous_hashes
                     .into_iter()
                     .filter(|(path, _)| {
@@ -4409,33 +4699,48 @@ impl Engine {
                         persisted_hashes.insert(relative_path.clone(), hash.clone());
                     }
                 }
-                let mut graph_refresh_paths = deleted_paths;
-                graph_refresh_paths.extend(processing.indexed_paths.iter().cloned());
+                let mut graph_refresh_paths = if features.graph {
+                    deleted_paths
+                } else {
+                    Vec::new()
+                };
+                graph_refresh_paths.extend(graph_indexed_paths);
                 graph_refresh_paths.sort();
                 graph_refresh_paths.dedup();
-                if !graph_refresh_paths.is_empty() {
+                if features.graph && !graph_refresh_paths.is_empty() {
                     self.resolve_graph(repo, &repo_key, &graph_refresh_paths)
                         .await?;
                 }
-                self.maintain_incremental_relationship_storage(
-                    &repo_key,
-                    !graph_refresh_paths.is_empty(),
-                )
-                .await?;
-                save_merkle_snapshot(&merkle_path, &persisted_hashes).await?;
-                let graph_root_hash = build_root_hash(&persisted_hashes);
-                self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
+                if features.graph {
+                    self.maintain_incremental_relationship_storage(
+                        &repo_key,
+                        !graph_refresh_paths.is_empty(),
+                    )
                     .await?;
-                let repo_path = repo.to_path_buf();
-                let local_index = self.inner.local_index.clone();
-                let chunk_coverage =
-                    run_low_priority_blocking("count_repo_chunk_coverage", move || {
-                        local_index.chunk_coverage(&repo_path)
-                    })
-                    .await?;
-                let coverage = IndexCoverage {
-                    indexed_files: chunk_coverage.indexed_files,
-                    total_chunks: chunk_coverage.total_chunks,
+                }
+                save_merkle_snapshot(&merkle_path, &persisted_hashes, features).await?;
+                if features.graph {
+                    let graph_root_hash = build_root_hash(&persisted_hashes);
+                    self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
+                        .await?;
+                }
+                let coverage = if features.lexical {
+                    let repo_path = repo.to_path_buf();
+                    let local_index = self.inner.local_index.clone();
+                    let chunk_coverage =
+                        run_low_priority_blocking("count_repo_chunk_coverage", move || {
+                            local_index.chunk_coverage(&repo_path)
+                        })
+                        .await?;
+                    IndexCoverage {
+                        indexed_files: chunk_coverage.indexed_files,
+                        total_chunks: chunk_coverage.total_chunks,
+                    }
+                } else {
+                    IndexCoverage {
+                        indexed_files: persisted_hashes.len() as u64,
+                        total_chunks: 0,
+                    }
                 };
                 let changes = RepoChangeSummary {
                     added: diff
@@ -4457,7 +4762,8 @@ impl Engine {
 
         match outcome {
             Ok((processing, changes, coverage)) => {
-                if vector_release_needed(full_reindex, &changes)
+                if features.semantic
+                    && vector_release_needed(full_reindex, &changes)
                     && let Err(error) = self
                         .maintain_vector_collections(
                             &[collection_name.clone(), symbol_collection_name.clone()],
@@ -4480,8 +4786,8 @@ impl Engine {
                                 SnapshotEntry::failed(
                                     message.clone(),
                                     last_progress,
-                                    Some(profile_name.clone()),
-                                    Some(configured_embedding_fingerprint.clone()),
+                                    profile_name.clone(),
+                                    configured_embedding_fingerprint.clone(),
                                 ),
                             );
                         })
@@ -4511,16 +4817,16 @@ impl Engine {
                                     SnapshotEntry::indexing(
                                         0.0,
                                         "running",
-                                        Some(profile_name.clone()),
-                                        Some(configured_embedding_fingerprint.clone()),
+                                        profile_name.clone(),
+                                        configured_embedding_fingerprint.clone(),
                                     )
                                 });
                         *entry = SnapshotEntry::indexed_with_status(
                             Some(coverage.indexed_files),
                             Some(coverage.total_chunks),
                             index_status.clone(),
-                            Some(profile_name.clone()),
-                            Some(configured_embedding_fingerprint.clone()),
+                            profile_name.clone(),
+                            configured_embedding_fingerprint.clone(),
                         );
                         if let Some(fingerprint) = &fingerprint {
                             apply_fingerprint(entry, fingerprint);
@@ -4535,7 +4841,9 @@ impl Engine {
                     indexed_files: Some(coverage.indexed_files),
                     total_chunks: Some(coverage.total_chunks),
                     index_status: Some(index_status),
-                    graph_status: Some("ready".to_string()),
+                    graph_status: Some(
+                        if features.graph { "ready" } else { "disabled" }.to_string(),
+                    ),
                     relationship_count: None,
                     full_reindex,
                     changes,
@@ -4557,8 +4865,8 @@ impl Engine {
                             SnapshotEntry::failed(
                                 message.clone(),
                                 last_progress,
-                                Some(profile_name.clone()),
-                                Some(configured_embedding_fingerprint.clone()),
+                                profile_name.clone(),
+                                configured_embedding_fingerprint.clone(),
                             ),
                         );
                     })
@@ -4568,7 +4876,9 @@ impl Engine {
                     indexed_files: None,
                     total_chunks: None,
                     index_status: Some("failed".to_string()),
-                    graph_status: Some("failed".to_string()),
+                    graph_status: Some(
+                        if features.graph { "failed" } else { "disabled" }.to_string(),
+                    ),
                     relationship_count: None,
                     full_reindex,
                     changes: RepoChangeSummary::default(),
@@ -4599,7 +4909,7 @@ impl Engine {
         };
 
         let overlay = worktree_overlay_context_from_snapshot(repo, &entry);
-        self.clear_worktree_overlay_indexes(&overlay).await?;
+        self.clear_worktree_overlay_indexes(&overlay, true).await?;
         let state_path = self.overlay_state_path(&entry.overlay_id);
         if state_path.exists() {
             tokio::fs::remove_file(&state_path)
@@ -4632,7 +4942,7 @@ impl Engine {
         validate_absolute_repo_path(repo)?;
         let ctx = self.repo_context(repo)?;
         if let Some(overlay) = ctx.overlay.as_ref() {
-            self.clear_worktree_overlay_indexes(overlay).await?;
+            self.clear_worktree_overlay_indexes(overlay, true).await?;
             let state_path = self.overlay_state_path(&overlay.resolution.overlay_id);
             if state_path.exists() {
                 tokio::fs::remove_file(&state_path)
@@ -4703,28 +5013,34 @@ impl Engine {
         Ok(())
     }
 
-    async fn clear_worktree_overlay_indexes(&self, overlay: &WorktreeOverlayContext) -> Result<()> {
-        if self
-            .inner
-            .milvus
-            .refresh_collection_presence(&overlay.chunk_collection)
-            .await?
-        {
-            self.inner
+    async fn clear_worktree_overlay_indexes(
+        &self,
+        overlay: &WorktreeOverlayContext,
+        clear_semantic: bool,
+    ) -> Result<()> {
+        if clear_semantic {
+            if self
+                .inner
                 .milvus
-                .drop_collection(&overlay.chunk_collection)
-                .await?;
-        }
-        if self
-            .inner
-            .milvus
-            .refresh_collection_presence(&overlay.symbol_collection)
-            .await?
-        {
-            self.inner
+                .refresh_collection_presence(&overlay.chunk_collection)
+                .await?
+            {
+                self.inner
+                    .milvus
+                    .drop_collection(&overlay.chunk_collection)
+                    .await?;
+            }
+            if self
+                .inner
                 .milvus
-                .drop_collection(&overlay.symbol_collection)
-                .await?;
+                .refresh_collection_presence(&overlay.symbol_collection)
+                .await?
+            {
+                self.inner
+                    .milvus
+                    .drop_collection(&overlay.symbol_collection)
+                    .await?;
+            }
         }
         let storage_root = overlay.storage_root.clone();
         let local_index = self.inner.local_index.clone();
@@ -4823,6 +5139,20 @@ impl Engine {
         filter_expression: Option<&str>,
     ) -> Result<SearchContextResult<RepoSearchHit>> {
         let canonical_key = ctx.canonical_root.display().to_string();
+        let features = self.index_features_for_repo(&ctx.canonical_root);
+        let mut warnings = Vec::new();
+        if !features.lexical && (plan.lexical_weight > 0.0 || plan.symbol_lexical_share > 0.0) {
+            warnings.push(format!(
+                "lexical indexing is disabled for {}",
+                ctx.canonical_root.display()
+            ));
+        }
+        if !features.semantic && (plan.dense_weight > 0.0 || plan.symbol_semantic_share > 0.0) {
+            warnings.push(format!(
+                "semantic indexing is disabled for {}",
+                ctx.canonical_root.display()
+            ));
+        }
         let mut hits = self
             .search_repo_index(
                 &ctx.requested_root,
@@ -4832,6 +5162,7 @@ impl Engine {
                 &symbol_collection_name(&ctx.canonical_root),
                 request,
                 plan,
+                features,
                 canonical_query_vector,
                 limit,
                 filter_expression,
@@ -4839,13 +5170,9 @@ impl Engine {
             .await?;
 
         let Some(overlay) = ctx.overlay.as_ref() else {
-            return Ok(SearchContextResult {
-                hits,
-                warnings: Vec::new(),
-            });
+            return Ok(SearchContextResult { hits, warnings });
         };
 
-        let mut warnings = Vec::new();
         let overlay_state = match self.load_overlay_state(overlay).await {
             Ok(state) => state,
             Err(error) => {
@@ -4875,6 +5202,7 @@ impl Engine {
                     &overlay.symbol_collection,
                     request,
                     plan,
+                    features,
                     overlay_query_vector,
                     limit,
                     filter_expression,
@@ -4903,21 +5231,26 @@ impl Engine {
         symbol_collection_name: &str,
         request: &SearchRequest,
         plan: &SearchPlan,
+        features: IndexFeatures,
         query_vector: Option<&[f32]>,
         limit: usize,
         filter_expression: Option<&str>,
     ) -> Result<Vec<RepoSearchHit>> {
-        let dense_hits = if let Some(query_vector) = query_vector {
-            if plan.dense_weight > 0.0 {
-                let _dense_permit = self.acquire_dense_budget().await?;
-                if self.inner.milvus.has_collection(collection_name).await? {
-                    self.inner
-                        .milvus
-                        .search_dense(collection_name, query_vector, limit, filter_expression)
-                        .await?
-                        .into_iter()
-                        .filter(|hit| search_document_matches(hit, request))
-                        .collect::<Vec<_>>()
+        let dense_hits = if features.semantic {
+            if let Some(query_vector) = query_vector {
+                if plan.dense_weight > 0.0 {
+                    let _dense_permit = self.acquire_dense_budget().await?;
+                    if self.inner.milvus.has_collection(collection_name).await? {
+                        self.inner
+                            .milvus
+                            .search_dense(collection_name, query_vector, limit, filter_expression)
+                            .await?
+                            .into_iter()
+                            .filter(|hit| search_document_matches(hit, request))
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
                 }
@@ -4928,8 +5261,8 @@ impl Engine {
             Vec::new()
         };
 
-        let lexical_hits = self
-            .run_search_lexical_blocking("search_chunk_index", {
+        let lexical_hits = if features.lexical {
+            self.run_search_lexical_blocking("search_chunk_index", {
                 let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let request = ChunkSearchRequest {
@@ -4943,9 +5276,12 @@ impl Engine {
                 };
                 move || local_index.search_chunks(&repo_path, &request)
             })
-            .await?;
+            .await?
+        } else {
+            Vec::new()
+        };
 
-        let symbol_collection_exists = if plan.symbol_semantic_share > 0.0 {
+        let symbol_collection_exists = if features.semantic && plan.symbol_semantic_share > 0.0 {
             self.has_collection_on_search_path(symbol_collection_name)
                 .await?
         } else {
@@ -4969,8 +5305,16 @@ impl Engine {
                 limit,
                 SymbolFusionConfig {
                     query_vector,
-                    lexical_share: plan.symbol_lexical_share,
-                    semantic_share: plan.symbol_semantic_share,
+                    lexical_share: if features.lexical {
+                        plan.symbol_lexical_share
+                    } else {
+                        0.0
+                    },
+                    semantic_share: if features.semantic {
+                        plan.symbol_semantic_share
+                    } else {
+                        0.0
+                    },
                     symbol_collection_exists,
                 },
             )
@@ -4985,6 +5329,7 @@ impl Engine {
             storage_repo,
             symbol_hits,
             plan.symbol_weight,
+            features.lexical,
         )
         .await?;
 
@@ -5010,6 +5355,26 @@ impl Engine {
         lexical_share: f64,
         semantic_share: f64,
     ) -> Result<SearchContextResult<RankedSymbolHit>> {
+        let features = self.index_features_for_repo(&ctx.canonical_root);
+        let mut warnings = Vec::new();
+        if !features.lexical && lexical_share > 0.0 {
+            warnings.push(format!(
+                "lexical indexing is disabled for {}",
+                ctx.canonical_root.display()
+            ));
+        }
+        if !features.semantic && semantic_share > 0.0 {
+            warnings.push(format!(
+                "semantic indexing is disabled for {}",
+                ctx.canonical_root.display()
+            ));
+        }
+        let lexical_share = if features.lexical { lexical_share } else { 0.0 };
+        let semantic_share = if features.semantic {
+            semantic_share
+        } else {
+            0.0
+        };
         let canonical_collection = symbol_collection_name(&ctx.canonical_root);
         let canonical_collection_exists = if semantic_share > 0.0 {
             self.has_collection_on_search_path(&canonical_collection)
@@ -5036,13 +5401,9 @@ impl Engine {
             .await?;
 
         let Some(overlay) = ctx.overlay.as_ref() else {
-            return Ok(SearchContextResult {
-                hits,
-                warnings: Vec::new(),
-            });
+            return Ok(SearchContextResult { hits, warnings });
         };
 
-        let mut warnings = Vec::new();
         let overlay_state = match self.load_overlay_state(overlay).await {
             Ok(state) => state,
             Err(error) => {
@@ -5109,8 +5470,8 @@ impl Engine {
         limit: usize,
         fusion: SymbolFusionConfig<'_>,
     ) -> Result<Vec<RankedSymbolHit>> {
-        let indexed_hits = self
-            .run_search_lexical_blocking("search_symbol_index", {
+        let indexed_hits = if fusion.lexical_share > 0.0 {
+            self.run_search_lexical_blocking("search_symbol_index", {
                 let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let request = SymbolSearchRequest {
@@ -5124,7 +5485,10 @@ impl Engine {
                 };
                 move || local_index.search_symbols(&repo_path, &request)
             })
-            .await?;
+            .await?
+        } else {
+            Vec::new()
+        };
 
         let semantic_hits = if fusion.semantic_share > 0.0 && fusion.symbol_collection_exists {
             if let Some(query_vector) = fusion.query_vector {
@@ -5202,6 +5566,7 @@ impl Engine {
         storage_repo: &Path,
         symbol_hits: Vec<RankedSymbolHit>,
         weight: f64,
+        use_lexical_chunks: bool,
     ) -> Result<()> {
         if weight <= 0.0 {
             return Ok(());
@@ -5214,7 +5579,7 @@ impl Engine {
             .unwrap_or(1.0);
         let mut file_chunk_cache: HashMap<String, Vec<LexicalChunkSearchHit>> = HashMap::new();
         for (rank, hit) in symbol_hits.into_iter().enumerate() {
-            if !file_chunk_cache.contains_key(&hit.relative_path) {
+            if use_lexical_chunks && !file_chunk_cache.contains_key(&hit.relative_path) {
                 let repo_path = storage_repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let relative_path = hit.relative_path.clone();
@@ -5299,23 +5664,26 @@ impl Engine {
     async fn status_for_repo(&self, snapshot: &Snapshot, repo: &Path) -> Result<RepoStatus> {
         let repo_key = repo.display().to_string();
         let collection_name = collection_name(repo);
+        let features = self.index_features_for_repo(repo);
         let entry = snapshot.codebases.get(&repo_key).cloned();
         let identity = self.repo_embedding_identity_status(snapshot, repo).await?;
 
         if matches!(
             entry.as_ref().map(|value| value.status.as_str()),
             Some("indexed")
-        ) && !self
-            .inner
-            .milvus
-            .refresh_collection_presence(&collection_name)
-            .await?
+        ) && features.semantic
+            && !self
+                .inner
+                .milvus
+                .refresh_collection_presence(&collection_name)
+                .await?
         {
             self.inner.snapshot.remove(&repo_key).await?;
             return Ok(RepoStatus {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name,
+                features,
                 status: "not_indexed".to_string(),
                 indexed_files: None,
                 total_chunks: None,
@@ -5325,7 +5693,7 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
-                embedding_profile: Some(identity.profile_name),
+                embedding_profile: features.semantic.then_some(identity.profile_name),
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
@@ -5344,6 +5712,7 @@ impl Engine {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name,
+                features,
                 status: entry.status,
                 indexed_files: entry.indexed_files,
                 total_chunks: entry.total_chunks,
@@ -5353,7 +5722,11 @@ impl Engine {
                 indexing_percentage: entry.indexing_percentage,
                 last_attempted_percentage: entry.last_attempted_percentage,
                 error_message: entry.error_message,
-                embedding_profile: entry.embedding_profile.or(Some(identity.profile_name)),
+                embedding_profile: if features.semantic {
+                    entry.embedding_profile.or(Some(identity.profile_name))
+                } else {
+                    None
+                },
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
@@ -5369,6 +5742,7 @@ impl Engine {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name,
+                features,
                 status: "not_indexed".to_string(),
                 indexed_files: None,
                 total_chunks: None,
@@ -5378,7 +5752,7 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
-                embedding_profile: Some(identity.profile_name),
+                embedding_profile: features.semantic.then_some(identity.profile_name),
                 configured_embedding_fingerprint: identity.configured_fingerprint,
                 stored_embedding_fingerprint: identity.stored_fingerprint,
                 embedding_mismatch_reason: identity.reason,
@@ -5403,9 +5777,17 @@ impl Engine {
         };
         let repo_key = ctx.requested_root.display().to_string();
         let canonical_key = ctx.canonical_root.display().to_string();
+        let features = self.index_features_for_repo(&ctx.canonical_root);
         let entry = snapshot.worktrees.get(&repo_key).cloned();
-        let profile_name = self.overlay_profile_name(ctx)?.to_string();
-        let configured_fingerprint = self.inner.embedding.fingerprint(&profile_name).await.ok();
+        let profile_name = features
+            .semantic
+            .then(|| self.overlay_profile_name(ctx).map(str::to_string))
+            .transpose()?;
+        let configured_fingerprint = if let Some(profile_name) = profile_name.as_deref() {
+            self.inner.embedding.fingerprint(profile_name).await.ok()
+        } else {
+            None
+        };
         let stored_fingerprint = entry
             .as_ref()
             .and_then(|entry| entry.embedding_fingerprint.clone());
@@ -5442,6 +5824,7 @@ impl Engine {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name: overlay.chunk_collection.clone(),
+                features,
                 status: entry.status,
                 indexed_files: coverage
                     .as_ref()
@@ -5454,7 +5837,7 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: entry.overlay_mismatch_reason.clone(),
-                embedding_profile: entry.embedding_profile.or(Some(profile_name)),
+                embedding_profile: entry.embedding_profile.or(profile_name),
                 configured_embedding_fingerprint: configured_fingerprint,
                 stored_embedding_fingerprint: stored_fingerprint,
                 embedding_mismatch_reason: fingerprint_mismatch,
@@ -5470,6 +5853,7 @@ impl Engine {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name: overlay.chunk_collection.clone(),
+                features,
                 status: "not_indexed".to_string(),
                 indexed_files: None,
                 total_chunks: None,
@@ -5479,7 +5863,7 @@ impl Engine {
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
-                embedding_profile: Some(profile_name),
+                embedding_profile: profile_name,
                 configured_embedding_fingerprint: configured_fingerprint,
                 stored_embedding_fingerprint: None,
                 embedding_mismatch_reason: None,
@@ -5553,11 +5937,19 @@ impl Engine {
         repo_key: &str,
         progress: f64,
     ) -> Result<()> {
-        let profile_name = self
-            .embedding_profile_name_for_repo(repo)
-            .ok()
-            .map(str::to_string);
-        let configured_embedding_fingerprint = self.embedding_fingerprint_for_repo(repo).await.ok();
+        let semantic_enabled = self.index_features_for_repo(repo).semantic;
+        let profile_name = if semantic_enabled {
+            self.embedding_profile_name_for_repo(repo)
+                .ok()
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let configured_embedding_fingerprint = if semantic_enabled {
+            self.embedding_fingerprint_for_repo(repo).await.ok()
+        } else {
+            None
+        };
         self.inner
             .snapshot
             .update(|snapshot| {
@@ -5583,6 +5975,7 @@ impl Engine {
     async fn flush_graph_database_replacements(
         &self,
         repo_key: &str,
+        features: IndexFeatures,
         pending: &mut Vec<PendingGraphDatabaseReplacement>,
     ) -> Result<()> {
         if pending.is_empty() {
@@ -5606,8 +5999,13 @@ impl Engine {
                 .into_iter()
                 .map(|replacement| replacement.graph)
                 .collect::<Vec<_>>();
-            symbol_store.replace_files_symbols(&repo_key, &symbol_replacements)?;
-            graph_store.replace_files(&repo_key, &graph_replacements)
+            if features.any() {
+                symbol_store.replace_files_symbols(&repo_key, &symbol_replacements)?;
+            }
+            if features.graph {
+                graph_store.replace_files(&repo_key, &graph_replacements)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -5700,6 +6098,9 @@ impl Engine {
 
     async fn graph_summary_for_repo(&self, repo: &Path) -> Result<(String, u64)> {
         let ctx = self.repo_context(repo)?;
+        if !self.index_features_for_repo(&ctx.canonical_root).graph {
+            return Ok(("disabled".to_string(), 0));
+        }
         let graph = self.inner.graph_store.clone();
         if let Some(overlay) = ctx.overlay {
             let overlay_key = overlay.repo_key;
@@ -5755,6 +6156,25 @@ impl Engine {
         plan: ProcessFilesPlan<'_>,
         files: &[RepoFile],
     ) -> Result<ProcessFilesResult> {
+        if !plan.features.any() {
+            let indexed_paths = files
+                .iter()
+                .map(|file| {
+                    file.absolute_path
+                        .strip_prefix(plan.repo)
+                        .unwrap_or(file.absolute_path.as_path())
+                        .display()
+                        .to_string()
+                        .replace('\\', "/")
+                })
+                .collect::<HashSet<_>>();
+            return Ok(ProcessFilesResult {
+                processed_files: indexed_paths.len() as u64,
+                indexed_paths,
+                total_chunks: 0,
+                status: IndexCompletionStatus::Completed,
+            });
+        }
         let mut pending_chunks = Vec::new();
         let mut pending_symbols = Vec::new();
         let mut pending_symbol_index_replacements = Vec::new();
@@ -5772,9 +6192,10 @@ impl Engine {
             let engine = self.clone();
             let repo = repo_path.clone();
             let repo_key = repo_key_owned.clone();
+            let features = plan.features;
             async move {
                 engine
-                    .prepare_repo_file(&repo, &repo_key, file, plan.splitter)
+                    .prepare_repo_file(&repo, &repo_key, file, plan.splitter, features)
                     .await
             }
         }))
@@ -5785,39 +6206,43 @@ impl Engine {
                 continue;
             };
             let chunk_count = prepared.chunks.len() as u64;
-            if total_chunks + chunk_count > CHUNK_LIMIT as u64 {
+            if (plan.features.lexical || plan.features.semantic)
+                && total_chunks + chunk_count > CHUNK_LIMIT as u64
+            {
                 status = IndexCompletionStatus::LimitReached;
                 break;
             }
-            let symbol_index_docs = prepared
-                .symbols
-                .iter()
-                .map(|symbol| SymbolIndexDoc {
-                    symbol_id: symbol.symbol_id.clone(),
-                    relative_path: symbol.relative_path.clone(),
-                    basename: prepared.basename.clone(),
-                    name: symbol.name.clone(),
-                    kind: symbol.kind.clone(),
-                    container: symbol.container.clone(),
-                    language: symbol.language.clone(),
-                    start_line: symbol.start_line,
-                    end_line: symbol.end_line,
-                    indexed_at: symbol.indexed_at.clone(),
-                    file_hash: symbol.file_hash.clone(),
-                })
-                .collect::<Vec<_>>();
-            pending_symbol_index_replacements.push(PendingSymbolIndexReplacement {
-                relative_path: prepared.relative_path.clone(),
-                documents: symbol_index_docs,
-            });
-            if pending_symbol_index_replacements.len() >= SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE {
-                self.flush_symbol_index_replacements(
-                    plan.storage_repo,
-                    &mut pending_symbol_index_replacements,
-                )
-                .await?;
+            if plan.features.lexical {
+                let symbol_index_docs = prepared
+                    .symbols
+                    .iter()
+                    .map(|symbol| SymbolIndexDoc {
+                        symbol_id: symbol.symbol_id.clone(),
+                        relative_path: symbol.relative_path.clone(),
+                        basename: prepared.basename.clone(),
+                        name: symbol.name.clone(),
+                        kind: symbol.kind.clone(),
+                        container: symbol.container.clone(),
+                        language: symbol.language.clone(),
+                        start_line: symbol.start_line,
+                        end_line: symbol.end_line,
+                        indexed_at: symbol.indexed_at.clone(),
+                        file_hash: symbol.file_hash.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                pending_symbol_index_replacements.push(PendingSymbolIndexReplacement {
+                    relative_path: prepared.relative_path.clone(),
+                    documents: symbol_index_docs,
+                });
+                if pending_symbol_index_replacements.len() >= SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE {
+                    self.flush_symbol_index_replacements(
+                        plan.storage_repo,
+                        &mut pending_symbol_index_replacements,
+                    )
+                    .await?;
+                }
             }
-            if plan.collections.symbol.is_some() {
+            if plan.features.semantic {
                 pending_symbols.extend(prepared.symbols.iter().cloned().map(|symbol| {
                     PendingSymbolDocument {
                         symbol,
@@ -5835,25 +6260,32 @@ impl Engine {
                 }
             }
 
-            pending_graph_database_replacements.push(PendingGraphDatabaseReplacement {
-                relative_path: prepared.relative_path.clone(),
-                symbols: prepared.symbols,
-                graph: GraphFileReplacement {
+            if plan.features.any() {
+                pending_graph_database_replacements.push(PendingGraphDatabaseReplacement {
                     relative_path: prepared.relative_path.clone(),
-                    references: prepared.relationships,
-                    coverage: prepared.relationship_coverage,
-                    file_hash: prepared.file_hash.clone(),
-                },
-            });
-            if pending_graph_database_replacements.len() >= GRAPH_DB_REPLACEMENT_BATCH_SIZE {
-                self.flush_graph_database_replacements(
-                    plan.repo_key,
-                    &mut pending_graph_database_replacements,
-                )
-                .await?;
+                    symbols: prepared.symbols,
+                    graph: GraphFileReplacement {
+                        relative_path: prepared.relative_path.clone(),
+                        references: prepared.relationships,
+                        coverage: prepared.relationship_coverage,
+                        file_hash: prepared.file_hash.clone(),
+                    },
+                });
+                if pending_graph_database_replacements.len() >= GRAPH_DB_REPLACEMENT_BATCH_SIZE {
+                    self.flush_graph_database_replacements(
+                        plan.repo_key,
+                        plan.features,
+                        &mut pending_graph_database_replacements,
+                    )
+                    .await?;
+                }
             }
 
-            for chunk in prepared.chunks {
+            for chunk in prepared
+                .chunks
+                .into_iter()
+                .filter(|_| plan.features.lexical || plan.features.semantic)
+            {
                 pending_chunks.push(PendingChunk {
                     chunk,
                     indexed_at: prepared.indexed_at.clone(),
@@ -5865,6 +6297,7 @@ impl Engine {
                         plan.storage_repo,
                         plan.profile_name,
                         plan.collections.chunk,
+                        plan.features,
                         &mut pending_chunks,
                     )
                     .await?;
@@ -5886,6 +6319,7 @@ impl Engine {
         if !pending_graph_database_replacements.is_empty() {
             self.flush_graph_database_replacements(
                 plan.repo_key,
+                plan.features,
                 &mut pending_graph_database_replacements,
             )
             .await?;
@@ -5896,6 +6330,7 @@ impl Engine {
                 plan.storage_repo,
                 plan.profile_name,
                 plan.collections.chunk,
+                plan.features,
                 &mut pending_chunks,
             )
             .await?;
@@ -5919,6 +6354,7 @@ impl Engine {
         Ok(ProcessFilesResult {
             indexed_paths,
             processed_files,
+            total_chunks,
             status,
         })
     }
@@ -5929,6 +6365,7 @@ impl Engine {
         repo_key: &str,
         file: RepoFile,
         splitter: SplitterKind,
+        features: IndexFeatures,
     ) -> Result<Option<PreparedRepoFile>> {
         let Some(text) = read_utf8_file(&file.absolute_path).await? else {
             return Ok(None);
@@ -5957,7 +6394,11 @@ impl Engine {
         let text_for_task = text;
         let file_hash_for_task = file_hash.clone();
         let (chunks, symbols, relationships) = tokio::task::spawn_blocking(move || {
-            let chunks = split_text(&absolute_path, &text_for_task, splitter)?;
+            let chunks = if features.lexical || features.semantic {
+                split_text(&absolute_path, &text_for_task, splitter)?
+            } else {
+                Vec::new()
+            };
             let (symbols, tree) = extract_symbols_with_tree(
                 &repo_key,
                 &relative_path_for_task,
@@ -5966,15 +6407,19 @@ impl Engine {
                 &indexed_at_for_task,
                 &file_hash_for_task,
             )?;
-            let relationships = extract_relationships_from_tree(
-                &repo_key,
-                &relative_path_for_task,
-                &absolute_path,
-                &text_for_task,
-                &symbols,
-                &file_hash_for_task,
-                tree.as_ref(),
-            )?;
+            let relationships = if features.graph {
+                extract_relationships_from_tree(
+                    &repo_key,
+                    &relative_path_for_task,
+                    &absolute_path,
+                    &text_for_task,
+                    &symbols,
+                    &file_hash_for_task,
+                    tree.as_ref(),
+                )?
+            } else {
+                Default::default()
+            };
             Ok::<_, anyhow::Error>((chunks, symbols, relationships))
         })
         .await
@@ -5997,8 +6442,9 @@ impl Engine {
         &self,
         repo: &Path,
         storage_repo: &Path,
-        profile_name: &str,
-        collection_name: &str,
+        profile_name: Option<&str>,
+        collection_name: Option<&str>,
+        features: IndexFeatures,
         pending_chunks: &mut Vec<PendingChunk>,
     ) -> Result<()> {
         let chunks = std::mem::take(pending_chunks);
@@ -6006,97 +6452,106 @@ impl Engine {
             return Ok(());
         }
 
-        let contents = chunks
-            .iter()
-            .map(|chunk| chunk.chunk.content.clone())
-            .collect::<Vec<_>>();
-        let embeddings = self
-            .inner
-            .embedding
-            .embed_documents(profile_name, &contents)
-            .await?;
-
-        let documents = chunks
+        let chunk_documents = chunks
             .into_iter()
-            .enumerate()
-            .map(
-                |(index, pending)| -> Result<(VectorDocument, ChunkIndexDoc)> {
-                    let chunk = pending.chunk;
-                    let relative_path = chunk
-                        .file_path
-                        .strip_prefix(repo)
-                        .unwrap_or(chunk.file_path.as_path())
-                        .display()
-                        .to_string()
-                        .replace('\\', "/");
-                    let basename = basename_for_path(&relative_path);
-                    let file_extension = chunk
-                        .file_path
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .map(|value| format!(".{value}"))
-                        .unwrap_or_default();
-                    let chunk_id = chunk_id(
-                        &relative_path,
-                        chunk.start_line,
-                        chunk.end_line,
-                        &chunk.content,
-                    );
-                    let vector_document = VectorDocument {
-                        id: chunk_id.clone(),
+            .map(|pending| -> Result<ChunkIndexDoc> {
+                let chunk = pending.chunk;
+                let relative_path = chunk
+                    .file_path
+                    .strip_prefix(repo)
+                    .unwrap_or(chunk.file_path.as_path())
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                let basename = basename_for_path(&relative_path);
+                let file_extension = chunk
+                    .file_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| format!(".{value}"))
+                    .unwrap_or_default();
+                let chunk_id = chunk_id(
+                    &relative_path,
+                    chunk.start_line,
+                    chunk.end_line,
+                    &chunk.content,
+                );
+                let chunk_document = ChunkIndexDoc {
+                    id: chunk_id,
+                    relative_path,
+                    basename,
+                    extension: file_extension,
+                    language: chunk.language,
+                    content: chunk.content,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    indexed_at: pending.indexed_at,
+                    file_hash: pending.file_hash,
+                };
+                Ok(chunk_document)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if features.semantic {
+            let profile_name =
+                profile_name.context("semantic indexing enabled without an embedding profile")?;
+            let collection_name =
+                collection_name.context("semantic indexing enabled without a chunk collection")?;
+            let contents = chunk_documents
+                .iter()
+                .map(|chunk| chunk.content.clone())
+                .collect::<Vec<_>>();
+            let embeddings = self
+                .inner
+                .embedding
+                .embed_documents(profile_name, &contents)
+                .await?;
+            let vector_documents = chunk_documents
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| -> Result<VectorDocument> {
+                    Ok(VectorDocument {
+                        id: chunk.id.clone(),
                         content: chunk.content.clone(),
                         vector: embeddings
                             .get(index)
                             .cloned()
                             .context("embedding/vector batch mismatch")?,
-                        relative_path: relative_path.clone(),
+                        relative_path: chunk.relative_path.clone(),
                         start_line: chunk.start_line,
                         end_line: chunk.end_line,
-                        file_extension: file_extension.clone(),
+                        file_extension: chunk.extension.clone(),
                         metadata: json!({
                             "codebasePath": repo.display().to_string(),
                             "language": chunk.language,
                             "chunkIndex": index,
-                            "indexedAt": pending.indexed_at,
-                            "fileHash": pending.file_hash,
-                            "basename": basename,
+                            "indexedAt": chunk.indexed_at,
+                            "fileHash": chunk.file_hash,
+                            "basename": chunk.basename,
                         }),
-                    };
-                    let chunk_document = ChunkIndexDoc {
-                        id: chunk_id,
-                        relative_path,
-                        basename,
-                        extension: file_extension,
-                        language: chunk.language,
-                        content: chunk.content,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        indexed_at: pending.indexed_at,
-                        file_hash: pending.file_hash,
-                    };
-                    Ok((vector_document, chunk_document))
-                },
-            )
-            .collect::<Result<Vec<_>>>()?;
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.inner
+                .milvus
+                .insert_documents(collection_name, &vector_documents)
+                .await?;
+        }
 
-        let (vector_documents, chunk_documents): (Vec<_>, Vec<_>) = documents.into_iter().unzip();
-
-        self.inner
-            .milvus
-            .insert_documents(collection_name, &vector_documents)
+        if features.lexical {
+            let repo_path = storage_repo.to_path_buf();
+            let local_index = self.inner.local_index.clone();
+            run_low_priority_blocking("write_chunk_lexical_docs", move || {
+                local_index.index_chunks(&repo_path, &chunk_documents)
+            })
             .await?;
-
-        let repo_path = storage_repo.to_path_buf();
-        let local_index = self.inner.local_index.clone();
-        run_low_priority_blocking("write_chunk_lexical_docs", move || {
-            local_index.index_chunks(&repo_path, &chunk_documents)
-        })
-        .await
+        }
+        Ok(())
     }
 
     async fn flush_symbol_documents(
         &self,
-        profile_name: &str,
+        profile_name: Option<&str>,
         symbol_collection_name: Option<&str>,
         pending_symbols: &mut Vec<PendingSymbolDocument>,
     ) -> Result<()> {
@@ -6104,6 +6559,8 @@ impl Engine {
             pending_symbols.clear();
             return Ok(());
         };
+        let profile_name = profile_name
+            .context("semantic symbol indexing enabled without an embedding profile")?;
 
         let symbols = std::mem::take(pending_symbols);
         if symbols.is_empty() {
@@ -7234,6 +7691,7 @@ fn repo_embedding_identity_status_for_snapshot(
     entry: Option<&SnapshotEntry>,
     configured_profile_name: &str,
     configured_fingerprint: Option<String>,
+    semantic_enabled: bool,
 ) -> RepoEmbeddingIdentityStatus {
     let stored_profile = entry
         .and_then(|value| value.embedding_profile.clone())
@@ -7253,14 +7711,16 @@ fn repo_embedding_identity_status_for_snapshot(
             "search root version mismatch: local state is `{}`, expected `{}`.",
             snapshot.search_root_version, SEARCH_ROOT_VERSION
         ));
-    } else if stored_profile != configured_profile_name {
+    } else if semantic_enabled && stored_profile != configured_profile_name {
         reason = Some(format!(
             "embedding profile mismatch: local state is `{stored_profile}`, current config is `{configured_profile_name}`."
         ));
-    } else if let (Some(stored), Some(configured)) = (
-        stored_fingerprint.as_deref(),
-        configured_fingerprint.as_deref(),
-    ) && stored != configured
+    } else if semantic_enabled
+        && let (Some(stored), Some(configured)) = (
+            stored_fingerprint.as_deref(),
+            configured_fingerprint.as_deref(),
+        )
+        && stored != configured
     {
         reason = Some(format!(
             "embedding fingerprint mismatch: local state is `{stored}`, current config is `{configured}`."
@@ -8203,7 +8663,11 @@ async fn load_merkle_snapshot(path: &Path) -> Result<MerkleSnapshot> {
     serde_json::from_str(&text).context("parsing merkle snapshot")
 }
 
-async fn save_merkle_snapshot(path: &Path, file_hashes: &BTreeMap<String, String>) -> Result<()> {
+async fn save_merkle_snapshot(
+    path: &Path,
+    file_hashes: &BTreeMap<String, String>,
+    features: IndexFeatures,
+) -> Result<()> {
     let merkle_dir = path
         .parent()
         .context("merkle snapshot missing parent directory")?;
@@ -8219,6 +8683,7 @@ async fn save_merkle_snapshot(path: &Path, file_hashes: &BTreeMap<String, String
         hash_algorithm: CONTENT_HASH_ALGORITHM.to_string(),
         root_hash: Some(build_root_hash(file_hashes)),
         merkle_dag: None,
+        features,
     };
     let text = serde_json::to_string(&serialized).context("serializing merkle snapshot")?;
     tokio::fs::write(path, text)
@@ -8273,17 +8738,17 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode,
+        CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, Engine,
         GRAPH_DB_REPLACEMENT_BATCH_SIZE, IndexCompletionStatus, IndexCoverage, IndexExecutionMode,
-        LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, OverlayIndexState, QueryProfileUsage,
-        SearchBudgets, SearchMode, SearchRequest, TextMatch, TextSearchScopeRequest,
-        apply_query_embedding_failure, bounded_window, build_chunk_context_snippet,
-        build_root_hash, chunk_id, classify_query, collect_live_candidate_files, collection_name,
-        diff_files, expected_vector_collections, failed_overlay_state, hash_text_like_file,
-        index_identity_status_for_snapshot, index_status_for_coverage,
-        is_agent_context_vector_collection, live_file_exists, merge_text_candidate_files,
-        narrowest_covering_symbol, overlay_lookup_uses_overlay, overlay_state_has_indexed_path,
-        overlay_state_has_search_index, overlay_state_load_warning,
+        IndexFeatures, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, OverlayIndexState,
+        QueryProfileUsage, SearchBudgets, SearchMode, SearchRequest, SplitterKind, TextMatch,
+        TextSearchScopeRequest, apply_query_embedding_failure, bounded_window,
+        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
+        collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
+        failed_overlay_state, hash_text_like_file, index_identity_status_for_snapshot,
+        index_status_for_coverage, is_agent_context_vector_collection, live_file_exists,
+        merge_text_candidate_files, narrowest_covering_symbol, overlay_lookup_uses_overlay,
+        overlay_state_has_indexed_path, overlay_state_has_search_index, overlay_state_load_warning,
         overlay_state_suppresses_canonical, plan_search, ready_target_reason,
         removed_repo_index_result, run_low_priority_blocking, scan_repo,
         search_text_scans_live_repo, select_edit_anchors, select_text_match,
@@ -8293,7 +8758,7 @@ mod tests {
         worktree_overlay_context_from_snapshot,
     };
     use crate::config::{
-        ExclusionProfile, RepoIndexPolicy, ResolvedScope, ScopeKind, SearchConfig,
+        Config, ExclusionProfile, RepoIndexPolicy, ResolvedScope, ScopeKind, SearchConfig,
     };
     use crate::engine::live_files::LiveFileStore;
     use crate::engine::symbols::IndexedSymbol;
@@ -8326,6 +8791,7 @@ mod tests {
             exclusion_profile: ExclusionProfile::Conservative,
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
+            features: IndexFeatures::all(),
         }
     }
 
@@ -8334,7 +8800,112 @@ mod tests {
             exclusion_profile: ExclusionProfile::Aggressive,
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
+            features: IndexFeatures::all(),
         }
+    }
+
+    #[tokio::test]
+    async fn per_repo_features_index_without_semantic_backend_and_disable_graph_cleanly() {
+        let root = temp_dir("per-repo-features");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .unwrap();
+        let config_path = root.join("config.toml");
+        let write_config = |features: &str| {
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+snapshot_path = "./snapshot.json"
+index_root = "./index"
+
+[embedding]
+provider = "ollama"
+model = "unreachable"
+
+[embedding.ollama]
+base_url = "http://127.0.0.1:1"
+dimensions = 8
+
+[milvus]
+address = "127.0.0.1:1"
+
+[indexing]
+default_features = ["semantic"]
+
+[[indexing.repo_rules]]
+repo = "{}"
+features = [{features}]
+
+[worktrees]
+mode = "full"
+
+[[groups]]
+id = "fixture"
+repos = ["{}"]
+"#,
+                    repo.display(),
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        };
+        let scope = ResolvedScope {
+            kind: ScopeKind::Repo,
+            id: repo.display().to_string(),
+            label: "fixture".to_string(),
+            repos: vec![repo.clone()],
+        };
+
+        write_config("\"lexical\"");
+        let config = Config::load_from_path(&config_path).unwrap();
+        let engine = Engine::new(&config).await.unwrap();
+        let indexed = engine
+            .index_scope(scope.clone(), true, SplitterKind::Ast, &[], &[])
+            .await
+            .unwrap();
+        assert!(!indexed.has_errors);
+        assert_eq!(indexed.repos[0].graph_status.as_deref(), Some("disabled"));
+
+        write_config("\"lexical\", \"graph\"");
+        let config = Config::load_from_path(&config_path).unwrap();
+        let engine = Engine::new(&config).await.unwrap();
+        let indexed = engine
+            .index_scope(scope.clone(), false, SplitterKind::Ast, &[], &[])
+            .await
+            .unwrap();
+        assert!(!indexed.has_errors);
+        assert!(!indexed.repos[0].full_reindex);
+        assert_eq!(indexed.repos[0].graph_status.as_deref(), Some("ready"));
+        let status = engine.status_scope(scope.clone()).await.unwrap();
+        assert_eq!(
+            status.repos[0].features,
+            IndexFeatures {
+                lexical: true,
+                semantic: false,
+                graph: true,
+            }
+        );
+        assert_eq!(status.repos[0].graph_status.as_deref(), Some("ready"));
+
+        write_config("\"lexical\"");
+        let config = Config::load_from_path(&config_path).unwrap();
+        let engine = Engine::new(&config).await.unwrap();
+        let indexed = engine
+            .index_scope(scope.clone(), false, SplitterKind::Ast, &[], &[])
+            .await
+            .unwrap();
+        assert!(!indexed.has_errors);
+        assert!(!indexed.repos[0].full_reindex);
+        assert_eq!(indexed.repos[0].graph_status.as_deref(), Some("disabled"));
+        let coverage = engine.relationship_readiness(scope, None).await.unwrap();
+        assert_eq!(coverage[0].graph_status, "disabled");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -9239,9 +9810,47 @@ mod tests {
             hash_algorithm: CONTENT_HASH_ALGORITHM.to_string(),
             root_hash: None,
             merkle_dag: None,
+            features: IndexFeatures::all(),
         };
 
         assert!(snapshot.is_compatible());
+    }
+
+    #[test]
+    fn merkle_snapshot_without_features_preserves_all_feature_compatibility() {
+        let snapshot: MerkleSnapshot = serde_json::from_value(serde_json::json!({
+            "fileHashes": [],
+            "hashAlgorithm": CONTENT_HASH_ALGORITHM,
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.features, IndexFeatures::all());
+        assert!(snapshot.is_compatible());
+    }
+
+    #[test]
+    fn disabled_semantic_identity_ignores_stored_embedding_changes() {
+        let snapshot = Snapshot {
+            index_format_version: super::INDEX_FORMAT_VERSION.to_string(),
+            search_root_version: super::SEARCH_ROOT_VERSION.to_string(),
+            embedding_fingerprint: Some("legacy-global".to_string()),
+            ..Snapshot::default()
+        };
+        let entry = super::SnapshotEntry {
+            embedding_profile: Some("old-profile".to_string()),
+            embedding_fingerprint: Some("old-fingerprint".to_string()),
+            ..super::SnapshotEntry::default()
+        };
+
+        let status = super::repo_embedding_identity_status_for_snapshot(
+            &snapshot,
+            Some(&entry),
+            "disabled",
+            None,
+            false,
+        );
+
+        assert!(status.reason.is_none());
     }
 
     #[test]
