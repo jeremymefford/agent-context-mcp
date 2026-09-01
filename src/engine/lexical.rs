@@ -4,16 +4,22 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::{QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, Value as _,
 };
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
+use tantivy::{Index, IndexReader, IndexWriter, Order, ReloadPolicy, Term, doc};
+
+use super::relationships::{CONFIDENCE_LEXICAL, RelationKind, ResolvedRelation};
 
 const CHUNK_SEGMENT_COMPACTION_THRESHOLD: usize = 64;
 const SYMBOL_SEGMENT_COMPACTION_THRESHOLD: usize = 64;
+// Relationship documents share many long exact keys. Keeping fewer segments avoids
+// repeating their term dictionaries and also improves cold-open frontier latency.
+const RELATION_SEGMENT_COMPACTION_THRESHOLD: usize = 64;
 const DELETED_DOC_COMPACTION_MIN: u64 = 256;
 const DELETED_DOC_COMPACTION_RATIO: f64 = 0.20;
+const RELATION_DELETED_DOC_COMPACTION_RATIO: f64 = 0.10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +135,7 @@ struct RepoCacheState {
 struct RepoIndexCache {
     chunk: Option<Arc<CachedIndex>>,
     symbol: Option<Arc<CachedIndex>>,
+    relation: Option<Arc<CachedIndex>>,
     last_access_tick: u64,
 }
 
@@ -141,6 +148,7 @@ struct CachedIndex {
 enum CachedIndexKind {
     Chunk,
     Symbol,
+    Relation,
 }
 
 impl LocalIndexStore {
@@ -324,6 +332,142 @@ impl LocalIndexStore {
         Ok(())
     }
 
+    pub fn replace_relation_docs_for_paths(
+        &self,
+        repo: &Path,
+        source_paths: &[String],
+        documents: &[ResolvedRelation],
+    ) -> Result<()> {
+        if source_paths.is_empty() && documents.is_empty() {
+            return Ok(());
+        }
+        let handle = self.open_or_create_relation_index(repo)?;
+        let schema = RelationSchema::from_index(&handle.index)?;
+        let writer = handle
+            .index
+            .writer::<TantivyDocument>(32_000_000)
+            .context("opening relation index writer")?;
+        for source_path in source_paths {
+            writer.delete_term(Term::from_field_text(schema.source_path_raw, source_path));
+        }
+        add_relation_documents(&writer, &schema, documents)?;
+        finish_writer(
+            &handle.index,
+            writer,
+            CachedIndexKind::Relation,
+            &self.relation_index_dir(repo),
+            "committing relation documents",
+        )?;
+        handle
+            .reader
+            .reload()
+            .context("reloading relation reader")?;
+        Ok(())
+    }
+
+    pub fn search_relations(
+        &self,
+        repo: &Path,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<ResolvedRelation>> {
+        let Some(handle) = self.open_existing_relation_index(repo)? else {
+            return Ok(Vec::new());
+        };
+        let schema = RelationSchema::from_index(&handle.index)?;
+        let searcher = handle.reader.searcher();
+        let parser = QueryParser::for_index(
+            &handle.index,
+            vec![
+                schema.target_name_text,
+                schema.target_qualified_name,
+                schema.evidence,
+            ],
+        );
+        let mut queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
+        if let Ok(query) = parser.parse_query(query_text) {
+            queries.push(query);
+        }
+        for term in normalized_terms(query_text) {
+            queries.push(Box::new(FuzzyTermQuery::new_prefix(
+                Term::from_field_text(schema.target_name_text, &term),
+                1,
+                true,
+            )));
+        }
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = BooleanQuery::union(queries);
+        let docs = searcher.search(&query, &TopDocs::with_limit(limit.clamp(1, 100)))?;
+        docs.into_iter()
+            .map(|(_, address)| {
+                let document: TantivyDocument = searcher.doc(address)?;
+                let mut relation = relation_from_document(&schema, &document)?;
+                // A text or fuzzy match is candidate evidence, regardless of the
+                // structural confidence carried by the indexed occurrence.
+                relation.confidence = CONFIDENCE_LEXICAL;
+                relation.resolution = "lexical_fallback".to_string();
+                Ok(relation)
+            })
+            .collect()
+    }
+
+    pub fn relation_frontier(
+        &self,
+        repo: &Path,
+        keys: &[String],
+        min_confidence: u64,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<ResolvedRelation>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(handle) = self.open_existing_relation_index(repo)? else {
+            return Ok(Vec::new());
+        };
+        let schema = RelationSchema::from_index(&handle.index)?;
+        let key_field = if reverse {
+            schema.target_key
+        } else {
+            schema.source_key
+        };
+        let key_query = BooleanQuery::union(
+            keys.iter()
+                .map(|key| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(key_field, key),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn tantivy::query::Query>
+                })
+                .collect(),
+        );
+        let searcher = handle.reader.searcher();
+        let docs = searcher.search(
+            &key_query,
+            &TopDocs::with_limit(limit.clamp(1, 1_000))
+                .order_by_fast_field::<u64>("confidence", Order::Desc),
+        )?;
+        let mut output = docs
+            .into_iter()
+            .map(|(_, address)| {
+                let document: TantivyDocument = searcher.doc(address)?;
+                relation_from_document(&schema, &document)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        output.retain(|relation| relation.confidence >= min_confidence);
+        output.sort_by(|left, right| {
+            right
+                .confidence
+                .cmp(&left.confidence)
+                .then(left.source_path.cmp(&right.source_path))
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.reference_id.cmp(&right.reference_id))
+        });
+        Ok(output)
+    }
+
     pub fn search_chunks(
         &self,
         repo: &Path,
@@ -434,6 +578,13 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
+    pub fn relation_document_count(&self, repo: &Path) -> Result<u64> {
+        let Some(handle) = self.open_existing_relation_index(repo)? else {
+            return Ok(0);
+        };
+        Ok(handle.reader.searcher().num_docs())
+    }
+
     pub fn chunk_coverage(&self, repo: &Path) -> Result<ChunkIndexCoverage> {
         let Some(handle) = self.open_existing_chunk_index(repo)? else {
             return Ok(ChunkIndexCoverage::default());
@@ -474,12 +625,21 @@ impl LocalIndexStore {
             .ok_or_else(|| anyhow!("symbol index unexpectedly missing after create"))
     }
 
+    fn open_or_create_relation_index(&self, repo: &Path) -> Result<Arc<CachedIndex>> {
+        self.open_cached_index(repo, CachedIndexKind::Relation, true)?
+            .ok_or_else(|| anyhow!("relation index unexpectedly missing after create"))
+    }
+
     fn open_existing_chunk_index(&self, repo: &Path) -> Result<Option<Arc<CachedIndex>>> {
         self.open_cached_index(repo, CachedIndexKind::Chunk, false)
     }
 
     fn open_existing_symbol_index(&self, repo: &Path) -> Result<Option<Arc<CachedIndex>>> {
         self.open_cached_index(repo, CachedIndexKind::Symbol, false)
+    }
+
+    fn open_existing_relation_index(&self, repo: &Path) -> Result<Option<Arc<CachedIndex>>> {
+        self.open_cached_index(repo, CachedIndexKind::Relation, false)
     }
 
     fn open_cached_index(
@@ -496,6 +656,7 @@ impl LocalIndexStore {
         let path = match kind {
             CachedIndexKind::Chunk => self.chunk_index_dir(repo),
             CachedIndexKind::Symbol => self.symbol_index_dir(repo),
+            CachedIndexKind::Relation => self.relation_index_dir(repo),
         };
         if !path.exists() {
             if !create {
@@ -514,6 +675,7 @@ impl LocalIndexStore {
             let schema = match kind {
                 CachedIndexKind::Chunk => chunk_schema(),
                 CachedIndexKind::Symbol => symbol_schema(),
+                CachedIndexKind::Relation => relation_schema(),
             };
             Index::create_in_dir(&path, schema)
                 .with_context(|| format!("creating Tantivy index {}", path.display()))?
@@ -549,6 +711,7 @@ impl LocalIndexStore {
         Ok(match kind {
             CachedIndexKind::Chunk => repo_cache.chunk.clone(),
             CachedIndexKind::Symbol => repo_cache.symbol.clone(),
+            CachedIndexKind::Relation => repo_cache.relation.clone(),
         })
     }
 
@@ -568,6 +731,7 @@ impl LocalIndexStore {
         let slot = match kind {
             CachedIndexKind::Chunk => &mut repo_cache.chunk,
             CachedIndexKind::Symbol => &mut repo_cache.symbol,
+            CachedIndexKind::Relation => &mut repo_cache.relation,
         };
         if let Some(existing) = slot {
             return Ok(existing.clone());
@@ -597,6 +761,10 @@ impl LocalIndexStore {
 
     fn symbol_index_dir(&self, repo: &Path) -> PathBuf {
         self.repo_root(repo).join("symbols")
+    }
+
+    fn relation_index_dir(&self, repo: &Path) -> PathBuf {
+        self.repo_root(repo).join("relations")
     }
 
     #[cfg(test)]
@@ -715,13 +883,27 @@ fn segment_metas_need_compaction(
         .iter()
         .map(|segment| segment.max_doc() as u64)
         .sum::<u64>();
-    max_docs > 0 && (deleted_docs as f64 / max_docs as f64) >= DELETED_DOC_COMPACTION_RATIO
+    deleted_docs_need_compaction(deleted_docs, max_docs, kind)
+}
+
+fn deleted_docs_need_compaction(deleted_docs: u64, max_docs: u64, kind: CachedIndexKind) -> bool {
+    deleted_docs >= DELETED_DOC_COMPACTION_MIN
+        && max_docs > 0
+        && (deleted_docs as f64 / max_docs as f64) >= deleted_doc_compaction_ratio(kind)
+}
+
+fn deleted_doc_compaction_ratio(kind: CachedIndexKind) -> f64 {
+    match kind {
+        CachedIndexKind::Relation => RELATION_DELETED_DOC_COMPACTION_RATIO,
+        CachedIndexKind::Chunk | CachedIndexKind::Symbol => DELETED_DOC_COMPACTION_RATIO,
+    }
 }
 
 fn compaction_segment_threshold(kind: CachedIndexKind) -> usize {
     match kind {
         CachedIndexKind::Chunk => CHUNK_SEGMENT_COMPACTION_THRESHOLD,
         CachedIndexKind::Symbol => SYMBOL_SEGMENT_COMPACTION_THRESHOLD,
+        CachedIndexKind::Relation => RELATION_SEGMENT_COMPACTION_THRESHOLD,
     }
 }
 
@@ -735,7 +917,9 @@ fn evict_lru_repos(state: &mut RepoCacheState, max_warm_repos: usize, preserve: 
         let Some((repo_root, _)) = state
             .repos
             .iter()
-            .filter(|(_, cache)| cache.chunk.is_some() || cache.symbol.is_some())
+            .filter(|(_, cache)| {
+                cache.chunk.is_some() || cache.symbol.is_some() || cache.relation.is_some()
+            })
             .filter(|(repo_root, _)| preserve.is_none_or(|value| *repo_root != value))
             .min_by_key(|(_, cache)| cache.last_access_tick)
             .map(|(repo_root, cache)| (repo_root.clone(), cache.last_access_tick))
@@ -781,6 +965,25 @@ struct SymbolSchema {
     file_hash: Field,
 }
 
+#[derive(Clone, Copy)]
+struct RelationSchema {
+    source_key: Field,
+    source_path_raw: Field,
+    target_key: Field,
+    target_path_raw: Field,
+    target_name_raw: Field,
+    target_name_text: Field,
+    target_qualified_name: Field,
+    kind: Field,
+    confidence: Field,
+    resolution: Field,
+    start_line: Field,
+    end_line: Field,
+    evidence: Field,
+    source_role: Field,
+    language: Field,
+}
+
 impl ChunkSchema {
     fn from_index(index: &Index) -> Result<Self> {
         let schema = index.schema();
@@ -824,6 +1027,63 @@ impl SymbolSchema {
     }
 }
 
+impl RelationSchema {
+    fn from_index(index: &Index) -> Result<Self> {
+        let schema = index.schema();
+        Ok(Self {
+            source_key: field(&schema, "source_key")?,
+            source_path_raw: field(&schema, "source_path_raw")?,
+            target_key: field(&schema, "target_key")?,
+            target_path_raw: field(&schema, "target_path_raw")?,
+            target_name_raw: field(&schema, "target_name_raw")?,
+            target_name_text: field(&schema, "target_name_text")?,
+            target_qualified_name: field(&schema, "target_qualified_name")?,
+            kind: field(&schema, "kind")?,
+            confidence: field(&schema, "confidence")?,
+            resolution: field(&schema, "resolution")?,
+            start_line: field(&schema, "start_line")?,
+            end_line: field(&schema, "end_line")?,
+            evidence: field(&schema, "evidence")?,
+            source_role: field(&schema, "source_role")?,
+            language: field(&schema, "language")?,
+        })
+    }
+}
+
+fn add_relation_documents(
+    writer: &IndexWriter<TantivyDocument>,
+    schema: &RelationSchema,
+    documents: &[ResolvedRelation],
+) -> Result<()> {
+    for relation in documents {
+        let mut document = doc!(
+            schema.source_key => relation.source_key.clone(),
+            schema.source_path_raw => relation.source_path.clone(),
+            schema.target_name_raw => relation.target_name.clone(),
+            schema.target_name_text => tokenize_identifiers(&relation.target_name),
+            schema.kind => relation.kind.as_str(),
+            schema.confidence => relation.confidence,
+            schema.resolution => relation.resolution.clone(),
+            schema.start_line => relation.start_line,
+            schema.end_line => relation.end_line,
+            schema.evidence => relation.evidence.clone(),
+            schema.source_role => relation.source_role.clone(),
+            schema.language => relation.language.clone(),
+        );
+        if let Some(target_key) = relation.target_key.as_deref() {
+            document.add_text(schema.target_key, target_key);
+        }
+        if let Some(target_path) = relation.target_path.as_deref() {
+            document.add_text(schema.target_path_raw, target_path);
+        }
+        if let Some(target_qualified_name) = relation.target_qualified_name.as_deref() {
+            document.add_text(schema.target_qualified_name, target_qualified_name);
+        }
+        writer.add_document(document)?;
+    }
+    Ok(())
+}
+
 fn chunk_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field("id", STRING | STORED);
@@ -858,6 +1118,26 @@ fn symbol_schema() -> Schema {
     builder.add_u64_field("end_line", FAST | STORED);
     builder.add_text_field("indexed_at", STRING | STORED);
     builder.add_text_field("file_hash", STRING | STORED);
+    builder.build()
+}
+
+fn relation_schema() -> Schema {
+    let mut builder = Schema::builder();
+    builder.add_text_field("source_key", STRING | STORED);
+    builder.add_text_field("source_path_raw", STRING | STORED);
+    builder.add_text_field("target_key", STRING | STORED);
+    builder.add_text_field("target_path_raw", STRING);
+    builder.add_text_field("target_name_raw", STRING | STORED);
+    builder.add_text_field("target_name_text", TEXT);
+    builder.add_text_field("target_qualified_name", TEXT);
+    builder.add_text_field("kind", STRING | STORED);
+    builder.add_u64_field("confidence", FAST | STORED);
+    builder.add_text_field("resolution", STRING | STORED);
+    builder.add_u64_field("start_line", FAST | STORED);
+    builder.add_u64_field("end_line", FAST | STORED);
+    builder.add_text_field("evidence", TEXT | STORED);
+    builder.add_text_field("source_role", STRING | STORED);
+    builder.add_text_field("language", STRING);
     builder.build()
 }
 
@@ -1099,6 +1379,37 @@ fn symbol_hit_from_document(
     })
 }
 
+fn relation_from_document(
+    schema: &RelationSchema,
+    document: &TantivyDocument,
+) -> Result<ResolvedRelation> {
+    let source_path = string_value(document, schema.source_path_raw)?;
+    let target_name = string_value(document, schema.target_name_raw)?;
+    let kind = RelationKind::parse(&string_value(document, schema.kind)?);
+    let start_line = u64_value(document, schema.start_line)?;
+    Ok(ResolvedRelation {
+        reference_id: format!("{source_path}:{start_line}:{}:{target_name}", kind.as_str()),
+        repo: String::new(),
+        source_key: string_value(document, schema.source_key)?,
+        source_symbol_id: None,
+        source_path,
+        target_key: optional_string_value(document, schema.target_key),
+        target_symbol_id: None,
+        target_path: None,
+        target_name,
+        target_qualified_name: None,
+        kind,
+        confidence: u64_value(document, schema.confidence)?,
+        resolution: string_value(document, schema.resolution)?,
+        start_line,
+        end_line: u64_value(document, schema.end_line)?,
+        evidence: string_value(document, schema.evidence)?,
+        source_role: string_value(document, schema.source_role)?,
+        language: String::new(),
+        file_hash: String::new(),
+    })
+}
+
 fn tokenize_identifiers(text: &str) -> String {
     normalized_terms(text).join(" ")
 }
@@ -1165,11 +1476,32 @@ fn u64_value(document: &TantivyDocument, field: Field) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor,
+        CachedIndexKind, ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor,
         SYMBOL_SEGMENT_COMPACTION_THRESHOLD, SymbolIndexDoc, SymbolSearchRequest,
+        deleted_docs_need_compaction,
     };
+    use crate::engine::relationships::{CONFIDENCE_LEXICAL, RelationKind, ResolvedRelation};
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn relationship_tombstones_compact_before_general_search_indexes() {
+        assert!(deleted_docs_need_compaction(
+            256,
+            2_560,
+            CachedIndexKind::Relation
+        ));
+        assert!(!deleted_docs_need_compaction(
+            256,
+            2_560,
+            CachedIndexKind::Chunk
+        ));
+        assert!(!deleted_docs_need_compaction(
+            255,
+            1_000,
+            CachedIndexKind::Relation
+        ));
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -1470,6 +1802,100 @@ mod tests {
         assert_eq!(searcher.num_docs(), 1);
         assert_eq!(store.cached_repo_count().unwrap(), 1);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relationship_index_supports_fuzzy_search_and_path_replacement() {
+        let root = temp_path("relationships");
+        let store = LocalIndexStore::new(root.clone(), 4);
+        let repo = Path::new("/tmp/repo-relationships");
+        let relation = ResolvedRelation {
+            reference_id: "ref-1".to_string(),
+            repo: repo.display().to_string(),
+            source_key: "source-key".to_string(),
+            source_symbol_id: Some("source-id".to_string()),
+            source_path: "src/source.rs".to_string(),
+            target_key: Some("target-key".to_string()),
+            target_symbol_id: Some("target-id".to_string()),
+            target_path: Some("src/target.rs".to_string()),
+            target_name: "TargetService".to_string(),
+            target_qualified_name: Some("crate::TargetService".to_string()),
+            kind: RelationKind::Calls,
+            confidence: 900,
+            resolution: "same_module_unique".to_string(),
+            start_line: 12,
+            end_line: 12,
+            evidence: "TargetService::run()".to_string(),
+            source_role: "production".to_string(),
+            language: "rust".to_string(),
+            file_hash: "hash".to_string(),
+        };
+        store
+            .replace_relation_docs_for_paths(
+                repo,
+                &["src/source.rs".to_string()],
+                std::slice::from_ref(&relation),
+            )
+            .unwrap();
+        let fuzzy = store.search_relations(repo, "TargetServce", 5).unwrap();
+        assert!(!fuzzy.is_empty());
+        assert_eq!(fuzzy[0].confidence, CONFIDENCE_LEXICAL);
+        assert_eq!(fuzzy[0].resolution, "lexical_fallback");
+        let reverse = store
+            .relation_frontier(repo, &["target-key".to_string()], 650, 5, true)
+            .unwrap();
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse[0].source_key, "source-key");
+        let forward = store
+            .relation_frontier(repo, &["source-key".to_string()], 650, 5, false)
+            .unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].target_key.as_deref(), Some("target-key"));
+
+        let mut replacement = relation.clone();
+        replacement.reference_id = "ref-2".to_string();
+        replacement.target_key = Some("new-target-key".to_string());
+        store
+            .replace_relation_docs_for_paths(
+                repo,
+                &["src/source.rs".to_string()],
+                std::slice::from_ref(&replacement),
+            )
+            .unwrap();
+        let replacement_hit = store.search_relations(repo, "TargetServce", 5).unwrap();
+        assert_eq!(replacement_hit.len(), 1);
+        assert_eq!(
+            replacement_hit[0].target_key.as_deref(),
+            Some("new-target-key")
+        );
+        let mut unresolved = relation.clone();
+        unresolved.reference_id = "ref-3".to_string();
+        unresolved.target_key = None;
+        unresolved.target_symbol_id = None;
+        unresolved.target_path = None;
+        unresolved.confidence = 0;
+        unresolved.resolution = "unresolved".to_string();
+        store
+            .replace_relation_docs_for_paths(
+                repo,
+                &["src/source.rs".to_string()],
+                std::slice::from_ref(&unresolved),
+            )
+            .unwrap();
+        let unresolved_hit = store.search_relations(repo, "TargetServce", 5).unwrap();
+        assert_eq!(unresolved_hit.len(), 1);
+        assert!(unresolved_hit[0].target_key.is_none());
+        assert_eq!(unresolved_hit[0].confidence, CONFIDENCE_LEXICAL);
+        store
+            .replace_relation_docs_for_paths(repo, &["src/source.rs".to_string()], &[])
+            .unwrap();
+        assert!(
+            store
+                .search_relations(repo, "TargetServce", 5)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

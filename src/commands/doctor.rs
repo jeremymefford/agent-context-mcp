@@ -506,6 +506,8 @@ mod tests {
             indexed_files: None,
             total_chunks: None,
             index_status: index_status.map(str::to_string),
+            graph_status: None,
+            relationship_count: None,
             indexing_percentage: None,
             last_attempted_percentage: None,
             error_message: None,

@@ -3,13 +3,18 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tree_sitter::{Language, Node, Parser};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use tree_sitter::{Language, Node, Parser, Tree};
 use xxhash_rust::xxh3::xxh3_128;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexedSymbol {
     pub symbol_id: String,
+    pub logical_key: String,
     pub repo: String,
     pub relative_path: String,
     pub name: String,
@@ -21,6 +26,11 @@ pub struct IndexedSymbol {
     pub indexed_at: String,
     pub file_hash: String,
     pub parent_symbol_id: Option<String>,
+    pub parent_logical_key: Option<String>,
+    pub qualified_name: String,
+    pub signature: String,
+    pub source_role: String,
+    pub identity_stable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +49,13 @@ pub struct OutlineNode {
 #[derive(Clone)]
 pub struct SymbolStore {
     path: PathBuf,
+    schema_initialized: Arc<SchemaInitialization>,
+}
+
+#[derive(Default)]
+struct SchemaInitialization {
+    ready: AtomicBool,
+    lock: Mutex<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +97,10 @@ const JS_SYMBOLS: &[SymbolRule] = &[
     },
     SymbolRule {
         node_kind: "function_declaration",
+        symbol_kind: "function",
+    },
+    SymbolRule {
+        node_kind: "variable_declarator",
         symbol_kind: "function",
     },
     SymbolRule {
@@ -343,9 +364,13 @@ const SWIFT_SYMBOLS: &[SymbolRule] = &[
 
 impl SymbolStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            schema_initialized: Arc::new(SchemaInitialization::default()),
+        }
     }
 
+    #[cfg(test)]
     pub fn replace_file_symbols(
         &self,
         repo: &str,
@@ -367,6 +392,7 @@ impl SymbolStore {
                 .prepare_cached(
                     "INSERT INTO symbols (
                         symbol_id,
+                        logical_key,
                         repo,
                         relative_path,
                         name,
@@ -377,8 +403,13 @@ impl SymbolStore {
                         end_line,
                         indexed_at,
                         file_hash,
-                        parent_symbol_id
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        parent_symbol_id,
+                        parent_logical_key,
+                        qualified_name,
+                        signature,
+                        source_role,
+                        identity_stable
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 )
                 .context("preparing symbol insert")?;
             let mut inserted_ids = BTreeSet::new();
@@ -391,6 +422,7 @@ impl SymbolStore {
                 statement
                     .execute(params![
                         symbol.symbol_id,
+                        symbol.logical_key,
                         symbol.repo,
                         symbol.relative_path,
                         symbol.name,
@@ -402,6 +434,11 @@ impl SymbolStore {
                         symbol.indexed_at,
                         symbol.file_hash,
                         symbol.parent_symbol_id,
+                        symbol.parent_logical_key,
+                        symbol.qualified_name,
+                        symbol.signature,
+                        symbol.source_role,
+                        symbol.identity_stable as i64,
                     ])
                     .with_context(|| format!("inserting symbol {}", symbol.symbol_id))?;
             }
@@ -409,6 +446,64 @@ impl SymbolStore {
         transaction
             .commit()
             .context("committing symbol transaction")
+    }
+
+    pub fn replace_files_symbols(
+        &self,
+        repo: &str,
+        replacements: &[(String, Vec<IndexedSymbol>)],
+    ) -> Result<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .context("starting batched symbol transaction")?;
+        let mut delete = transaction
+            .prepare_cached("DELETE FROM symbols WHERE repo = ?1 AND relative_path = ?2")?;
+        let mut insert = transaction.prepare_cached(
+            "INSERT INTO symbols (
+                symbol_id, logical_key, repo, relative_path, name, kind, container,
+                language, start_line, end_line, indexed_at, file_hash,
+                parent_symbol_id, parent_logical_key, qualified_name, signature,
+                source_role, identity_stable
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        )?;
+        for (relative_path, symbols) in replacements {
+            delete.execute(params![repo, relative_path])?;
+            let mut inserted_ids = BTreeSet::new();
+            for symbol in symbols {
+                if !inserted_ids.insert(symbol.symbol_id.clone()) {
+                    continue;
+                }
+                insert.execute(params![
+                    symbol.symbol_id,
+                    symbol.logical_key,
+                    symbol.repo,
+                    symbol.relative_path,
+                    symbol.name,
+                    symbol.kind,
+                    symbol.container,
+                    symbol.language,
+                    symbol.start_line as i64,
+                    symbol.end_line as i64,
+                    symbol.indexed_at,
+                    symbol.file_hash,
+                    symbol.parent_symbol_id,
+                    symbol.parent_logical_key,
+                    symbol.qualified_name,
+                    symbol.signature,
+                    symbol.source_role,
+                    symbol.identity_stable as i64,
+                ])?;
+            }
+        }
+        drop(delete);
+        drop(insert);
+        transaction
+            .commit()
+            .context("committing batched symbol transaction")
     }
 
     pub fn delete_file(&self, repo: &str, relative_path: &str) -> Result<()> {
@@ -436,6 +531,7 @@ impl SymbolStore {
             .query_row(
                 "SELECT
                     symbol_id,
+                    logical_key,
                     repo,
                     relative_path,
                     name,
@@ -446,7 +542,12 @@ impl SymbolStore {
                     end_line,
                     indexed_at,
                     file_hash,
-                    parent_symbol_id
+                    parent_symbol_id,
+                    parent_logical_key,
+                    qualified_name,
+                    signature,
+                    source_role,
+                    identity_stable
                  FROM symbols
                  WHERE repo = ?1 AND symbol_id = ?2",
                 params![repo, symbol_id],
@@ -470,6 +571,7 @@ impl SymbolStore {
             .prepare_cached(
                 "SELECT
                     symbol_id,
+                    logical_key,
                     repo,
                     relative_path,
                     name,
@@ -480,7 +582,12 @@ impl SymbolStore {
                     end_line,
                     indexed_at,
                     file_hash,
-                    parent_symbol_id
+                    parent_symbol_id,
+                    parent_logical_key,
+                    qualified_name,
+                    signature,
+                    source_role,
+                    identity_stable
                 FROM symbols
                 WHERE repo = ?1 AND symbol_id = ?2",
             )
@@ -497,12 +604,40 @@ impl SymbolStore {
         Ok(symbols)
     }
 
+    pub fn symbols_by_logical_keys(
+        &self,
+        repo: &str,
+        logical_keys: &[String],
+    ) -> Result<Vec<IndexedSymbol>> {
+        if logical_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.open()?;
+        let mut symbols = Vec::new();
+        let mut statement = connection.prepare_cached(
+            "SELECT symbol_id, logical_key, repo, relative_path, name, kind, container,
+                    language, start_line, end_line, indexed_at, file_hash, parent_symbol_id,
+                    parent_logical_key, qualified_name, signature, source_role, identity_stable
+             FROM symbols WHERE repo = ?1 AND logical_key = ?2",
+        )?;
+        for key in logical_keys {
+            if let Some(symbol) = statement
+                .query_row(params![repo, key], map_symbol_row)
+                .optional()?
+            {
+                symbols.push(symbol);
+            }
+        }
+        Ok(symbols)
+    }
+
     pub fn file_symbols(&self, repo: &str, relative_path: &str) -> Result<Vec<IndexedSymbol>> {
         let connection = self.open()?;
         let mut statement = connection
             .prepare_cached(
                 "SELECT
                     symbol_id,
+                    logical_key,
                     repo,
                     relative_path,
                     name,
@@ -513,7 +648,12 @@ impl SymbolStore {
                     end_line,
                     indexed_at,
                     file_hash,
-                    parent_symbol_id
+                    parent_symbol_id,
+                    parent_logical_key,
+                    qualified_name,
+                    signature,
+                    source_role,
+                    identity_stable
                 FROM symbols
                 WHERE repo = ?1 AND relative_path = ?2
                 ORDER BY start_line ASC, end_line ASC, name ASC",
@@ -533,6 +673,19 @@ impl SymbolStore {
         }
         let connection = Connection::open(&self.path)
             .with_context(|| format!("opening symbol db {}", self.path.display()))?;
+        if self.schema_initialized.ready.load(Ordering::Acquire) {
+            connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
+            return Ok(connection);
+        }
+        let _guard = self
+            .schema_initialized
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.schema_initialized.ready.load(Ordering::Acquire) {
+            connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
+            return Ok(connection);
+        }
         migrate_symbol_schema(&connection)?;
         connection
             .execute_batch(
@@ -540,6 +693,7 @@ impl SymbolStore {
                  PRAGMA synchronous = NORMAL;
                  CREATE TABLE IF NOT EXISTS symbols (
                     symbol_id TEXT NOT NULL,
+                    logical_key TEXT NOT NULL DEFAULT '',
                     repo TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -551,12 +705,19 @@ impl SymbolStore {
                     indexed_at TEXT NOT NULL,
                     file_hash TEXT NOT NULL,
                     parent_symbol_id TEXT,
+                    parent_logical_key TEXT,
+                    qualified_name TEXT NOT NULL DEFAULT '',
+                    signature TEXT NOT NULL DEFAULT '',
+                    source_role TEXT NOT NULL DEFAULT 'production',
+                    identity_stable INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (repo, symbol_id)
                  );
                  CREATE INDEX IF NOT EXISTS idx_symbols_repo_path ON symbols(repo, relative_path, start_line, end_line);
-                 CREATE INDEX IF NOT EXISTS idx_symbols_repo_name ON symbols(repo, name, kind);",
+                 CREATE INDEX IF NOT EXISTS idx_symbols_repo_name ON symbols(repo, name, kind);
+                 CREATE INDEX IF NOT EXISTS idx_symbols_repo_logical_key ON symbols(repo, logical_key);",
             )
             .context("initializing symbol db schema")?;
+        self.schema_initialized.ready.store(true, Ordering::Release);
         Ok(connection)
     }
 }
@@ -579,13 +740,10 @@ fn migrate_symbol_schema(connection: &Connection) -> Result<()> {
     let Some(existing_sql) = existing_sql else {
         return Ok(());
     };
-    if existing_sql.contains("PRIMARY KEY (repo, symbol_id)") {
-        return Ok(());
-    }
-
-    connection
-        .execute_batch(
-            "BEGIN IMMEDIATE;
+    if !existing_sql.contains("PRIMARY KEY (repo, symbol_id)") {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
              ALTER TABLE symbols RENAME TO symbols_legacy;
              CREATE TABLE symbols (
                 symbol_id TEXT NOT NULL,
@@ -632,9 +790,40 @@ fn migrate_symbol_schema(connection: &Connection) -> Result<()> {
              FROM symbols_legacy;
              DROP TABLE symbols_legacy;
              COMMIT;",
-        )
-        .context("migrating symbol table schema")?;
+            )
+            .context("migrating symbol table schema")?;
+    }
+
+    let columns = table_columns(connection, "symbols")?;
+    for (name, declaration) in [
+        ("logical_key", "TEXT NOT NULL DEFAULT ''"),
+        ("parent_logical_key", "TEXT"),
+        ("qualified_name", "TEXT NOT NULL DEFAULT ''"),
+        ("signature", "TEXT NOT NULL DEFAULT ''"),
+        ("source_role", "TEXT NOT NULL DEFAULT 'production'"),
+        ("identity_stable", "INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        if !columns.contains(name) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE symbols ADD COLUMN {name} {declaration}"),
+                    [],
+                )
+                .with_context(|| format!("adding symbols.{name}"))?;
+        }
+    }
     Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("reading {table} schema"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("querying {table} schema"))?;
+    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .with_context(|| format!("collecting {table} schema"))
 }
 
 pub fn extract_symbols(
@@ -645,22 +834,36 @@ pub fn extract_symbols(
     indexed_at: &str,
     file_hash: &str,
 ) -> Result<Vec<IndexedSymbol>> {
+    Ok(extract_symbols_with_tree(repo, relative_path, path, text, indexed_at, file_hash)?.0)
+}
+
+pub fn extract_symbols_with_tree(
+    repo: &str,
+    relative_path: &str,
+    path: &Path,
+    text: &str,
+    indexed_at: &str,
+    file_hash: &str,
+) -> Result<(Vec<IndexedSymbol>, Option<Tree>)> {
     if is_markdown_path(path) {
-        return Ok(extract_markdown_symbols(
-            repo,
-            relative_path,
-            text,
-            indexed_at,
-            file_hash,
-            markdown_language_for_path(path),
+        return Ok((
+            extract_markdown_symbols(
+                repo,
+                relative_path,
+                text,
+                indexed_at,
+                file_hash,
+                markdown_language_for_path(path),
+            ),
+            None,
         ));
     }
 
     let Some(config) = symbol_config(path) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     if should_skip_symbol_extraction(path, text, &config) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let mut parser = Parser::new();
@@ -668,7 +871,7 @@ pub fn extract_symbols(
         .set_language(&config.language)
         .context("setting tree-sitter language for symbol extraction")?;
     let Some(tree) = parser.parse(text, None) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
 
     let mut output = Vec::new();
@@ -683,7 +886,8 @@ pub fn extract_symbols(
     };
     collect_symbols(tree.root_node(), &context, &mut stack, &mut output)?;
     dedupe_symbols_in_place(&mut output);
-    Ok(output)
+    assign_source_roles(relative_path, path, text, &mut output);
+    Ok((output, Some(tree)))
 }
 
 #[derive(Debug)]
@@ -783,11 +987,27 @@ fn extract_markdown_symbols(
         })
         .collect::<Vec<_>>();
 
+    let source_role = source_role_for_path(relative_path).to_string();
+    let logical_keys = headings
+        .iter()
+        .map(|heading| {
+            logical_symbol_key(
+                relative_path,
+                language,
+                "heading",
+                &heading.name,
+                markdown_heading_container(&headings, heading.parent_index).as_deref(),
+                &format!("h{} {}", heading.level, heading.name),
+            )
+        })
+        .collect::<Vec<_>>();
+
     headings
         .iter()
         .enumerate()
         .map(|(index, heading)| IndexedSymbol {
             symbol_id: symbol_ids[index].clone(),
+            logical_key: logical_keys[index].clone(),
             repo: repo.to_string(),
             relative_path: relative_path.to_string(),
             name: heading.name.clone(),
@@ -801,6 +1021,15 @@ fn extract_markdown_symbols(
             parent_symbol_id: heading
                 .parent_index
                 .map(|parent| symbol_ids[parent].clone()),
+            parent_logical_key: heading
+                .parent_index
+                .map(|parent| logical_keys[parent].clone()),
+            qualified_name: markdown_heading_container(&headings, heading.parent_index)
+                .map(|container| format!("{container}::{}", heading.name))
+                .unwrap_or_else(|| heading.name.clone()),
+            signature: format!("h{} {}", heading.level, heading.name),
+            source_role: source_role.clone(),
+            identity_stable: true,
         })
         .collect()
 }
@@ -967,7 +1196,7 @@ fn build_outline_children(
 fn collect_symbols(
     node: Node<'_>,
     context: &SymbolExtractionContext<'_>,
-    stack: &mut Vec<(String, String)>,
+    stack: &mut Vec<(String, String, String)>,
     output: &mut Vec<IndexedSymbol>,
 ) -> Result<()> {
     let mut pushed = false;
@@ -983,17 +1212,32 @@ fn collect_symbols(
     {
         let start_line = node.start_position().row as u64 + 1;
         let end_line = node.end_position().row as u64 + 1;
-        let parent_symbol_id = stack.last().map(|(symbol_id, _)| symbol_id.clone());
+        let parent_symbol_id = stack.last().map(|(symbol_id, _, _)| symbol_id.clone());
+        let parent_logical_key = stack.last().map(|(_, logical_key, _)| logical_key.clone());
         let container = (!stack.is_empty()).then(|| {
             stack
                 .iter()
-                .map(|(_, name)| name.as_str())
+                .map(|(_, _, name)| name.as_str())
                 .collect::<Vec<_>>()
                 .join("::")
         });
         let symbol_id = symbol_id(context.relative_path, kind, &name, start_line, end_line);
+        let signature = normalized_declaration_signature(node, context.text);
+        let logical_key = logical_symbol_key(
+            context.relative_path,
+            context.config.language_name,
+            kind,
+            &name,
+            container.as_deref(),
+            &signature,
+        );
+        let qualified_name = container
+            .as_deref()
+            .map(|value| format!("{value}::{name}"))
+            .unwrap_or_else(|| name.clone());
         output.push(IndexedSymbol {
             symbol_id: symbol_id.clone(),
+            logical_key: logical_key.clone(),
             repo: context.repo.to_string(),
             relative_path: context.relative_path.to_string(),
             name: name.clone(),
@@ -1005,8 +1249,13 @@ fn collect_symbols(
             indexed_at: context.indexed_at.to_string(),
             file_hash: context.file_hash.to_string(),
             parent_symbol_id,
+            parent_logical_key,
+            qualified_name,
+            signature,
+            source_role: source_role_for_path(context.relative_path).to_string(),
+            identity_stable: true,
         });
-        stack.push((symbol_id, name));
+        stack.push((symbol_id, logical_key, name));
         pushed = true;
     }
 
@@ -1025,6 +1274,27 @@ fn collect_symbols(
 fn dedupe_symbols_in_place(symbols: &mut Vec<IndexedSymbol>) {
     let mut seen = BTreeSet::new();
     symbols.retain(|symbol| seen.insert(symbol.symbol_id.clone()));
+
+    let mut duplicate_counts = BTreeMap::<String, usize>::new();
+    for symbol in symbols.iter() {
+        *duplicate_counts
+            .entry(symbol.logical_key.clone())
+            .or_default() += 1;
+    }
+    let mut ordinals = BTreeMap::<String, usize>::new();
+    for symbol in symbols.iter_mut() {
+        if duplicate_counts
+            .get(&symbol.logical_key)
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            let ordinal = ordinals.entry(symbol.logical_key.clone()).or_default();
+            *ordinal += 1;
+            symbol.logical_key = format!("{}#{}", symbol.logical_key, ordinal);
+            symbol.identity_stable = false;
+        }
+    }
 }
 
 fn should_skip_symbol_extraction(path: &Path, text: &str, config: &SymbolConfig) -> bool {
@@ -1055,6 +1325,9 @@ fn is_probably_minified_javascript_like(path: &Path, text: &str) -> bool {
 fn should_index_symbol_node(node: Node<'_>, context: &SymbolExtractionContext<'_>) -> bool {
     match context.config.language_name {
         "cpp" => should_index_cpp_symbol_node(node),
+        "javascript" | "typescript" if node.kind() == "variable_declarator" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression")),
         _ => true,
     }
 }
@@ -1123,6 +1396,112 @@ fn symbol_id(
     let digest =
         xxh3_128(format!("{relative_path}:{kind}:{name}:{start_line}:{end_line}").as_bytes());
     format!("sym_{digest:032x}").chars().take(22).collect()
+}
+
+fn logical_symbol_key(
+    relative_path: &str,
+    language: &str,
+    kind: &str,
+    name: &str,
+    container: Option<&str>,
+    signature: &str,
+) -> String {
+    let identity = format!(
+        "{}:{}:{}:{}:{}:{}",
+        language,
+        relative_path.replace('\\', "/"),
+        container.unwrap_or_default(),
+        kind,
+        name,
+        signature
+    );
+    let digest = xxh3_128(identity.as_bytes());
+    format!("symkey_{digest:032x}")
+}
+
+fn normalized_declaration_signature(node: Node<'_>, text: &[u8]) -> String {
+    let end = node
+        .child_by_field_name("body")
+        .or_else(|| {
+            node.child_by_field_name("value")
+                .and_then(|value| value.child_by_field_name("body"))
+        })
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| node.end_byte())
+        .min(text.len());
+    let start = node.start_byte().min(end);
+    String::from_utf8_lossy(&text[start..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn source_role_for_path(relative_path: &str) -> &'static str {
+    let normalized = relative_path.replace('\\', "/").to_ascii_lowercase();
+    let basename = Path::new(&normalized)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if normalized
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"))
+        || basename.ends_with("_test.rs")
+        || basename.ends_with(".test.ts")
+        || basename.ends_with(".test.tsx")
+        || basename.ends_with(".spec.ts")
+        || basename.ends_with(".spec.tsx")
+    {
+        "test"
+    } else if normalized
+        .split('/')
+        .any(|part| matches!(part, "example" | "examples"))
+    {
+        "example"
+    } else if normalized
+        .split('/')
+        .any(|part| matches!(part, "generated" | "gen"))
+    {
+        "generated"
+    } else {
+        "production"
+    }
+}
+
+fn assign_source_roles(
+    relative_path: &str,
+    path: &Path,
+    text: &str,
+    symbols: &mut [IndexedSymbol],
+) {
+    let path_role = source_role_for_path(relative_path);
+    if path_role != "production" {
+        for symbol in symbols {
+            symbol.source_role = path_role.to_string();
+        }
+        return;
+    }
+    if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+        return;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    for symbol in symbols {
+        let start = symbol.start_line.saturating_sub(5) as usize;
+        let end = symbol.start_line.min(lines.len() as u64) as usize;
+        let header = lines[start..end].join(" ").replace(' ', "");
+        let test_container = symbol.container.as_deref().is_some_and(|container| {
+            container
+                .split("::")
+                .any(|part| matches!(part.to_ascii_lowercase().as_str(), "test" | "tests"))
+        });
+        if header.contains("#[test]")
+            || header.contains("#[tokio::test]")
+            || header.contains("#[async_std::test]")
+            || header.contains("cfg(test)")
+            || test_container
+        {
+            symbol.source_role = "test".to_string();
+        }
+    }
 }
 
 fn symbol_config(path: &Path) -> Option<SymbolConfig> {
@@ -1225,17 +1604,23 @@ fn markdown_language_for_path(path: &Path) -> &'static str {
 fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
     Ok(IndexedSymbol {
         symbol_id: row.get(0)?,
-        repo: row.get(1)?,
-        relative_path: row.get(2)?,
-        name: row.get(3)?,
-        kind: row.get(4)?,
-        container: row.get(5)?,
-        language: row.get(6)?,
-        start_line: row.get::<_, i64>(7)? as u64,
-        end_line: row.get::<_, i64>(8)? as u64,
-        indexed_at: row.get(9)?,
-        file_hash: row.get(10)?,
-        parent_symbol_id: row.get(11)?,
+        logical_key: row.get(1)?,
+        repo: row.get(2)?,
+        relative_path: row.get(3)?,
+        name: row.get(4)?,
+        kind: row.get(5)?,
+        container: row.get(6)?,
+        language: row.get(7)?,
+        start_line: row.get::<_, i64>(8)? as u64,
+        end_line: row.get::<_, i64>(9)? as u64,
+        indexed_at: row.get(10)?,
+        file_hash: row.get(11)?,
+        parent_symbol_id: row.get(12)?,
+        parent_logical_key: row.get(13)?,
+        qualified_name: row.get(14)?,
+        signature: row.get(15)?,
+        source_role: row.get(16)?,
+        identity_stable: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -1508,6 +1893,7 @@ static int spellfix1_row_compare(const void *A, const void *B){
         let store = SymbolStore::new(db_path.clone());
         let symbol = IndexedSymbol {
             symbol_id: "sym_duplicate".to_string(),
+            logical_key: "symkey_duplicate".to_string(),
             repo: "/tmp/repo".to_string(),
             relative_path: "src/main.rs".to_string(),
             name: "duplicate".to_string(),
@@ -1519,6 +1905,11 @@ static int spellfix1_row_compare(const void *A, const void *B){
             indexed_at: "2026-01-01T00:00:00Z".to_string(),
             file_hash: "hash-1".to_string(),
             parent_symbol_id: None,
+            parent_logical_key: None,
+            qualified_name: "duplicate".to_string(),
+            signature: "fn duplicate()".to_string(),
+            source_role: "production".to_string(),
+            identity_stable: true,
         };
 
         store
@@ -1549,5 +1940,155 @@ static int spellfix1_row_compare(const void *A, const void *B){
         .unwrap();
 
         assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn logical_keys_survive_position_and_body_edits_but_track_api_identity() {
+        let path = std::path::Path::new("src/lib.rs");
+        let before = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "fn target(value: u64) -> u64 { value + 1 }",
+            "now",
+            "before",
+        )
+        .unwrap();
+        let body_edit = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "\n\nfn target(value: u64) -> u64 {\n    value.saturating_add(2)\n}",
+            "later",
+            "body",
+        )
+        .unwrap();
+        let renamed = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "fn renamed(value: u64) -> u64 { value + 1 }",
+            "later",
+            "rename",
+        )
+        .unwrap();
+        let signature_edit = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "fn target(value: usize) -> u64 { value as u64 }",
+            "later",
+            "signature",
+        )
+        .unwrap();
+        let key = &before
+            .iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap()
+            .logical_key;
+        assert_eq!(
+            key,
+            &body_edit
+                .iter()
+                .find(|symbol| symbol.name == "target")
+                .unwrap()
+                .logical_key
+        );
+        assert_ne!(
+            key,
+            &renamed
+                .iter()
+                .find(|symbol| symbol.name == "renamed")
+                .unwrap()
+                .logical_key
+        );
+        assert_ne!(
+            key,
+            &signature_edit
+                .iter()
+                .find(|symbol| symbol.name == "target")
+                .unwrap()
+                .logical_key
+        );
+    }
+
+    #[test]
+    fn typescript_arrow_functions_are_stable_symbols() {
+        let path = std::path::Path::new("src/actions.ts");
+        let before = extract_symbols(
+            "/tmp/repo",
+            "src/actions.ts",
+            path,
+            "export const handler = (value: number) => value + 1;\nconst plain = 1;",
+            "now",
+            "before",
+        )
+        .unwrap();
+        let body_edit = extract_symbols(
+            "/tmp/repo",
+            "src/actions.ts",
+            path,
+            "export const handler = (value: number) => value + 2;\nconst plain = 2;",
+            "later",
+            "body",
+        )
+        .unwrap();
+        let signature_edit = extract_symbols(
+            "/tmp/repo",
+            "src/actions.ts",
+            path,
+            "export const handler = (value: string) => value.length;",
+            "later",
+            "signature",
+        )
+        .unwrap();
+        let handler = before
+            .iter()
+            .find(|symbol| symbol.name == "handler")
+            .unwrap();
+        assert_eq!(handler.kind, "function");
+        assert!(!before.iter().any(|symbol| symbol.name == "plain"));
+        assert_eq!(
+            handler.logical_key,
+            body_edit
+                .iter()
+                .find(|symbol| symbol.name == "handler")
+                .unwrap()
+                .logical_key
+        );
+        assert_ne!(
+            handler.logical_key,
+            signature_edit
+                .iter()
+                .find(|symbol| symbol.name == "handler")
+                .unwrap()
+                .logical_key
+        );
+    }
+
+    #[test]
+    fn duplicate_declarations_and_inline_rust_tests_are_reported() {
+        let path = std::path::Path::new("src/lib.rs");
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "fn duplicate() {}\nfn duplicate() {}\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn exercises_duplicate() { duplicate(); }\n}",
+            "now",
+            "hash",
+        )
+        .unwrap();
+        let duplicates = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.iter().all(|symbol| !symbol.identity_stable));
+        assert!(
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == "exercises_duplicate")
+                .is_some_and(|symbol| symbol.source_role == "test")
+        );
     }
 }

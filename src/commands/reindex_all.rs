@@ -10,9 +10,11 @@ pub async fn run(config: &Config) -> Result<()> {
     let result = engine
         .index_scope(engine.all_scope()?, true, SplitterKind::Ast, &[], &[])
         .await?;
-    println!("{}", render_index_text(&result));
     if result.has_errors {
+        println!("{}", render_index_text(&result));
         std::process::exit(1);
     }
+    engine.compact_relationship_storage().await?;
+    println!("{}", render_index_text(&result));
     Ok(())
 }

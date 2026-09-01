@@ -1,4 +1,9 @@
 use crate::config::{Config, ResolvedScope};
+use crate::engine::changes::{AnalyzeChangesRequest, ChangeAnalysisResponse};
+use crate::engine::impact::{
+    ImpactEvidence, ImpactNode, ImpactRequest, ImpactResponse, TracePathRequest, TracePathResponse,
+};
+use crate::engine::relationships::RepoRelationshipCoverage;
 use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
 use crate::engine::{
@@ -471,6 +476,110 @@ struct SearchSymbolsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct AnalyzeImpactArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    symbol_id: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default = "default_impact_depth")]
+    max_depth: usize,
+    #[serde(default = "default_impact_nodes")]
+    max_nodes: usize,
+    #[serde(default = "default_true")]
+    include_tests: bool,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default)]
+    include_possible: bool,
+    #[serde(default = "default_graph_detail")]
+    detail: String,
+    #[serde(default = "default_max_evidence_per_node")]
+    max_evidence_per_node: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TracePathArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    from_symbol_id: Option<String>,
+    #[serde(default)]
+    from_file: Option<String>,
+    #[serde(default)]
+    from_line: Option<u64>,
+    #[serde(default)]
+    to_symbol_id: Option<String>,
+    #[serde(default)]
+    to_file: Option<String>,
+    #[serde(default)]
+    to_line: Option<u64>,
+    #[serde(default = "default_trace_depth")]
+    max_depth: usize,
+    #[serde(default = "default_trace_paths")]
+    max_paths: usize,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default = "default_graph_detail")]
+    detail: String,
+    #[serde(default = "default_max_evidence_per_node")]
+    max_evidence_per_node: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CoverageArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default = "default_graph_detail")]
+    detail: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzeChangesArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default = "default_base_ref")]
+    base_ref: String,
+    #[serde(default)]
+    include_untracked: bool,
+    #[serde(default = "default_impact_depth")]
+    max_depth: usize,
+    #[serde(default = "default_impact_nodes")]
+    max_nodes: usize,
+    #[serde(default = "default_true")]
+    include_tests: bool,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default = "default_graph_detail")]
+    detail: String,
+    #[serde(default = "default_max_evidence_per_node")]
+    max_evidence_per_node: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SearchTextArgs {
     #[serde(default)]
     scope: Option<String>,
@@ -868,7 +977,7 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Use list_scopes first. Use search_symbols for exact definitions. Use search_code for broader discovery; its snippets are discovery hints, not authoritative reads. Use search_text for exact literals, identifiers, test names, and log lines in a known repo, file, or subtree instead of shell rg. Use get_file_outline for compact file structure once the file is known. Use prepare_edit_target only when the exact patch location is already known; it is the final pre-patch step, not a general reader or overview tool. If prepare_edit_target returns needsNarrowing or ambiguous, go back to search_text or get_file_outline. Fall back to shell rg/sed/bat only when regex is required or MCP exact inspection is unavailable. scope defaults to the configured default group.";
+const SERVER_INSTRUCTIONS: &str = "Start with list_scopes once, then use search_symbols for exact definitions, search_code for discovery, search_text for exact literals instead of shell rg when indexed, and get_file_outline for known-file structure. Request includeSymbolId when a symbol will feed analyze_impact, trace_path, or prepare_edit_target; graph tools also accept file+line selectors. Use analyze_impact for callers and affected tests, trace_path for a directed dependency explanation, analyze_changes for baseRef-to-working-tree risk, and check_index_coverage before interpreting an empty graph result. Graph responses use compact agent-ready objects by default; request detail=full only when complete canonical metadata is needed. Follow status and nextActions instead of treating needs_index, symbol_not_found, not_found, or truncation as proof of no dependency. Confidence >=650 is structural; lower values are possible evidence only. Rust and TypeScript are the guaranteed graph languages. Use prepare_edit_target only as the final pre-patch step after the exact edit location is known. Relationship analysis requires index format v2 and never rebuilds automatically. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
@@ -907,6 +1016,26 @@ pub fn tool_list() -> Vec<Tool> {
             "Final pre-patch step only. Use immediately before editing instead of sed/bat/cat after the exact patch location is known. Not for overview or broad inspection.",
             true,
             prepare_edit_target_schema(),
+        ),
+        build_graph_tool(
+            "analyze_impact",
+            "Find callers, transitive dependents, and affected tests for one Rust/TypeScript definition. Pass a symbolId from search_symbols or a repo-relative file+line; returns compact evidence and recovery actions.",
+            analyze_impact_schema(),
+        ),
+        build_graph_tool(
+            "trace_path",
+            "Explain how one Rust/TypeScript definition depends on another. Each endpoint accepts a symbolId or repo-relative file+line; a not_found status includes coverage-aware next actions.",
+            trace_path_schema(),
+        ),
+        build_graph_tool(
+            "analyze_changes",
+            "Assess current working-tree Rust/TypeScript declaration changes against a Git base and rank affected code/tests. Returns explicit invalid_base and needs_index states instead of implying safety.",
+            analyze_changes_schema(),
+        ),
+        build_graph_tool(
+            "check_index_coverage",
+            "Decide whether graph results are trustworthy enough to interpret. Reports readiness, stale files, supported coverage, resolution tiers, and the exact indexing action when refresh is required.",
+            coverage_schema(),
         ),
         build_tool(
             "explain_search",
@@ -1231,6 +1360,248 @@ impl ServerHandler for NativeServer {
                     Ok(tool_success(
                         render_prepare_edit_target_summary_text(&result),
                         serde_json::to_value(compact_prepare_edit_target_response(&result)).ok(),
+                    ))
+                }
+                "analyze_impact" => {
+                    let args: AnalyzeImpactArgs = parse_args(args)?;
+                    let detail = parse_graph_detail(&args.detail).map_err(invalid_params)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .analyze_impact(
+                            scope.clone(),
+                            ImpactRequest {
+                                repo: repo.clone(),
+                                symbol_id: normalize_optional_string(&args.symbol_id),
+                                file: normalize_optional_path(&args.file),
+                                line: args.line,
+                                max_depth: args.max_depth,
+                                max_nodes: args.max_nodes,
+                                include_tests: args.include_tests,
+                                min_confidence: args.min_confidence.min(1000),
+                                include_possible: args.include_possible,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            let coverage = self
+                                .engine
+                                .relationship_readiness(scope.clone(), repo.as_deref())
+                                .await
+                                .map_err(internal_error)?;
+                            let value = json!({
+                                "status": "needs_index",
+                                "needsIndex": true,
+                                "reason": "relationship graph is stale, incomplete, or incompatible",
+                                "coverage": coverage,
+                                "nextActions": [graph_action(
+                                    "index_codebase",
+                                    "Refresh this scope before retrying impact analysis.",
+                                    json!({"scope": scope.id, "force": false}),
+                                )],
+                            });
+                            return Ok(tool_success(
+                                "Impact analysis needs a current relationship index".to_string(),
+                                Some(value),
+                            ));
+                        }
+                        Err(error) => {
+                            if let Some(value) = graph_recoverable_error_value(
+                                &error,
+                                "analyze_impact",
+                                &scope.id,
+                                repo.as_deref(),
+                            ) {
+                                return Ok(tool_success(
+                                    "Impact analysis needs a more precise symbol selector"
+                                        .to_string(),
+                                    Some(value),
+                                ));
+                            }
+                            return Err(internal_error(error));
+                        }
+                    };
+                    let status = impact_response_status(&result);
+                    let summary = format!(
+                        "Impact `{status}`: {} direct, {} transitive, {} tests, {} possible dependents, {} possible tests{}",
+                        result.direct_dependents.len(),
+                        result.transitive_dependents.len(),
+                        result.affected_tests.len(),
+                        result.possible_dependents.len(),
+                        result.possible_tests.len(),
+                        if result.truncated { " (truncated)" } else { "" }
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(impact_response_value(
+                            &result,
+                            detail,
+                            args.max_evidence_per_node,
+                        )),
+                    ))
+                }
+                "trace_path" => {
+                    let args: TracePathArgs = parse_args(args)?;
+                    let detail = parse_graph_detail(&args.detail).map_err(invalid_params)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .trace_dependency_path(
+                            scope.clone(),
+                            TracePathRequest {
+                                repo: repo.clone(),
+                                from_symbol_id: normalize_optional_string(&args.from_symbol_id),
+                                from_file: normalize_optional_path(&args.from_file),
+                                from_line: args.from_line,
+                                to_symbol_id: normalize_optional_string(&args.to_symbol_id),
+                                to_file: normalize_optional_path(&args.to_file),
+                                to_line: args.to_line,
+                                max_depth: args.max_depth,
+                                max_paths: args.max_paths,
+                                min_confidence: args.min_confidence.min(1000),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            let coverage = self
+                                .engine
+                                .relationship_readiness(scope.clone(), repo.as_deref())
+                                .await
+                                .map_err(internal_error)?;
+                            let value = json!({
+                                "status": "needs_index",
+                                "needsIndex": true,
+                                "reason": "relationship graph is stale, incomplete, or incompatible",
+                                "coverage": coverage,
+                                "nextActions": [graph_action(
+                                    "index_codebase",
+                                    "Refresh this scope before retrying path tracing.",
+                                    json!({"scope": scope.id, "force": false}),
+                                )],
+                            });
+                            return Ok(tool_success(
+                                "Path tracing needs a current relationship index".to_string(),
+                                Some(value),
+                            ));
+                        }
+                        Err(error) => {
+                            if let Some(value) = graph_recoverable_error_value(
+                                &error,
+                                "trace_path",
+                                &scope.id,
+                                repo.as_deref(),
+                            ) {
+                                return Ok(tool_success(
+                                    "Path tracing needs valid from/to symbol selectors".to_string(),
+                                    Some(value),
+                                ));
+                            }
+                            return Err(internal_error(error));
+                        }
+                    };
+                    let status = trace_response_status(&result);
+                    let summary = format!(
+                        "Dependency path `{status}`: {} path(s){}",
+                        result.paths.len(),
+                        if result.truncated { " (truncated)" } else { "" }
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(trace_response_value(
+                            &result,
+                            detail,
+                            args.max_evidence_per_node,
+                            args.max_depth,
+                        )),
+                    ))
+                }
+                "analyze_changes" => {
+                    let args: AnalyzeChangesArgs = parse_args(args)?;
+                    let detail = parse_graph_detail(&args.detail).map_err(invalid_params)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let result = self
+                        .engine
+                        .analyze_changes(
+                            scope,
+                            AnalyzeChangesRequest {
+                                repo: normalize_optional_string(&args.repo),
+                                base_ref: args.base_ref,
+                                include_untracked: args.include_untracked,
+                                max_depth: args.max_depth.clamp(1, 5),
+                                max_nodes: args.max_nodes.clamp(1, 250),
+                                include_tests: args.include_tests,
+                                min_confidence: args.min_confidence.min(1000),
+                            },
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                    let summary = if result.invalid_base {
+                        format!(
+                            "Change analysis: invalid base ({})",
+                            result.reason.as_deref().unwrap_or("unknown reason")
+                        )
+                    } else if result.needs_index {
+                        "Change analysis needs a current index".to_string()
+                    } else {
+                        format!(
+                            "Change analysis: {} files, {} symbols, {} impact roots{}",
+                            result.files.len(),
+                            result.symbols.len(),
+                            result.impacts.len(),
+                            if result.truncated { " (truncated)" } else { "" }
+                        )
+                    };
+                    Ok(tool_success(
+                        summary,
+                        Some(change_response_value(
+                            &result,
+                            detail,
+                            args.max_evidence_per_node,
+                        )),
+                    ))
+                }
+                "check_index_coverage" => {
+                    let args: CoverageArgs = parse_args(args)?;
+                    let detail = parse_graph_detail(&args.detail).map_err(invalid_params)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let result = self
+                        .engine
+                        .relationship_coverage(scope.clone(), args.repo.as_deref())
+                        .await
+                        .map_err(internal_error)?;
+                    let ready = result.iter().all(|coverage| {
+                        coverage.graph_status == "ready" && coverage.stale_files.is_empty()
+                    });
+                    let summary = format!(
+                        "Relationship coverage `{}`: {} repositories",
+                        if ready { "ready" } else { "needs_index" },
+                        result.len()
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(coverage_response_value(&result, detail, &scope.id)),
                     ))
                 }
                 "get_file_outline" => {
@@ -1871,6 +2242,16 @@ fn build_tool(
     tool
 }
 
+fn build_graph_tool(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Map<String, Value>,
+) -> Tool {
+    let mut tool = build_tool(name, description, true, input_schema);
+    tool.output_schema = Some(Arc::new(graph_output_schema()));
+    tool
+}
+
 fn parse_args<T>(arguments: Map<String, Value>) -> Result<T, McpError>
 where
     T: for<'de> Deserialize<'de>,
@@ -2348,12 +2729,496 @@ fn count_outline_nodes(nodes: &[OutlineNode]) -> usize {
         .sum()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphDetail {
+    Compact,
+    Full,
+}
+
+fn parse_graph_detail(value: &str) -> Result<GraphDetail> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "compact" => Ok(GraphDetail::Compact),
+        "full" => Ok(GraphDetail::Full),
+        other => bail!("invalid detail `{other}`; expected compact or full"),
+    }
+}
+
+fn graph_action(tool: &str, reason: &str, arguments: Value) -> Value {
+    json!({
+        "tool": tool,
+        "reason": reason,
+        "arguments": arguments,
+    })
+}
+
+fn graph_value_with_status<T: Serialize>(status: &str, value: &T, actions: Vec<Value>) -> Value {
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| json!({}));
+    let object = value
+        .as_object_mut()
+        .expect("graph responses serialize as objects");
+    object.insert("status".to_string(), Value::String(status.to_string()));
+    if !actions.is_empty() {
+        object.insert("nextActions".to_string(), Value::Array(actions));
+    }
+    value
+}
+
+fn compact_evidence_value(evidence: &ImpactEvidence) -> Value {
+    json!({
+        "relation": evidence.relation.as_str(),
+        "confidence": evidence.confidence,
+        "resolution": evidence.resolution,
+        "file": evidence.source_path,
+        "line": evidence.start_line,
+        "endLine": evidence.end_line,
+        "text": evidence.text,
+    })
+}
+
+fn compact_impact_node_value(node: &ImpactNode, max_evidence: usize) -> Value {
+    let mut value = json!({
+        "name": node.name,
+        "kind": node.kind,
+        "file": node.relative_path,
+        "line": node.start_line,
+        "endLine": node.end_line,
+        "role": node.source_role,
+        "depth": node.depth,
+        "score": round_score(node.score),
+        "possible": node.possible,
+        "evidence": node.evidence.iter().take(max_evidence).map(compact_evidence_value).collect::<Vec<_>>(),
+    });
+    if let Some(symbol_id) = node.symbol_id.as_ref() {
+        value
+            .as_object_mut()
+            .expect("compact impact node is an object")
+            .insert("symbolId".to_string(), Value::String(symbol_id.clone()));
+    }
+    value
+}
+
+fn compact_coverage_value(
+    coverage: &RepoRelationshipCoverage,
+    include_paths: bool,
+    live_audit_verified: bool,
+) -> Value {
+    let graph_ready = coverage.graph_status == "ready";
+    let mut value = json!({
+        "repo": coverage.repo,
+        "graphStatus": coverage.graph_status,
+        "graphReady": graph_ready,
+        "liveAudit": if live_audit_verified { "verified" } else { "not_run" },
+        "conclusive": graph_ready && live_audit_verified && coverage.stale_files.is_empty(),
+        "resolutionPercentage": round_score(coverage.resolution_percentage),
+        "files": {
+            "supported": coverage.supported_files,
+            "unsupported": coverage.unsupported_files,
+            "stale": coverage.stale_files.len(),
+        },
+        "definitions": coverage.definitions,
+        "references": {
+            "total": coverage.references,
+            "definite": coverage.definite,
+            "probable": coverage.probable,
+            "possible": coverage.possible,
+            "unresolved": coverage.unresolved,
+        },
+        "unstableIdentities": coverage.unstable_identities,
+        "languages": coverage.by_language,
+    });
+    if include_paths {
+        let object = value
+            .as_object_mut()
+            .expect("compact coverage is an object");
+        object.insert(
+            "staleFiles".to_string(),
+            json!(coverage.stale_files.iter().take(50).collect::<Vec<_>>()),
+        );
+        object.insert(
+            "unsupportedPaths".to_string(),
+            json!(
+                coverage
+                    .unsupported_paths
+                    .iter()
+                    .take(50)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    value
+}
+
+fn impact_response_status(result: &ImpactResponse) -> &'static str {
+    if result.diagnostic.is_some() {
+        "unsupported"
+    } else if result.truncated {
+        "truncated"
+    } else if result.direct_dependents.is_empty()
+        && result.transitive_dependents.is_empty()
+        && result.affected_tests.is_empty()
+        && result.possible_dependents.is_empty()
+        && result.possible_tests.is_empty()
+    {
+        "no_dependents"
+    } else {
+        "ok"
+    }
+}
+
+fn impact_next_actions(result: &ImpactResponse) -> Vec<Value> {
+    let mut actions = Vec::new();
+    if result.truncated
+        && let Some(symbol_id) = result.root.symbol_id.as_ref()
+    {
+        actions.push(graph_action(
+            "analyze_impact",
+            "Traversal was truncated; raise maxDepth or maxNodes only if broader impact is needed.",
+            json!({
+                "scope": result.scope,
+                "repo": result.repo,
+                "symbolId": symbol_id,
+                "maxDepth": 5,
+                "maxNodes": 250,
+            }),
+        ));
+    }
+    if impact_response_status(result) == "no_dependents" {
+        actions.push(graph_action(
+            "check_index_coverage",
+            "Confirm that an empty impact result reflects sufficient graph coverage.",
+            json!({"scope": result.scope, "repo": result.repo}),
+        ));
+        actions.push(graph_action(
+            "search_code",
+            "Look for dynamic, generated, or unsupported-language usage outside the structural graph.",
+            json!({"scope": result.scope, "query": result.root.name, "dedupeByFile": true}),
+        ));
+    }
+    actions
+}
+
+fn impact_response_value(
+    result: &ImpactResponse,
+    detail: GraphDetail,
+    max_evidence: usize,
+) -> Value {
+    let status = impact_response_status(result);
+    let actions = impact_next_actions(result);
+    if detail == GraphDetail::Full {
+        let mut value = graph_value_with_status(status, result, actions);
+        value
+            .as_object_mut()
+            .expect("full impact response is an object")
+            .insert("coverageAudit".to_string(), json!("verified"));
+        return value;
+    }
+    let max_evidence = max_evidence.clamp(0, 5);
+    json!({
+        "status": status,
+        "scope": result.scope,
+        "repo": result.repo,
+        "root": compact_impact_node_value(&result.root, max_evidence),
+        "counts": {
+            "direct": result.direct_dependents.len(),
+            "transitive": result.transitive_dependents.len(),
+            "tests": result.affected_tests.len(),
+            "possible": result.possible_dependents.len() + result.possible_tests.len(),
+            "ambiguities": result.ambiguities.len(),
+        },
+        "directDependents": result.direct_dependents.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        "transitiveDependents": result.transitive_dependents.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        "affectedTests": result.affected_tests.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        "possibleDependents": result.possible_dependents.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        "possibleTests": result.possible_tests.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        "ambiguities": result.ambiguities,
+        "coverage": compact_coverage_value(&result.coverage, false, true),
+        "diagnostic": result.diagnostic,
+        "truncated": result.truncated,
+        "truncationNotices": result.truncation_notices,
+        "nextActions": actions,
+    })
+}
+
+fn trace_response_status(result: &TracePathResponse) -> &'static str {
+    if result.diagnostic.is_some() {
+        "unsupported"
+    } else if result.truncated {
+        "truncated"
+    } else if result.found {
+        "found"
+    } else {
+        "not_found"
+    }
+}
+
+fn trace_response_value(
+    result: &TracePathResponse,
+    detail: GraphDetail,
+    max_evidence: usize,
+    requested_max_depth: usize,
+) -> Value {
+    let status = trace_response_status(result);
+    let mut actions = Vec::new();
+    if !result.found {
+        actions.push(graph_action(
+            "check_index_coverage",
+            "A missing path is conclusive only when graph coverage is sufficient.",
+            json!({"scope": result.scope, "repo": result.repo}),
+        ));
+        if requested_max_depth < 10
+            && let (Some(from_id), Some(to_id)) =
+                (result.from.symbol_id.as_ref(), result.to.symbol_id.as_ref())
+        {
+            actions.push(graph_action(
+                "trace_path",
+                "Retry with a wider bound only when a longer structural path is useful.",
+                json!({
+                    "scope": result.scope,
+                    "repo": result.repo,
+                    "fromSymbolId": from_id,
+                    "toSymbolId": to_id,
+                    "maxDepth": (requested_max_depth + 2).min(10),
+                }),
+            ));
+        }
+    }
+    if detail == GraphDetail::Full {
+        let mut value = graph_value_with_status(status, result, actions);
+        value
+            .as_object_mut()
+            .expect("full trace response is an object")
+            .insert("coverageAudit".to_string(), json!("verified"));
+        return value;
+    }
+    let max_evidence = max_evidence.clamp(0, 5);
+    json!({
+        "status": status,
+        "scope": result.scope,
+        "repo": result.repo,
+        "from": compact_impact_node_value(&result.from, 0),
+        "to": compact_impact_node_value(&result.to, 0),
+        "pathCount": result.paths.len(),
+        "paths": result.paths.iter().map(|path| json!({
+            "score": round_score(path.score),
+            "nodes": path.nodes.iter().map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "ambiguities": result.ambiguities,
+        "coverage": compact_coverage_value(&result.coverage, false, true),
+        "diagnostic": result.diagnostic,
+        "truncated": result.truncated,
+        "truncationNotices": result.truncation_notices,
+        "nextActions": actions,
+    })
+}
+
+fn change_response_status(result: &ChangeAnalysisResponse) -> &'static str {
+    if result.invalid_base {
+        "invalid_base"
+    } else if result.needs_index {
+        "needs_index"
+    } else if result.files.is_empty() {
+        "no_changes"
+    } else if result.truncated {
+        "truncated"
+    } else {
+        "ok"
+    }
+}
+
+fn change_response_value(
+    result: &ChangeAnalysisResponse,
+    detail: GraphDetail,
+    max_evidence: usize,
+) -> Value {
+    let status = change_response_status(result);
+    let mut actions = Vec::new();
+    if result.needs_index {
+        actions.push(graph_action(
+            "index_codebase",
+            "Refresh the current working-tree index before retrying change analysis.",
+            json!({"path": result.repo, "force": false}),
+        ));
+    } else if result.invalid_base {
+        actions.push(graph_action(
+            "analyze_changes",
+            "Retry with a Git commit, branch, or tag that resolves in this repository.",
+            json!({"scope": result.scope, "repo": result.repo, "baseRef": "HEAD"}),
+        ));
+    }
+    if detail == GraphDetail::Full {
+        let mut value = graph_value_with_status(status, result, actions);
+        value
+            .as_object_mut()
+            .expect("full change response is an object")
+            .insert("coverageAudit".to_string(), json!("verified"));
+        return value;
+    }
+    let max_evidence = max_evidence.clamp(0, 5);
+    let symbols = result
+        .symbols
+        .iter()
+        .map(|change| {
+            let selected = change.current.as_ref().or(change.old.as_ref());
+            json!({
+                "change": change.change,
+                "symbolId": selected.map(|symbol| symbol.symbol_id.as_str()),
+                "name": selected.map(|symbol| symbol.name.as_str()),
+                "kind": selected.map(|symbol| symbol.kind.as_str()),
+                "qualifiedName": selected.map(|symbol| symbol.qualified_name.as_str()),
+                "file": selected.map(|symbol| symbol.relative_path.as_str()),
+                "line": selected.map(|symbol| symbol.start_line),
+            })
+        })
+        .collect::<Vec<_>>();
+    let impacts = result
+        .impacts
+        .iter()
+        .map(|impact| {
+            let analysis = impact.analysis.as_ref();
+            json!({
+                "change": impact.change,
+                "qualifiedName": impact.qualified_name,
+                "status": analysis.map(impact_response_status).unwrap_or("possible_only"),
+                "counts": analysis.map(|value| json!({
+                    "direct": value.direct_dependents.len(),
+                    "transitive": value.transitive_dependents.len(),
+                    "tests": value.affected_tests.len(),
+                    "possible": value.possible_dependents.len() + value.possible_tests.len(),
+                })),
+                "topDependents": analysis.map(|value| value.direct_dependents.iter().take(10).map(|node| compact_impact_node_value(node, max_evidence)).collect::<Vec<_>>()).unwrap_or_default(),
+                "possibleEvidence": impact.possible_evidence.iter().take(max_evidence).map(compact_evidence_value).collect::<Vec<_>>(),
+                "note": impact.note,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": status,
+        "scope": result.scope,
+        "repo": result.repo,
+        "baseRef": result.base_ref,
+        "resolvedBase": result.resolved_base,
+        "reason": result.reason,
+        "counts": {
+            "files": result.files.len(),
+            "symbols": result.symbols.len(),
+            "impactRoots": result.impacts.len(),
+        },
+        "files": result.files,
+        "symbols": symbols,
+        "impacts": impacts,
+        "coverage": result.coverage.as_ref().map(|value| compact_coverage_value(value, false, true)),
+        "truncated": result.truncated,
+        "nextActions": actions,
+    })
+}
+
+fn coverage_response_value(
+    result: &[RepoRelationshipCoverage],
+    detail: GraphDetail,
+    scope: &str,
+) -> Value {
+    let ready = result
+        .iter()
+        .all(|coverage| coverage.graph_status == "ready" && coverage.stale_files.is_empty());
+    let status = if ready { "ready" } else { "needs_index" };
+    let repositories = if detail == GraphDetail::Full {
+        serde_json::to_value(result).unwrap_or_else(|_| json!([]))
+    } else {
+        Value::Array(
+            result
+                .iter()
+                .map(|coverage| compact_coverage_value(coverage, true, true))
+                .collect(),
+        )
+    };
+    let actions = if ready {
+        Vec::new()
+    } else {
+        vec![graph_action(
+            "index_codebase",
+            "Refresh repositories whose graph status is not ready or whose file hashes are stale.",
+            json!({"scope": scope, "force": false}),
+        )]
+    };
+    json!({
+        "status": status,
+        "ready": ready,
+        "repositoryCount": result.len(),
+        "repositories": repositories,
+        "nextActions": actions,
+    })
+}
+
 fn round_score(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn graph_requires_index(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("relationship graph is stale or incomplete")
+    })
+}
+
+fn graph_recoverable_error_value(
+    error: &anyhow::Error,
+    tool: &str,
+    scope: &str,
+    _repo: Option<&str>,
+) -> Option<Value> {
+    let reason = format!("{error:#}");
+    let normalized = reason.to_ascii_lowercase();
+    let status = if normalized.contains("symbolid was not found")
+        || normalized.contains("no indexed symbol contains")
+        || normalized.contains("no indexed from symbol contains")
+        || normalized.contains("no indexed to symbol contains")
+    {
+        "symbol_not_found"
+    } else if normalized.contains("provide symbolid")
+        || normalized.contains("provide fromsymbolid")
+        || normalized.contains("provide tosymbolid")
+        || normalized.contains("line is required")
+    {
+        "invalid_selector"
+    } else if normalized.contains("requires one repository")
+        || normalized.contains("repo hint")
+        || normalized.contains("multiple repositories")
+    {
+        "needs_repo"
+    } else {
+        return None;
+    };
+    let mut value = json!({
+        "status": status,
+        "tool": tool,
+        "reason": reason,
+        "suggestedNextTool": "search_symbols",
+        "suggestedArguments": {
+            "scope": scope,
+            "includeSymbolId": true,
+            "limit": 5,
+        },
+        "missingArguments": ["query"],
+    });
+    if status == "needs_repo" {
+        value
+            .as_object_mut()
+            .expect("recoverable graph error is an object")
+            .insert(
+                "nextActions".to_string(),
+                json!([graph_action(
+                    "list_scopes",
+                    "Resolve the repository before retrying the graph tool.",
+                    json!({}),
+                )]),
+            );
+    }
+    Some(value)
 }
 
 fn invalid_params(error: anyhow::Error) -> McpError {
@@ -2366,6 +3231,36 @@ fn internal_error(error: anyhow::Error) -> McpError {
 
 fn default_limit() -> usize {
     5
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_impact_depth() -> usize {
+    2
+}
+fn default_impact_nodes() -> usize {
+    50
+}
+fn default_trace_depth() -> usize {
+    5
+}
+fn default_trace_paths() -> usize {
+    3
+}
+fn default_min_confidence() -> u64 {
+    650
+}
+fn default_base_ref() -> String {
+    "HEAD".to_string()
+}
+
+fn default_graph_detail() -> String {
+    "compact".to_string()
+}
+
+fn default_max_evidence_per_node() -> usize {
+    2
 }
 
 fn default_text_search_limit() -> usize {
@@ -2744,6 +3639,122 @@ fn prepare_edit_target_schema() -> Map<String, Value> {
     .unwrap_or_default()
 }
 
+fn analyze_impact_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Find callers, transitive dependents, and affected tests for one Rust/TypeScript definition. Prefer symbolId from search_symbols(includeSymbolId=true); file+line avoids a separate lookup when the source location is already known.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "repo": nullable_string_schema("Repo root or basename. Supply this when scope contains multiple repositories."),
+            "symbolId": {"type": "string", "minLength": 1, "description": "Root symbol id from search_symbols(includeSymbolId=true)."},
+            "file": {"type": "string", "minLength": 1, "description": "Repo-relative source file used with line."},
+            "line": {"type": "integer", "format": "uint64", "minimum": 1},
+            "maxDepth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 2},
+            "maxNodes": {"type": "integer", "minimum": 1, "maximum": 250, "default": 50},
+            "includeTests": {"type": "boolean", "default": true},
+            "minConfidence": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 650},
+            "includePossible": {"type": "boolean", "default": false, "description": "Include confidence 300-649 candidates in separately labeled possible sections."},
+            "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact is optimized for agent decisions; full returns complete canonical metadata."},
+            "maxEvidencePerNode": {"type": "integer", "minimum": 0, "maximum": 5, "default": 2, "description": "Maximum evidence edges retained per returned node in compact mode."}
+        },
+        "anyOf": [
+            {"required": ["symbolId"]},
+            {"required": ["file", "line"]}
+        ]
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn trace_path_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Trace the shortest highest-confidence directed dependency paths between two Rust/TypeScript definitions. Each endpoint accepts either a symbolId or a file+line selector.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "repo": nullable_string_schema("Repo root or basename. Supply this when scope contains multiple repositories."),
+            "fromSymbolId": {"type": "string", "minLength": 1, "description": "Source symbol id from search_symbols(includeSymbolId=true)."},
+            "fromFile": {"type": "string", "minLength": 1, "description": "Repo-relative source file used with fromLine."},
+            "fromLine": {"type": "integer", "format": "uint64", "minimum": 1},
+            "toSymbolId": {"type": "string", "minLength": 1, "description": "Target symbol id from search_symbols(includeSymbolId=true)."},
+            "toFile": {"type": "string", "minLength": 1, "description": "Repo-relative target file used with toLine."},
+            "toLine": {"type": "integer", "format": "uint64", "minimum": 1},
+            "maxDepth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            "maxPaths": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+            "minConfidence": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 650},
+            "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
+            "maxEvidencePerNode": {"type": "integer", "minimum": 0, "maximum": 5, "default": 2}
+        },
+        "allOf": [
+            {"anyOf": [{"required": ["fromSymbolId"]}, {"required": ["fromFile", "fromLine"]}]},
+            {"anyOf": [{"required": ["toSymbolId"]}, {"required": ["toFile", "toLine"]}]}
+        ]
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn coverage_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Check whether relationship coverage is sufficient to trust an empty or incomplete graph result. Call this before concluding that no dependency exists.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root. Defaults to the configured default group."),
+            "repo": nullable_string_schema("Optional repo root or basename within a group scope."),
+            "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"}
+        }
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
+fn analyze_changes_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Classify Rust/TypeScript declaration changes from a validated Git base to the current working tree, then attach bounded impact evidence. Historical-to-historical comparisons are not supported.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root."),
+            "repo": nullable_string_schema("Repo root or basename; required for multi-repo scopes."),
+            "baseRef": {"type": "string", "default": "HEAD"},
+            "includeUntracked": {"type": "boolean", "default": false},
+            "maxDepth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 2},
+            "maxNodes": {"type": "integer", "minimum": 1, "maximum": 250, "default": 50},
+            "includeTests": {"type": "boolean", "default": true},
+            "minConfidence": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 650},
+            "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
+            "maxEvidencePerNode": {"type": "integer", "minimum": 0, "maximum": 5, "default": 2}
+        }
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn graph_output_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Agent-ready graph result. Inspect status first, then consume evidence or follow nextActions.",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Machine-readable outcome such as ok, found, not_found, no_dependents, truncated, needs_index, invalid_base, invalid_selector, symbol_not_found, or unsupported."
+            },
+            "nextActions": {
+                "type": "array",
+                "description": "Bounded follow-up tool calls for recoverable or inconclusive outcomes.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "arguments": {"type": "object"}
+                    },
+                    "required": ["tool", "reason", "arguments"]
+                }
+            }
+        },
+        "required": ["status"],
+        "additionalProperties": true
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
 fn explain_search_schema() -> Map<String, Value> {
     json!({
         "type": "object",
@@ -2859,15 +3870,19 @@ fn list_scopes_schema() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_WORKER_STALE_AFTER, IndexCoordinatorState, OutlineCompactionOptions, OutlineDetail,
-        PendingIndexRequest, SERVER_INSTRUCTIONS, SearchMode, compact_outline_response,
+        GraphDetail, INDEX_WORKER_STALE_AFTER, IndexCoordinatorState, OutlineCompactionOptions,
+        OutlineDetail, PendingIndexRequest, SERVER_INSTRUCTIONS, SearchMode,
+        analyze_changes_schema, analyze_impact_schema, compact_outline_response,
         compact_prepare_edit_target_response, compact_search_response_value,
-        compact_symbol_search_response_value, compact_text_search_response_value, default_limit,
-        enforce_loopback_bind, get_file_outline_schema, list_scopes_schema, listen_is_loopback,
-        normalize_extension_filter, parse_search_mode, parse_splitter_kind,
+        compact_symbol_search_response_value, compact_text_search_response_value,
+        coverage_response_value, coverage_schema, default_limit, enforce_loopback_bind,
+        get_file_outline_schema, graph_output_schema, impact_response_value, list_scopes_schema,
+        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
         prepare_edit_target_schema, search_symbols_schema, search_text_schema, search_tool_success,
-        tool_list,
+        tool_list, trace_path_schema, trace_response_status,
     };
+    use crate::engine::impact::{ImpactEvidence, ImpactNode, ImpactResponse, TracePathResponse};
+    use crate::engine::relationships::{RelationKind, RepoRelationshipCoverage};
     use crate::engine::splitter::SplitterKind;
     use crate::engine::symbols::OutlineNode;
     use crate::engine::{
@@ -2970,7 +3985,169 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "search_text"));
         assert!(tools.iter().any(|tool| tool.name == "prepare_edit_target"));
         assert!(tools.iter().any(|tool| tool.name == "get_file_outline"));
+        assert!(tools.iter().any(|tool| tool.name == "analyze_impact"));
+        assert!(tools.iter().any(|tool| tool.name == "trace_path"));
+        assert!(tools.iter().any(|tool| tool.name == "analyze_changes"));
+        assert!(tools.iter().any(|tool| tool.name == "check_index_coverage"));
         assert!(tools.iter().any(|tool| tool.name == "explain_search"));
+    }
+
+    #[test]
+    fn relationship_tool_schemas_publish_defaults_and_limits() {
+        let impact = Value::Object(analyze_impact_schema());
+        let trace = Value::Object(trace_path_schema());
+        let changes = Value::Object(analyze_changes_schema());
+        let coverage = Value::Object(coverage_schema());
+
+        assert_eq!(impact["properties"]["maxDepth"]["default"], 2);
+        assert_eq!(impact["properties"]["maxDepth"]["maximum"], 5);
+        assert_eq!(impact["properties"]["maxNodes"]["maximum"], 250);
+        assert_eq!(impact["properties"]["minConfidence"]["default"], 650);
+        assert_eq!(impact["properties"]["detail"]["default"], "compact");
+        assert_eq!(impact["properties"]["maxEvidencePerNode"]["maximum"], 5);
+        assert_eq!(impact["anyOf"].as_array().map(Vec::len), Some(2));
+        assert_eq!(trace["properties"]["maxDepth"]["default"], 5);
+        assert_eq!(trace["properties"]["maxPaths"]["maximum"], 10);
+        assert!(trace["properties"].get("fromFile").is_some());
+        assert_eq!(trace["allOf"].as_array().map(Vec::len), Some(2));
+        assert_eq!(changes["properties"]["baseRef"]["default"], "HEAD");
+        assert_eq!(changes["properties"]["includeUntracked"]["default"], false);
+        assert_eq!(changes["properties"]["detail"]["default"], "compact");
+        assert_eq!(coverage["properties"]["detail"]["default"], "compact");
+        assert!(
+            coverage["description"]
+                .as_str()
+                .unwrap()
+                .contains("coverage")
+        );
+    }
+
+    #[test]
+    fn relationship_tools_advertise_agent_status_output_schema() {
+        let tools = tool_list();
+        for name in [
+            "analyze_impact",
+            "trace_path",
+            "analyze_changes",
+            "check_index_coverage",
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = tool.output_schema.as_ref().expect("graph output schema");
+            assert_eq!(schema["required"], json!(["status"]));
+            assert!(schema["properties"].get("nextActions").is_some());
+        }
+        assert_eq!(graph_output_schema()["required"], json!(["status"]));
+    }
+
+    fn impact_node(name: &str, role: &str, evidence_count: usize) -> ImpactNode {
+        ImpactNode {
+            logical_key: format!("key-{name}"),
+            symbol_id: Some(format!("sym-{name}")),
+            name: name.to_string(),
+            kind: "function".to_string(),
+            relative_path: format!("src/{name}.rs"),
+            start_line: 10,
+            end_line: 12,
+            source_role: role.to_string(),
+            depth: 1,
+            score: 0.9,
+            possible: false,
+            evidence: (0..evidence_count)
+                .map(|index| ImpactEvidence {
+                    relation: RelationKind::Calls,
+                    confidence: 900,
+                    resolution: "same_module_unique".to_string(),
+                    source_path: format!("src/caller_{index}.rs"),
+                    start_line: 20 + index as u64,
+                    end_line: 20 + index as u64,
+                    text: format!("target_{index}()"),
+                })
+                .collect(),
+        }
+    }
+
+    fn impact_response(direct: Vec<ImpactNode>) -> ImpactResponse {
+        ImpactResponse {
+            scope: "repo".to_string(),
+            repo: "/repo".to_string(),
+            root: impact_node("root", "production", 0),
+            direct_dependents: direct,
+            transitive_dependents: Vec::new(),
+            affected_tests: Vec::new(),
+            possible_dependents: Vec::new(),
+            possible_tests: Vec::new(),
+            ambiguities: Vec::new(),
+            coverage: RepoRelationshipCoverage {
+                repo: "/repo".to_string(),
+                graph_status: "ready".to_string(),
+                supported_files: 10,
+                references: 20,
+                definite: 15,
+                probable: 2,
+                resolution_percentage: 85.0,
+                ..RepoRelationshipCoverage::default()
+            },
+            diagnostic: None,
+            truncated: false,
+            truncation_notices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compact_impact_response_is_bounded_and_chainable() {
+        let result = impact_response(vec![impact_node("caller", "production", 3)]);
+        let value = impact_response_value(&result, GraphDetail::Compact, 1);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["counts"]["direct"], 1);
+        assert_eq!(value["directDependents"][0]["symbolId"], "sym-caller");
+        assert_eq!(value["coverage"]["graphReady"], true);
+        assert_eq!(value["coverage"]["liveAudit"], "verified");
+        assert_eq!(value["coverage"]["conclusive"], true);
+        assert_eq!(
+            value["directDependents"][0]["evidence"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(value["directDependents"][0].get("logicalKey").is_none());
+    }
+
+    #[test]
+    fn truncated_trace_never_reports_not_found() {
+        let node = impact_node("endpoint", "production", 0);
+        let response = TracePathResponse {
+            scope: "repo".to_string(),
+            repo: "/repo".to_string(),
+            from: node.clone(),
+            to: node,
+            found: false,
+            paths: Vec::new(),
+            ambiguities: Vec::new(),
+            coverage: RepoRelationshipCoverage::default(),
+            diagnostic: None,
+            truncated: true,
+            truncation_notices: vec!["bounded".to_string()],
+        };
+        assert_eq!(trace_response_status(&response), "truncated");
+    }
+
+    #[test]
+    fn empty_impact_response_recommends_coverage_and_fallback_search() {
+        let value = impact_response_value(&impact_response(Vec::new()), GraphDetail::Compact, 2);
+        assert_eq!(value["status"], "no_dependents");
+        assert_eq!(value["nextActions"][0]["tool"], "check_index_coverage");
+        assert_eq!(value["nextActions"][1]["tool"], "search_code");
+    }
+
+    #[test]
+    fn coverage_response_wraps_repositories_in_an_object() {
+        let coverage = impact_response(Vec::new()).coverage;
+        let value = coverage_response_value(&[coverage], GraphDetail::Compact, "repo");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["repositoryCount"], 1);
+        assert!(value["repositories"].is_array());
+        assert_eq!(value["repositories"][0]["liveAudit"], "verified");
+        assert_eq!(value["repositories"][0]["conclusive"], true);
     }
 
     #[test]

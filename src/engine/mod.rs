@@ -1,8 +1,11 @@
+pub mod changes;
 pub mod embedding;
 pub mod freshness;
+pub mod impact;
 pub mod lexical;
 pub mod live_files;
 pub mod milvus;
+pub mod relationships;
 pub mod splitter;
 pub mod symbols;
 
@@ -21,7 +24,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xxhash_rust::xxh3::Xxh3;
@@ -37,19 +40,26 @@ use self::lexical::{
 };
 use self::live_files::{LiveFileSnapshot, LiveFileStore, TextMatch};
 use self::milvus::{MilvusClient, SearchDocument, VectorDocument};
+use self::relationships::{
+    FileRelationshipCoverage, GraphFileReplacement, GraphStore, RawReference,
+    extract_relationships_from_tree,
+};
 use self::splitter::{
     CodeChunk, SplitterKind, default_supported_extensions, language_for_extension, split_text,
 };
-use self::symbols::{IndexedSymbol, OutlineNode, SymbolStore, build_outline, extract_symbols};
+use self::symbols::{
+    IndexedSymbol, OutlineNode, SymbolStore, build_outline, extract_symbols_with_tree,
+};
 
 const EMBEDDING_BATCH_SIZE: usize = 64;
 const SYMBOL_INDEX_REPLACEMENT_BATCH_SIZE: usize = 64;
+const GRAPH_DB_REPLACEMENT_BATCH_SIZE: usize = 64;
 const CHUNK_LIMIT: usize = 450_000;
 const RRF_K: f64 = 100.0;
 const CONTENT_HASH_ALGORITHM: &str = "xxh3_128";
 const LEGACY_CONTENT_HASH_ALGORITHM: &str = "sha256";
 const SNAPSHOT_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
-const INDEX_FORMAT_VERSION: &str = "v1";
+const INDEX_FORMAT_VERSION: &str = "v2";
 const SEARCH_ROOT_VERSION: &str = "v1";
 const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
 const SYMBOL_COLLECTION_PREFIX: &str = "hybrid_symbols_";
@@ -121,6 +131,7 @@ const PREPARE_AMBIGUOUS_PREVIEW_CHARS: usize = 120;
 const PREPARE_AMBIGUOUS_PREVIEW_BEFORE_LINES: u64 = 1;
 const PREPARE_AMBIGUOUS_PREVIEW_AFTER_LINES: u64 = 1;
 const EXPLICIT_REFRESH_MAX_FILE_PREPARE_PARALLELISM: usize = 8;
+const GRAPH_VERIFICATION_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 
 thread_local! {
     static LOW_PRIORITY_BLOCKING_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -139,7 +150,16 @@ struct EngineInner {
     local_index: LocalIndexStore,
     live_files: LiveFileStore,
     symbol_store: SymbolStore,
+    graph_store: GraphStore,
+    graph_verification_cache: Mutex<HashMap<PathBuf, GraphVerificationCacheEntry>>,
     search_budgets: SearchBudgets,
+}
+
+#[derive(Clone)]
+struct GraphVerificationCacheEntry {
+    filesystem_token: String,
+    hashes: BTreeMap<String, String>,
+    verified_at: Instant,
 }
 
 #[derive(Clone)]
@@ -166,6 +186,8 @@ pub struct RepoIndexResult {
     pub indexed_files: Option<u64>,
     pub total_chunks: Option<u64>,
     pub index_status: Option<String>,
+    pub graph_status: Option<String>,
+    pub relationship_count: Option<u64>,
     pub full_reindex: bool,
     pub changes: RepoChangeSummary,
     pub error: Option<String>,
@@ -550,6 +572,10 @@ pub struct RepoStatus {
     pub indexed_files: Option<u64>,
     pub total_chunks: Option<u64>,
     pub index_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_count: Option<u64>,
     pub indexing_percentage: Option<f64>,
     pub last_attempted_percentage: Option<f64>,
     pub error_message: Option<String>,
@@ -743,6 +769,13 @@ struct PendingSymbolIndexReplacement {
 }
 
 #[derive(Debug, Clone)]
+struct PendingGraphDatabaseReplacement {
+    relative_path: String,
+    symbols: Vec<IndexedSymbol>,
+    graph: GraphFileReplacement,
+}
+
+#[derive(Debug, Clone)]
 struct PreparedRepoFile {
     relative_path: String,
     basename: String,
@@ -751,6 +784,8 @@ struct PreparedRepoFile {
     file_hash: String,
     chunks: Vec<CodeChunk>,
     symbols: Vec<IndexedSymbol>,
+    relationships: Vec<RawReference>,
+    relationship_coverage: FileRelationshipCoverage,
 }
 
 #[derive(Debug, Clone)]
@@ -1026,6 +1061,8 @@ impl Engine {
                 ),
                 live_files: LiveFileStore::new(LIVE_FILE_CACHE_LIMIT),
                 symbol_store: SymbolStore::new(config.symbol_db_path()),
+                graph_store: GraphStore::new(config.symbol_db_path()),
+                graph_verification_cache: Mutex::new(HashMap::new()),
                 search_budgets: SearchBudgets::new(&config.search),
             }),
         })
@@ -1484,6 +1521,8 @@ impl Engine {
                                 indexed_files: None,
                                 total_chunks: None,
                                 index_status: Some("failed".to_string()),
+                                graph_status: Some("failed".to_string()),
+                                relationship_count: None,
                                 full_reindex: force,
                                 changes: RepoChangeSummary::default(),
                                 error: Some(error.to_string()),
@@ -1497,6 +1536,8 @@ impl Engine {
                             indexed_files: None,
                             total_chunks: None,
                             index_status: Some("failed".to_string()),
+                            graph_status: Some("failed".to_string()),
+                            relationship_count: None,
                             full_reindex: force,
                             changes: RepoChangeSummary::default(),
                             error: Some(error.to_string()),
@@ -1536,11 +1577,24 @@ impl Engine {
                         indexed_files: None,
                         total_chunks: None,
                         index_status: Some("failed".to_string()),
+                        graph_status: Some("failed".to_string()),
+                        relationship_count: None,
                         full_reindex: force,
                         changes: RepoChangeSummary::default(),
                         error: Some(error.to_string()),
                     });
                 }
+            }
+        }
+
+        for result in &mut results {
+            let repo = Path::new(&result.repo);
+            if repo.exists()
+                && let Ok((graph_status, relationship_count)) =
+                    self.graph_summary_for_repo(repo).await
+            {
+                result.graph_status = Some(graph_status);
+                result.relationship_count = Some(relationship_count);
             }
         }
 
@@ -1575,6 +1629,14 @@ impl Engine {
             label: scope.label,
             repos,
         })
+    }
+
+    pub async fn compact_relationship_storage(&self) -> Result<()> {
+        let graph_store = self.inner.graph_store.clone();
+        run_low_priority_blocking("compact_relationship_storage", move || {
+            graph_store.compact_storage()
+        })
+        .await
     }
 
     pub async fn explain_search(
@@ -2136,6 +2198,11 @@ impl Engine {
         scope: ResolvedScope,
         request: PrepareEditTargetRequest,
     ) -> Result<PrepareEditTargetResponse> {
+        if let Ok(mut cache) = self.inner.graph_verification_cache.lock() {
+            for repo in &scope.repos {
+                cache.remove(repo);
+            }
+        }
         let has_symbol_locator = request
             .symbol_name
             .as_deref()
@@ -3447,11 +3514,16 @@ impl Engine {
         for repo in scope.repos {
             let ctx = self.repo_context(&repo)?;
             let repo_key = repo.display().to_string();
-            let status = if ctx.overlay.is_some() {
+            let mut status = if ctx.overlay.is_some() {
                 self.status_for_worktree_overlay(&snapshot, &ctx).await?
             } else {
                 self.status_for_repo(&snapshot, &repo).await?
             };
+            if let Ok((graph_status, relationship_count)) = self.graph_summary_for_repo(&repo).await
+            {
+                status.graph_status = Some(graph_status);
+                status.relationship_count = Some(relationship_count);
+            }
             indexed_files += status.indexed_files.unwrap_or(0);
             total_chunks += status.total_chunks.unwrap_or(0);
             repos.push(RepoStatus {
@@ -3585,6 +3657,8 @@ impl Engine {
             self.remove_overlay_state_if_present(&overlay.resolution.overlay_id)
                 .await?;
         }
+        self.set_graph_state(&overlay.repo_key, "failed", None)
+            .await?;
         self.inner
             .snapshot
             .update(|snapshot| {
@@ -3606,6 +3680,8 @@ impl Engine {
             indexed_files: None,
             total_chunks: None,
             index_status: Some(index_status.to_string()),
+            graph_status: Some("failed".to_string()),
+            relationship_count: None,
             full_reindex: force,
             changes,
             error: Some(message),
@@ -3872,6 +3948,8 @@ impl Engine {
                     indexed_files: Some(0),
                     total_chunks: Some(0),
                     index_status: Some("too_large".to_string()),
+                    graph_status: Some("unavailable".to_string()),
+                    relationship_count: Some(0),
                     full_reindex: false,
                     changes,
                     error: None,
@@ -3879,6 +3957,8 @@ impl Engine {
             }
 
             self.clear_worktree_overlay_indexes(overlay).await?;
+            self.set_graph_state(&overlay.repo_key, "updating", None)
+                .await?;
             if !to_index.is_empty() {
                 self.inner
                     .milvus
@@ -3937,6 +4017,17 @@ impl Engine {
                 embedding_profile: Some(profile_name.clone()),
                 embedding_fingerprint: Some(configured_embedding_fingerprint.clone()),
             };
+            let suppressed_paths = overlay_suppressed_paths(&state);
+            self.resolve_overlay_graph(
+                &overlay.storage_root,
+                &overlay.repo_key,
+                &canonical_key,
+                &suppressed_paths,
+            )
+            .await?;
+            let graph_root_hash = build_root_hash(&overlay_indexed_hashes(&canonical_hashes, &state));
+            self.set_graph_state(&overlay.repo_key, "ready", Some(&graph_root_hash))
+                .await?;
             let overlay_storage_root = overlay.storage_root.clone();
             let local_index = self.inner.local_index.clone();
             let chunk_coverage =
@@ -3987,6 +4078,8 @@ impl Engine {
                 indexed_files: Some(coverage.indexed_files),
                 total_chunks: Some(coverage.total_chunks),
                 index_status: Some(index_status),
+                graph_status: Some("ready".to_string()),
+                relationship_count: None,
                 full_reindex: false,
                 changes,
                 error: None,
@@ -4108,6 +4201,8 @@ impl Engine {
         };
         let full_reindex = force || !collection_exists || previous_snapshot.is_none();
 
+        self.set_graph_state(&repo_key, "updating", None).await?;
+
         let outcome = async {
             if full_reindex {
                 if collection_exists {
@@ -4131,6 +4226,13 @@ impl Engine {
                     symbol_store.clear_repo(&repo_key_for_symbols)
                 })
                 .await?;
+                let graph_store = self.inner.graph_store.clone();
+                let repo_key_for_graph = repo_key.clone();
+                run_low_priority_blocking("clear_repo_graph", move || {
+                    graph_store.clear_repo(&repo_key_for_graph)
+                })
+                .await?;
+                self.set_graph_state(&repo_key, "updating", None).await?;
                 self.inner
                     .milvus
                     .create_hybrid_collection(
@@ -4171,7 +4273,11 @@ impl Engine {
                     .filter(|(path, _)| processing.indexed_paths.contains(*path))
                     .map(|(path, hash)| (path.clone(), hash.clone()))
                     .collect::<BTreeMap<_, _>>();
+                self.resolve_graph(repo, &repo_key, &[]).await?;
                 save_merkle_snapshot(&merkle_path, &indexed_hashes).await?;
+                let graph_root_hash = build_root_hash(&indexed_hashes);
+                self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
+                    .await?;
                 let changes = RepoChangeSummary {
                     added: processing.processed_files,
                     modified: 0,
@@ -4247,9 +4353,20 @@ impl Engine {
                     .await?;
                     let symbol_store = self.inner.symbol_store.clone();
                     let repo_key_for_symbols = repo_key.clone();
+                    let symbol_paths = deleted_paths.clone();
                     run_low_priority_blocking("delete_symbol_rows", move || {
-                        for path in deleted_paths {
+                        for path in symbol_paths {
                             symbol_store.delete_file(&repo_key_for_symbols, &path)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    let graph_store = self.inner.graph_store.clone();
+                    let repo_key_for_graph = repo_key.clone();
+                    let graph_paths = deleted_paths.clone();
+                    run_low_priority_blocking("delete_graph_rows", move || {
+                        for path in graph_paths {
+                            graph_store.delete_file(&repo_key_for_graph, &path)?;
                         }
                         Ok(())
                     })
@@ -4292,7 +4409,23 @@ impl Engine {
                         persisted_hashes.insert(relative_path.clone(), hash.clone());
                     }
                 }
+                let mut graph_refresh_paths = deleted_paths;
+                graph_refresh_paths.extend(processing.indexed_paths.iter().cloned());
+                graph_refresh_paths.sort();
+                graph_refresh_paths.dedup();
+                if !graph_refresh_paths.is_empty() {
+                    self.resolve_graph(repo, &repo_key, &graph_refresh_paths)
+                        .await?;
+                }
+                self.maintain_incremental_relationship_storage(
+                    &repo_key,
+                    !graph_refresh_paths.is_empty(),
+                )
+                .await?;
                 save_merkle_snapshot(&merkle_path, &persisted_hashes).await?;
+                let graph_root_hash = build_root_hash(&persisted_hashes);
+                self.set_graph_state(&repo_key, "ready", Some(&graph_root_hash))
+                    .await?;
                 let repo_path = repo.to_path_buf();
                 let local_index = self.inner.local_index.clone();
                 let chunk_coverage =
@@ -4358,6 +4491,8 @@ impl Engine {
                         indexed_files: None,
                         total_chunks: None,
                         index_status: Some("failed".to_string()),
+                        graph_status: Some("failed".to_string()),
+                        relationship_count: None,
                         full_reindex,
                         changes,
                         error: Some(message),
@@ -4400,13 +4535,15 @@ impl Engine {
                     indexed_files: Some(coverage.indexed_files),
                     total_chunks: Some(coverage.total_chunks),
                     index_status: Some(index_status),
+                    graph_status: Some("ready".to_string()),
+                    relationship_count: None,
                     full_reindex,
                     changes,
                     error: None,
                 })
             }
             Err(error) => {
-                let message = error.to_string();
+                let message = format!("{error:#}");
                 self.inner
                     .snapshot
                     .update(|snapshot| {
@@ -4431,6 +4568,8 @@ impl Engine {
                     indexed_files: None,
                     total_chunks: None,
                     index_status: Some("failed".to_string()),
+                    graph_status: Some("failed".to_string()),
+                    relationship_count: None,
                     full_reindex,
                     changes: RepoChangeSummary::default(),
                     error: Some(message),
@@ -4547,6 +4686,12 @@ impl Engine {
             symbol_store.clear_repo(&repo_key_clone)
         })
         .await?;
+        let graph_store = self.inner.graph_store.clone();
+        let graph_repo_key = repo_key.clone();
+        run_low_priority_blocking("clear_repo_graph_rows", move || {
+            graph_store.clear_repo(&graph_repo_key)
+        })
+        .await?;
 
         let merkle_path = merkle_snapshot_path(&self.inner.config.merkle_dir(), repo);
         if merkle_path.exists() {
@@ -4591,6 +4736,12 @@ impl Engine {
         let symbol_store = self.inner.symbol_store.clone();
         run_low_priority_blocking("clear_overlay_symbol_rows", move || {
             symbol_store.clear_repo(&overlay_repo_key)
+        })
+        .await?;
+        let graph_store = self.inner.graph_store.clone();
+        let overlay_graph_key = overlay.repo_key.clone();
+        run_low_priority_blocking("clear_overlay_graph_rows", move || {
+            graph_store.clear_repo(&overlay_graph_key)
         })
         .await
     }
@@ -5169,6 +5320,8 @@ impl Engine {
                 indexed_files: None,
                 total_chunks: None,
                 index_status: None,
+                graph_status: None,
+                relationship_count: None,
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
@@ -5195,6 +5348,8 @@ impl Engine {
                 indexed_files: entry.indexed_files,
                 total_chunks: entry.total_chunks,
                 index_status: entry.index_status,
+                graph_status: None,
+                relationship_count: None,
                 indexing_percentage: entry.indexing_percentage,
                 last_attempted_percentage: entry.last_attempted_percentage,
                 error_message: entry.error_message,
@@ -5218,6 +5373,8 @@ impl Engine {
                 indexed_files: None,
                 total_chunks: None,
                 index_status: None,
+                graph_status: None,
+                relationship_count: None,
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
@@ -5292,6 +5449,8 @@ impl Engine {
                     .or(entry.changed_files),
                 total_chunks: coverage.as_ref().map(|coverage| coverage.total_chunks),
                 index_status: entry.overlay_status.clone(),
+                graph_status: None,
+                relationship_count: None,
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: entry.overlay_mismatch_reason.clone(),
@@ -5315,6 +5474,8 @@ impl Engine {
                 indexed_files: None,
                 total_chunks: None,
                 index_status: Some(default_overlay_status.to_string()),
+                graph_status: None,
+                relationship_count: None,
                 indexing_percentage: None,
                 last_attempted_percentage: None,
                 error_message: None,
@@ -5419,21 +5580,154 @@ impl Engine {
         Ok(())
     }
 
-    async fn write_file_symbols(
+    async fn flush_graph_database_replacements(
         &self,
         repo_key: &str,
-        relative_path: &str,
-        symbols: &[IndexedSymbol],
+        pending: &mut Vec<PendingGraphDatabaseReplacement>,
     ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
         let repo_key = repo_key.to_string();
-        let relative_path = relative_path.to_string();
         let symbol_store = self.inner.symbol_store.clone();
-        let symbols = symbols.to_vec();
-        run_low_priority_blocking("write_file_symbols", move || {
-            symbol_store.replace_file_symbols(&repo_key, &relative_path, &symbols)?;
-            Ok(())
+        let graph_store = self.inner.graph_store.clone();
+        let replacements = std::mem::take(pending);
+        run_low_priority_blocking("write_graph_database_batch", move || {
+            let symbol_replacements = replacements
+                .iter()
+                .map(|replacement| {
+                    (
+                        replacement.relative_path.clone(),
+                        replacement.symbols.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let graph_replacements = replacements
+                .into_iter()
+                .map(|replacement| replacement.graph)
+                .collect::<Vec<_>>();
+            symbol_store.replace_files_symbols(&repo_key, &symbol_replacements)?;
+            graph_store.replace_files(&repo_key, &graph_replacements)
         })
         .await
+    }
+
+    async fn resolve_graph(
+        &self,
+        storage_repo: &Path,
+        repo_key: &str,
+        refresh_paths: &[String],
+    ) -> Result<()> {
+        let graph_store = self.inner.graph_store.clone();
+        let local_index = self.inner.local_index.clone();
+        let storage_repo = storage_repo.to_path_buf();
+        let repo_key = repo_key.to_string();
+        let refresh_paths = refresh_paths.to_vec();
+        run_low_priority_blocking("resolve_relationship_graph", move || {
+            let mut source_paths = if refresh_paths.is_empty() {
+                graph_store.resolve_repo(&repo_key)?;
+                graph_store.source_paths(&repo_key)?
+            } else {
+                graph_store.resolve_repo_paths(&repo_key, &refresh_paths)?
+            };
+            let relations =
+                graph_store.relation_documents_for_source_paths(&repo_key, &source_paths)?;
+            source_paths.extend(refresh_paths);
+            source_paths.sort();
+            source_paths.dedup();
+            local_index.replace_relation_docs_for_paths(&storage_repo, &source_paths, &relations)
+        })
+        .await
+    }
+
+    async fn resolve_overlay_graph(
+        &self,
+        storage_repo: &Path,
+        repo_key: &str,
+        canonical_key: &str,
+        suppressed_paths: &BTreeSet<String>,
+    ) -> Result<()> {
+        let graph_store = self.inner.graph_store.clone();
+        let local_index = self.inner.local_index.clone();
+        let storage_repo = storage_repo.to_path_buf();
+        let repo_key = repo_key.to_string();
+        let canonical_key = canonical_key.to_string();
+        let suppressed_paths = suppressed_paths.clone();
+        run_low_priority_blocking("resolve_overlay_relationship_graph", move || {
+            graph_store.resolve_repo_with_fallback(&repo_key, &canonical_key, &suppressed_paths)?;
+            let relations = graph_store.all_relation_documents(&repo_key)?;
+            let source_paths = graph_store.source_paths(&repo_key)?;
+            local_index.replace_relation_docs_for_paths(&storage_repo, &source_paths, &relations)
+        })
+        .await
+    }
+
+    async fn maintain_incremental_relationship_storage(
+        &self,
+        repo_key: &str,
+        graph_changed: bool,
+    ) -> Result<()> {
+        let graph_store = self.inner.graph_store.clone();
+        let repo_key = repo_key.to_string();
+        run_low_priority_blocking("maintain_incremental_relationship_storage", move || {
+            graph_store.maintain_incremental_storage(&repo_key, graph_changed)
+        })
+        .await
+    }
+
+    async fn set_graph_state(
+        &self,
+        repo_key: &str,
+        status: &str,
+        root_hash: Option<&str>,
+    ) -> Result<()> {
+        let graph_store = self.inner.graph_store.clone();
+        let repo_key = repo_key.to_string();
+        let cache_key = PathBuf::from(&repo_key);
+        let status = status.to_string();
+        let root_hash = root_hash.map(ToString::to_string);
+        run_low_priority_blocking("set_relationship_graph_state", move || {
+            graph_store.set_state(&repo_key, &status, root_hash.as_deref())
+        })
+        .await?;
+        self.inner
+            .graph_verification_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph verification cache poisoned"))?
+            .remove(&cache_key);
+        Ok(())
+    }
+
+    async fn graph_summary_for_repo(&self, repo: &Path) -> Result<(String, u64)> {
+        let ctx = self.repo_context(repo)?;
+        let graph = self.inner.graph_store.clone();
+        if let Some(overlay) = ctx.overlay {
+            let overlay_key = overlay.repo_key;
+            let canonical_key = ctx.canonical_root.display().to_string();
+            let overlay_graph = graph.clone();
+            let canonical_graph = graph.clone();
+            let (overlay, canonical) = tokio::try_join!(
+                run_low_priority_blocking("overlay_graph_summary", move || {
+                    overlay_graph.coverage_cached(&overlay_key)
+                }),
+                run_low_priority_blocking("canonical_graph_summary", move || {
+                    canonical_graph.coverage_cached(&canonical_key)
+                })
+            )?;
+            let status = if overlay.graph_status == "ready" && canonical.graph_status == "ready" {
+                "ready".to_string()
+            } else {
+                format!(
+                    "overlay:{},canonical:{}",
+                    overlay.graph_status, canonical.graph_status
+                )
+            };
+            return Ok((status, overlay.references + canonical.references));
+        }
+        let key = ctx.canonical_root.display().to_string();
+        let coverage =
+            run_low_priority_blocking("graph_summary", move || graph.coverage_cached(&key)).await?;
+        Ok((coverage.graph_status, coverage.references))
     }
 
     async fn flush_symbol_index_replacements(
@@ -5464,6 +5758,7 @@ impl Engine {
         let mut pending_chunks = Vec::new();
         let mut pending_symbols = Vec::new();
         let mut pending_symbol_index_replacements = Vec::new();
+        let mut pending_graph_database_replacements = Vec::new();
         let mut indexed_paths = HashSet::new();
         let mut processed_files = 0u64;
         let mut total_chunks = 0u64;
@@ -5494,8 +5789,6 @@ impl Engine {
                 status = IndexCompletionStatus::LimitReached;
                 break;
             }
-            self.write_file_symbols(plan.repo_key, &prepared.relative_path, &prepared.symbols)
-                .await?;
             let symbol_index_docs = prepared
                 .symbols
                 .iter()
@@ -5542,6 +5835,24 @@ impl Engine {
                 }
             }
 
+            pending_graph_database_replacements.push(PendingGraphDatabaseReplacement {
+                relative_path: prepared.relative_path.clone(),
+                symbols: prepared.symbols,
+                graph: GraphFileReplacement {
+                    relative_path: prepared.relative_path.clone(),
+                    references: prepared.relationships,
+                    coverage: prepared.relationship_coverage,
+                    file_hash: prepared.file_hash.clone(),
+                },
+            });
+            if pending_graph_database_replacements.len() >= GRAPH_DB_REPLACEMENT_BATCH_SIZE {
+                self.flush_graph_database_replacements(
+                    plan.repo_key,
+                    &mut pending_graph_database_replacements,
+                )
+                .await?;
+            }
+
             for chunk in prepared.chunks {
                 pending_chunks.push(PendingChunk {
                     chunk,
@@ -5572,6 +5883,13 @@ impl Engine {
             }
         }
 
+        if !pending_graph_database_replacements.is_empty() {
+            self.flush_graph_database_replacements(
+                plan.repo_key,
+                &mut pending_graph_database_replacements,
+            )
+            .await?;
+        }
         if !pending_chunks.is_empty() {
             self.flush_chunks(
                 plan.repo,
@@ -5638,9 +5956,9 @@ impl Engine {
         let indexed_at_for_task = indexed_at.clone();
         let text_for_task = text;
         let file_hash_for_task = file_hash.clone();
-        let (chunks, symbols) = tokio::task::spawn_blocking(move || {
+        let (chunks, symbols, relationships) = tokio::task::spawn_blocking(move || {
             let chunks = split_text(&absolute_path, &text_for_task, splitter)?;
-            let symbols = extract_symbols(
+            let (symbols, tree) = extract_symbols_with_tree(
                 &repo_key,
                 &relative_path_for_task,
                 &absolute_path,
@@ -5648,7 +5966,16 @@ impl Engine {
                 &indexed_at_for_task,
                 &file_hash_for_task,
             )?;
-            Ok::<_, anyhow::Error>((chunks, symbols))
+            let relationships = extract_relationships_from_tree(
+                &repo_key,
+                &relative_path_for_task,
+                &absolute_path,
+                &text_for_task,
+                &symbols,
+                &file_hash_for_task,
+                tree.as_ref(),
+            )?;
+            Ok::<_, anyhow::Error>((chunks, symbols, relationships))
         })
         .await
         .context("joining file preparation task")??;
@@ -5661,6 +5988,8 @@ impl Engine {
             file_hash,
             chunks,
             symbols,
+            relationships: relationships.references,
+            relationship_coverage: relationships.coverage,
         }))
     }
 
@@ -5908,6 +6237,20 @@ fn overlay_suppressed_paths(state: &OverlayIndexState) -> BTreeSet<String> {
         .collect()
 }
 
+fn overlay_indexed_hashes(
+    canonical_hashes: &BTreeMap<String, String>,
+    state: &OverlayIndexState,
+) -> BTreeMap<String, String> {
+    let suppressed = overlay_suppressed_paths(state);
+    let mut hashes = canonical_hashes
+        .iter()
+        .filter(|(path, _)| !suppressed.contains(*path))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect::<BTreeMap<_, _>>();
+    hashes.extend(state.indexed_hashes.iter().cloned());
+    hashes
+}
+
 fn overlay_state_suppresses_canonical(state: &OverlayIndexState) -> bool {
     matches!(
         state.overlay_status.as_deref(),
@@ -5991,6 +6334,8 @@ fn removed_repo_index_result(repo: &Path, removed_files: u64, force: bool) -> Re
         indexed_files: None,
         total_chunks: None,
         index_status: Some(REMOVED_REPO_INDEX_STATUS.to_string()),
+        graph_status: Some("missing".to_string()),
+        relationship_count: Some(0),
         full_reindex: force,
         changes: RepoChangeSummary {
             added: 0,
@@ -6022,11 +6367,13 @@ pub fn render_index_text(result: &ScopeIndexResult) -> String {
         match &repo.error {
             Some(error) => lines.push(format!("FAIL {}: {}", repo.repo, error)),
             None => lines.push(format!(
-                "OK {} files={} chunks={} index_status={} full_reindex={} added={} modified={} removed={}",
+                "OK {} files={} chunks={} index_status={} graph_status={} relationships={} full_reindex={} added={} modified={} removed={}",
                 repo.repo,
                 repo.indexed_files.unwrap_or(0),
                 repo.total_chunks.unwrap_or(0),
                 repo.index_status.as_deref().unwrap_or("unknown"),
+                repo.graph_status.as_deref().unwrap_or("unknown"),
+                repo.relationship_count.unwrap_or(0),
                 repo.full_reindex,
                 repo.changes.added,
                 repo.changes.modified,
@@ -6147,10 +6494,12 @@ pub fn render_status_text(result: &StatusReport) -> String {
             String::new()
         };
         lines.push(format!(
-            "{} status={} index_status={} files={} chunks={}{}{}{}",
+            "{} status={} index_status={} graph_status={} relationships={} files={} chunks={}{}{}{}",
             repo.repo,
             repo.status,
             repo.index_status.as_deref().unwrap_or("unknown"),
+            repo.graph_status.as_deref().unwrap_or("unknown"),
+            repo.relationship_count.unwrap_or(0),
             repo.indexed_files.unwrap_or(0),
             repo.total_chunks.unwrap_or(0),
             progress_suffix,
@@ -7924,16 +8273,17 @@ fn diff_files(previous: &BTreeMap<String, String>, current: &BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode, IndexCompletionStatus,
-        IndexCoverage, IndexExecutionMode, LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot,
-        OverlayIndexState, QueryProfileUsage, SearchBudgets, SearchMode, SearchRequest, TextMatch,
-        TextSearchScopeRequest, apply_query_embedding_failure, bounded_window,
-        build_chunk_context_snippet, build_root_hash, chunk_id, classify_query,
-        collect_live_candidate_files, collection_name, diff_files, expected_vector_collections,
-        failed_overlay_state, hash_text_like_file, index_identity_status_for_snapshot,
-        index_status_for_coverage, is_agent_context_vector_collection, live_file_exists,
-        merge_text_candidate_files, narrowest_covering_symbol, overlay_lookup_uses_overlay,
-        overlay_state_has_indexed_path, overlay_state_has_search_index, overlay_state_load_warning,
+        CONTENT_HASH_ALGORITHM, EditTargetAnchor, EditTargetReasonCode,
+        GRAPH_DB_REPLACEMENT_BATCH_SIZE, IndexCompletionStatus, IndexCoverage, IndexExecutionMode,
+        LEGACY_CONTENT_HASH_ALGORITHM, MerkleSnapshot, OverlayIndexState, QueryProfileUsage,
+        SearchBudgets, SearchMode, SearchRequest, TextMatch, TextSearchScopeRequest,
+        apply_query_embedding_failure, bounded_window, build_chunk_context_snippet,
+        build_root_hash, chunk_id, classify_query, collect_live_candidate_files, collection_name,
+        diff_files, expected_vector_collections, failed_overlay_state, hash_text_like_file,
+        index_identity_status_for_snapshot, index_status_for_coverage,
+        is_agent_context_vector_collection, live_file_exists, merge_text_candidate_files,
+        narrowest_covering_symbol, overlay_lookup_uses_overlay, overlay_state_has_indexed_path,
+        overlay_state_has_search_index, overlay_state_load_warning,
         overlay_state_suppresses_canonical, plan_search, ready_target_reason,
         removed_repo_index_result, run_low_priority_blocking, scan_repo,
         search_text_scans_live_repo, select_edit_anchors, select_text_match,
@@ -8025,6 +8375,7 @@ mod tests {
     fn narrowest_covering_symbol_prefers_inner_symbol() {
         let outer = IndexedSymbol {
             symbol_id: "outer".to_string(),
+            logical_key: "outer-key".to_string(),
             repo: "/tmp/repo".to_string(),
             relative_path: "src/lib.rs".to_string(),
             name: "outer".to_string(),
@@ -8036,9 +8387,15 @@ mod tests {
             indexed_at: "2026-01-01T00:00:00Z".to_string(),
             file_hash: "hash".to_string(),
             parent_symbol_id: None,
+            parent_logical_key: None,
+            qualified_name: "outer".to_string(),
+            signature: "fn outer()".to_string(),
+            source_role: "production".to_string(),
+            identity_stable: true,
         };
         let inner = IndexedSymbol {
             symbol_id: "inner".to_string(),
+            logical_key: "inner-key".to_string(),
             repo: "/tmp/repo".to_string(),
             relative_path: "src/lib.rs".to_string(),
             name: "inner".to_string(),
@@ -8050,6 +8407,11 @@ mod tests {
             indexed_at: "2026-01-01T00:00:00Z".to_string(),
             file_hash: "hash".to_string(),
             parent_symbol_id: Some("outer".to_string()),
+            parent_logical_key: Some("outer-key".to_string()),
+            qualified_name: "outer::inner".to_string(),
+            signature: "fn inner()".to_string(),
+            source_role: "production".to_string(),
+            identity_stable: true,
         };
 
         let symbols = [outer, inner];
@@ -8061,6 +8423,7 @@ mod tests {
     fn symbol_ready_window_requires_selected_match_to_fit_budget() {
         let symbol = IndexedSymbol {
             symbol_id: "helper".to_string(),
+            logical_key: "helper-key".to_string(),
             repo: "/tmp/repo".to_string(),
             relative_path: "src/lib.rs".to_string(),
             name: "helper".to_string(),
@@ -8072,6 +8435,11 @@ mod tests {
             indexed_at: "2026-01-01T00:00:00Z".to_string(),
             file_hash: "hash".to_string(),
             parent_symbol_id: None,
+            parent_logical_key: None,
+            qualified_name: "helper".to_string(),
+            signature: "fn helper()".to_string(),
+            source_role: "production".to_string(),
+            identity_stable: true,
         };
         let selected = TextMatch {
             start_byte: 120,
@@ -8880,7 +9248,7 @@ mod tests {
     fn identity_status_uses_actual_default_profile_for_legacy_fingerprint() {
         let snapshot = Snapshot {
             format_version: "v3".to_string(),
-            index_format_version: "v1".to_string(),
+            index_format_version: super::INDEX_FORMAT_VERSION.to_string(),
             search_root_version: "v1".to_string(),
             embedding_fingerprint: Some("hosted-fingerprint".to_string()),
             ..Snapshot::default()
@@ -8900,7 +9268,7 @@ mod tests {
     fn identity_status_mismatch_mentions_default_profile() {
         let snapshot = Snapshot {
             format_version: "v3".to_string(),
-            index_format_version: "v1".to_string(),
+            index_format_version: super::INDEX_FORMAT_VERSION.to_string(),
             search_root_version: "v1".to_string(),
             embedding_fingerprint: Some("old-fingerprint".to_string()),
             ..Snapshot::default()
@@ -9219,5 +9587,496 @@ mod tests {
             ));
         }
         fs::write(&output_path, lines.join("\n") + "\n").expect("write benchmark output");
+    }
+
+    #[test]
+    #[ignore = "manual graph benchmark"]
+    fn bench_relationship_graph_manual() {
+        use crate::engine::lexical::LocalIndexStore;
+        use crate::engine::relationships::{
+            GraphFileReplacement, GraphStore, extract_relationships_from_tree,
+        };
+        use crate::engine::symbols::{SymbolStore, extract_symbols_with_tree};
+        use std::time::Instant;
+
+        fn directory_bytes(path: &Path) -> u64 {
+            let Ok(entries) = fs::read_dir(path) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    entry
+                        .file_type()
+                        .ok()
+                        .filter(|kind| kind.is_dir())
+                        .map_or_else(
+                            || entry.metadata().map(|value| value.len()).unwrap_or(0),
+                            |_| directory_bytes(&entry.path()),
+                        )
+                })
+                .sum()
+        }
+
+        let repo = PathBuf::from(
+            std::env::var("CC_GRAPH_BENCH_REPO")
+                .expect("set CC_GRAPH_BENCH_REPO to an absolute repository path"),
+        );
+        let output = PathBuf::from(
+            std::env::var("CC_GRAPH_BENCH_OUTPUT_DIR")
+                .expect("set CC_GRAPH_BENCH_OUTPUT_DIR to an empty output directory"),
+        );
+        fs::create_dir_all(&output).expect("create graph benchmark output directory");
+        let index_root = output.join("index");
+        fs::create_dir_all(&index_root).expect("create benchmark index directory");
+        let database = index_root.join("symbols.sqlite3");
+        assert!(!database.exists(), "benchmark database already exists");
+
+        let scan_started = Instant::now();
+        let files = scan_repo(&repo, &[], &[], &conservative_index_policy())
+            .expect("scan benchmark repository");
+        let scan_elapsed = scan_started.elapsed();
+        let graph_root_hash = build_root_hash(
+            &files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.hash.clone()))
+                .collect(),
+        );
+        let repo_key = repo.display().to_string();
+        let symbols = SymbolStore::new(database.clone());
+        let graph = GraphStore::new(database.clone());
+        graph
+            .set_state(&repo_key, "updating", None)
+            .expect("mark graph updating");
+
+        let prepare_started = Instant::now();
+        let mut analyzed_files = 0usize;
+        let mut symbol_count = 0usize;
+        let mut reference_count = 0usize;
+        let mut pending_symbols = Vec::new();
+        let mut pending_graph = Vec::new();
+        for (relative_path, file) in &files {
+            let extension = file
+                .absolute_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if !matches!(extension, "rs" | "ts" | "tsx" | "mts" | "cts") {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(&file.absolute_path) else {
+                continue;
+            };
+            let (file_symbols, tree) = extract_symbols_with_tree(
+                &repo_key,
+                relative_path,
+                &file.absolute_path,
+                &source,
+                "bench",
+                &file.hash,
+            )
+            .expect("extract benchmark symbols");
+            let extracted = extract_relationships_from_tree(
+                &repo_key,
+                relative_path,
+                &file.absolute_path,
+                &source,
+                &file_symbols,
+                &file.hash,
+                tree.as_ref(),
+            )
+            .expect("extract benchmark relationships");
+            analyzed_files += 1;
+            symbol_count += file_symbols.len();
+            reference_count += extracted.references.len();
+            pending_symbols.push((relative_path.clone(), file_symbols));
+            pending_graph.push(GraphFileReplacement {
+                relative_path: relative_path.clone(),
+                references: extracted.references,
+                coverage: extracted.coverage,
+                file_hash: file.hash.clone(),
+            });
+            if pending_graph.len() >= GRAPH_DB_REPLACEMENT_BATCH_SIZE {
+                symbols
+                    .replace_files_symbols(&repo_key, &pending_symbols)
+                    .expect("write benchmark symbol batch");
+                graph
+                    .replace_files(&repo_key, &pending_graph)
+                    .expect("write benchmark graph batch");
+                pending_symbols.clear();
+                pending_graph.clear();
+            }
+            if analyzed_files.is_multiple_of(250) {
+                eprintln!("graph benchmark prepared {analyzed_files} files");
+            }
+        }
+        symbols
+            .replace_files_symbols(&repo_key, &pending_symbols)
+            .expect("write final benchmark symbol batch");
+        graph
+            .replace_files(&repo_key, &pending_graph)
+            .expect("write final benchmark graph batch");
+        let prepare_elapsed = prepare_started.elapsed();
+
+        let resolve_started = Instant::now();
+        graph
+            .resolve_repo(&repo_key)
+            .expect("resolve benchmark graph");
+        graph
+            .set_state(&repo_key, "ready", Some(&graph_root_hash))
+            .expect("mark graph ready");
+        let resolve_elapsed = resolve_started.elapsed();
+        let relations = graph.all_relations(&repo_key).expect("load graph edges");
+        let relationship_documents = graph
+            .all_relation_documents(&repo_key)
+            .expect("load graph relationship documents");
+        let edge_count = relations.len();
+
+        let index_started = Instant::now();
+        let local_index = LocalIndexStore::new(index_root.clone(), 4);
+        local_index
+            .replace_relation_docs_for_paths(
+                &repo,
+                &graph.source_paths(&repo_key).expect("load source paths"),
+                &relationship_documents,
+            )
+            .expect("build relationship evidence index");
+        let index_elapsed = index_started.elapsed();
+
+        let mut inbound_counts = BTreeMap::<String, usize>::new();
+        for relation in &relations {
+            if let Some(target) = relation.target_key.as_ref() {
+                *inbound_counts.entry(target.clone()).or_default() += 1;
+            }
+        }
+        let representative = inbound_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(key, _)| key)
+            .expect("benchmark graph should contain an edge");
+        let root_symbol = symbols
+            .symbols_by_logical_keys(&repo_key, std::slice::from_ref(&representative))
+            .expect("load representative graph symbol")
+            .into_iter()
+            .next()
+            .expect("representative target should be a symbol");
+        let trace_edge = relations
+            .iter()
+            .find(|relation| {
+                relation.confidence >= 650
+                    && relation.source_symbol_id.is_some()
+                    && relation.target_symbol_id.is_some()
+            })
+            .expect("benchmark graph should contain a traceable edge")
+            .clone();
+        let query_started = Instant::now();
+        let mut returned = 0usize;
+        for _ in 0..1_000 {
+            returned += graph
+                .relations_to(&repo_key, std::slice::from_ref(&representative), 650, 101)
+                .expect("query reverse frontier")
+                .len();
+        }
+        let query_elapsed = query_started.elapsed();
+        let cache_started = Instant::now();
+        for _ in 0..1_000 {
+            graph
+                .coverage_cached(&repo_key)
+                .expect("load cached coverage");
+        }
+        let cache_elapsed = cache_started.elapsed();
+        let coverage_started = Instant::now();
+        let coverage = graph.coverage(&repo_key).expect("calculate coverage");
+        let coverage_elapsed = coverage_started.elapsed();
+
+        let config_path = output.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+snapshot_path = "./snapshot.json"
+index_root = "./index"
+
+[embedding]
+provider = "ollama"
+model = "benchmark"
+
+[embedding.ollama]
+base_url = "http://127.0.0.1:1"
+dimensions = 8
+
+[milvus]
+address = "127.0.0.1:1"
+
+[worktrees]
+mode = "full"
+
+[[groups]]
+id = "benchmark"
+repos = ["{}"]
+"#,
+                repo.display()
+            ),
+        )
+        .expect("write benchmark config");
+        let config = crate::config::Config::load_from_path(&config_path)
+            .expect("load isolated benchmark config");
+        let runtime = tokio::runtime::Runtime::new().expect("create benchmark runtime");
+        let engine = runtime
+            .block_on(super::Engine::new(&config))
+            .expect("create isolated benchmark engine");
+        let scope = ResolvedScope {
+            kind: ScopeKind::Repo,
+            id: repo_key.clone(),
+            label: "benchmark".to_string(),
+            repos: vec![repo.clone()],
+        };
+        let impact_started = Instant::now();
+        let impact = runtime
+            .block_on(engine.analyze_impact(
+                scope.clone(),
+                crate::engine::impact::ImpactRequest {
+                    repo: Some(repo_key.clone()),
+                    symbol_id: Some(root_symbol.symbol_id),
+                    file: None,
+                    line: None,
+                    max_depth: 2,
+                    max_nodes: 50,
+                    include_tests: true,
+                    min_confidence: 650,
+                    include_possible: false,
+                },
+            ))
+            .expect("run isolated Scryer impact analysis");
+        let impact_elapsed = impact_started.elapsed();
+        assert!(impact.diagnostic.is_none());
+        let impact_nodes = impact.direct_dependents.len()
+            + impact.transitive_dependents.len()
+            + impact.affected_tests.len();
+        let trace_started = Instant::now();
+        let trace = runtime
+            .block_on(engine.trace_dependency_path(
+                scope,
+                crate::engine::impact::TracePathRequest {
+                    repo: Some(repo_key.clone()),
+                    from_symbol_id: trace_edge.source_symbol_id,
+                    from_file: None,
+                    from_line: None,
+                    to_symbol_id: trace_edge.target_symbol_id,
+                    to_file: None,
+                    to_line: None,
+                    max_depth: 5,
+                    max_paths: 3,
+                    min_confidence: 650,
+                },
+            ))
+            .expect("run isolated Scryer dependency trace");
+        let trace_elapsed = trace_started.elapsed();
+        assert!(trace.found);
+
+        let report = format!(
+            concat!(
+                "repo={}\nscanned_files={}\nanalyzed_files={}\nsymbols={}\n",
+                "references={}\nedges={}\nscan_ms={}\nprepare_ms={}\nresolve_ms={}\n",
+                "tantivy_build_ms={}\nreverse_1000_ms={}\nreverse_total_rows={}\n",
+                "cached_coverage_1000_ms={}\nfull_coverage_ms={}\nresolution_percentage={:.3}\n",
+                "impact_ms={}\nimpact_nodes={}\ntrace_ms={}\ntrace_paths={}\n",
+                "sqlite_bytes={}\nrelationship_index_bytes={}\n"
+            ),
+            repo.display(),
+            files.len(),
+            analyzed_files,
+            symbol_count,
+            reference_count,
+            edge_count,
+            scan_elapsed.as_millis(),
+            prepare_elapsed.as_millis(),
+            resolve_elapsed.as_millis(),
+            index_elapsed.as_millis(),
+            query_elapsed.as_millis(),
+            returned,
+            cache_elapsed.as_millis(),
+            coverage_elapsed.as_millis(),
+            coverage.resolution_percentage,
+            impact_elapsed.as_millis(),
+            impact_nodes,
+            trace_elapsed.as_millis(),
+            trace.paths.len(),
+            fs::metadata(&database)
+                .map(|value| value.len())
+                .unwrap_or(0),
+            directory_bytes(&index_root).saturating_sub(
+                fs::metadata(&database)
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+            ),
+        );
+        fs::write(output.join("report.txt"), &report).expect("write graph benchmark report");
+        eprintln!("{report}");
+    }
+
+    #[test]
+    #[ignore = "manual graph query benchmark"]
+    fn bench_relationship_queries_manual() {
+        use crate::engine::impact::{ImpactRequest, TracePathRequest};
+        use crate::engine::relationships::GraphStore;
+        use crate::engine::symbols::SymbolStore;
+        use std::time::Instant;
+
+        fn percentile(samples: &[u128], numerator: usize, denominator: usize) -> u128 {
+            let index = (samples.len().saturating_sub(1) * numerator) / denominator;
+            samples[index]
+        }
+
+        let repo = PathBuf::from(
+            std::env::var("CC_GRAPH_BENCH_REPO")
+                .expect("set CC_GRAPH_BENCH_REPO to an absolute repository path"),
+        );
+        let output = PathBuf::from(
+            std::env::var("CC_GRAPH_BENCH_OUTPUT_DIR")
+                .expect("set CC_GRAPH_BENCH_OUTPUT_DIR to a completed benchmark directory"),
+        );
+        let iterations = std::env::var("CC_GRAPH_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(5, 1_000);
+        let repo_key = repo.display().to_string();
+        let database = output.join("index/symbols.sqlite3");
+        let graph = GraphStore::new(database.clone());
+        let symbols = SymbolStore::new(database);
+        let relations = graph
+            .all_relations(&repo_key)
+            .expect("load benchmark graph");
+        let mut inbound_counts = BTreeMap::<String, usize>::new();
+        let requested_symbol = std::env::var("CC_GRAPH_BENCH_SYMBOL").ok();
+        for relation in &relations {
+            if relation.confidence >= 650
+                && requested_symbol
+                    .as_deref()
+                    .is_none_or(|name| relation.target_name == name)
+                && let Some(target) = relation.target_key.as_ref()
+            {
+                *inbound_counts.entry(target.clone()).or_default() += 1;
+            }
+        }
+        let representative = inbound_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(key, _)| key)
+            .expect("benchmark graph should contain an edge");
+        let root_symbol = symbols
+            .symbols_by_logical_keys(&repo_key, &[representative])
+            .expect("load representative symbol")
+            .into_iter()
+            .next()
+            .expect("representative target should be a symbol");
+        let mut frontier_micros = Vec::new();
+        for _ in 0..iterations {
+            let started = Instant::now();
+            graph
+                .relations_to(
+                    &repo_key,
+                    std::slice::from_ref(&root_symbol.logical_key),
+                    650,
+                    101,
+                )
+                .expect("run repeated reverse frontier lookup");
+            frontier_micros.push(started.elapsed().as_micros());
+        }
+        frontier_micros.sort_unstable();
+        let trace_edge = relations
+            .into_iter()
+            .find(|relation| {
+                relation.confidence >= 650
+                    && relation.source_symbol_id.is_some()
+                    && relation.target_symbol_id.is_some()
+            })
+            .expect("benchmark graph should contain a traceable edge");
+        let config = crate::config::Config::load_from_path(&output.join("config.toml"))
+            .expect("load isolated benchmark config");
+        let runtime = tokio::runtime::Runtime::new().expect("create benchmark runtime");
+        let engine = runtime
+            .block_on(super::Engine::new(&config))
+            .expect("create isolated benchmark engine");
+        let scope = ResolvedScope {
+            kind: ScopeKind::Repo,
+            id: repo_key.clone(),
+            label: "benchmark".to_string(),
+            repos: vec![repo],
+        };
+        let mut impact_micros = Vec::new();
+        let mut trace_micros = Vec::new();
+        let mut impact_nodes = 0usize;
+        for _ in 0..iterations {
+            let started = Instant::now();
+            let impact = runtime
+                .block_on(engine.analyze_impact(
+                    scope.clone(),
+                    ImpactRequest {
+                        repo: Some(repo_key.clone()),
+                        symbol_id: Some(root_symbol.symbol_id.clone()),
+                        file: None,
+                        line: None,
+                        max_depth: 2,
+                        max_nodes: 50,
+                        include_tests: true,
+                        min_confidence: 650,
+                        include_possible: false,
+                    },
+                ))
+                .expect("run repeated impact analysis");
+            assert!(impact.diagnostic.is_none());
+            impact_nodes = impact.direct_dependents.len()
+                + impact.transitive_dependents.len()
+                + impact.affected_tests.len()
+                + impact.possible_dependents.len()
+                + impact.possible_tests.len();
+            impact_micros.push(started.elapsed().as_micros());
+
+            let started = Instant::now();
+            let trace = runtime
+                .block_on(engine.trace_dependency_path(
+                    scope.clone(),
+                    TracePathRequest {
+                        repo: Some(repo_key.clone()),
+                        from_symbol_id: trace_edge.source_symbol_id.clone(),
+                        from_file: None,
+                        from_line: None,
+                        to_symbol_id: trace_edge.target_symbol_id.clone(),
+                        to_file: None,
+                        to_line: None,
+                        max_depth: 5,
+                        max_paths: 3,
+                        min_confidence: 650,
+                    },
+                ))
+                .expect("run repeated dependency trace");
+            assert!(trace.found);
+            trace_micros.push(started.elapsed().as_micros());
+        }
+        impact_micros.sort_unstable();
+        trace_micros.sort_unstable();
+        let report = format!(
+            concat!(
+                "impact_root={}\nimpact_nodes={}\n",
+                "frontier_p50_us={}\nfrontier_p95_us={}\n",
+                "impact_p50_us={}\nimpact_p95_us={}\nimpact_max_us={}\n",
+                "trace_p50_us={}\ntrace_p95_us={}\ntrace_max_us={}\n"
+            ),
+            root_symbol.qualified_name,
+            impact_nodes,
+            percentile(&frontier_micros, 50, 100),
+            percentile(&frontier_micros, 95, 100),
+            percentile(&impact_micros, 50, 100),
+            percentile(&impact_micros, 95, 100),
+            impact_micros.last().copied().unwrap_or(0),
+            percentile(&trace_micros, 50, 100),
+            percentile(&trace_micros, 95, 100),
+            trace_micros.last().copied().unwrap_or(0),
+        );
+        fs::write(output.join("query-report.txt"), &report)
+            .expect("write graph query benchmark report");
+        eprintln!("{report}");
     }
 }

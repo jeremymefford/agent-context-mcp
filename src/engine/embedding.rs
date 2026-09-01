@@ -525,7 +525,8 @@ where
                     tokio::time::sleep(retry_delay_for(operation, attempt)).await;
                     continue;
                 }
-                return Err(error).with_context(|| operation.to_string());
+                let message = format!("{operation} transport error: {error:#}");
+                return Err(error).context(message);
             }
         }
     }

@@ -365,6 +365,18 @@ agent-context refresh-all
 agent-context reindex-all
 ```
 
+Relationship analysis uses index format `v2`. Upgrading does not delete or rebuild an existing
+index automatically: run `agent-context reindex-all` explicitly before using the graph tools. A
+successful full reindex also compacts the canonical relationship store; failed reindexes skip the
+final compaction step.
+
+Incremental refreshes maintain storage automatically. Unchanged repositories do not rewrite the
+relationship index; changed repositories prune obsolete logical keys, checkpoint SQLite without
+blocking readers, and merge relationship-index tombstones once they reach 10%. SQLite reuses free
+pages during normal churn and performs a full vacuum only after at least 64 MiB and 20% of the
+database are reclaimable. This keeps routine refreshes cheap while allowing the index to contract
+after large deletes or repository reorganizations.
+
 ### 10. Install post-commit hooks
 
 ```bash
@@ -384,6 +396,10 @@ Current tools:
 - `search_text`
 - `get_file_outline`
 - `prepare_edit_target`
+- `analyze_impact`
+- `trace_path`
+- `analyze_changes`
+- `check_index_coverage`
 - `explain_search`
 - `clear_index`
 - `get_indexing_status`
@@ -391,7 +407,12 @@ Current tools:
 Preferred routing:
 
 - use `list_scopes` first in an unfamiliar workspace
-- use `search_symbols` first for exact definition lookup; request `includeSymbolId` only when you plan to hand that id directly to `prepare_edit_target`
+- use `search_symbols` first for exact definition lookup; request `includeSymbolId` when you plan to hand that id directly to `prepare_edit_target`, `analyze_impact`, or `trace_path`
+- use `analyze_impact` for bounded reverse traversal from one Rust or TypeScript definition; pass either `symbolId` or `file + line`, and consume the separate callers, transitive dependents, and affected-test sections
+- use `trace_path` for the shortest highest-confidence directed dependency paths; each endpoint accepts either a symbol id or a `file + line` selector
+- use `analyze_changes` for a validated Git `baseRef` (default `HEAD`) versus the current working tree; it includes staged, unstaged, renamed, deleted, and optionally untracked files, but does not compare two historical refs
+- use `check_index_coverage` before treating an empty graph result as “no impact”; it reports readiness, stale files, unsupported files, confidence tiers, unresolved references, and unstable identities
+- graph tools return `detail: "compact"` agent-facing responses by default; inspect `status` first and follow executable `nextActions` for `needs_index`, `not_found`, empty, or truncated results; request `detail: "full"` only for complete canonical metadata
 - use `search_code` for broader semantic or hybrid discovery; treat returned snippets as discovery hints, not authoritative reads
 - use `search_text` for exact strings, identifiers, test names, and log lines inside a known repo, known file, or bounded repo-relative tree instead of narrow `rg`
 - use `get_file_outline` once the target file is known and you need structure rather than broad file reads
@@ -405,13 +426,62 @@ Typical flow for a code-assistant task:
 
 1. `list_scopes`
 2. `search_symbols` for an exact symbol if one is known
-   Ask for `includeSymbolId` only if the next step really needs the raw id.
+   Ask for `includeSymbolId` when the next step needs impact, path, or edit preparation.
 3. `search_code` for broader behavior or semantic discovery
-4. `search_text` when a known repo, file, or subtree needs exact literal confirmation
-5. `get_file_outline` on the chosen file
-6. `prepare_edit_target` only after the exact patch location is known
+4. `analyze_impact` or `trace_path` with returned symbol ids—or known file/line selectors—when structural dependency evidence is needed
+5. `check_index_coverage` if a missing path or dependent could be a coverage limitation
+6. `search_text` when a known repo, file, or subtree needs exact literal confirmation
+7. `get_file_outline` on the chosen file
+8. `prepare_edit_target` only after the exact patch location is known
    It can resolve by `symbolId` or by a concrete symbol hit in one file.
-7. use shell reads only if regex is required or MCP exact inspection is unavailable
+9. use shell reads only if regex is required or MCP exact inspection is unavailable
+
+### Structural impact coverage
+
+The relationship graph is deliberately narrower than code search. Rust and TypeScript/TSX are the
+only guaranteed languages. SQLite is the canonical graph state and provides compact, deduplicated
+edges and coverage accounting. A third per-repository Tantivy index provides exact
+forward/reverse frontier lookup plus fuzzy target/evidence discovery and deterministic ranking.
+Worktree overlays compose with the canonical graph and suppress canonical edges
+originating in changed or deleted paths.
+
+Public relationship kinds are `calls`, `imports`, `reexports`, `type_uses`, `implements`, and
+`inherits`. Resolution confidence is fixed: `1000` exact qualified, `950` imported alias, `900`
+same-module unique, `750` unique compatible repository symbol, `450` ambiguous name/method
+candidate, and `300` lexical fallback. Traversal defaults exclude values below `650`; possible
+candidates remain separately labeled and never become definite dependencies because of fuzzy or
+semantic similarity. Coverage classifies `900-1000` as definite, `650-899` as probable structural
+evidence, `300-649` as possible, and references with no candidate as unresolved. Repeated
+occurrences between the same source, target, and relation kind share
+one traversal edge while retaining representative evidence. Ambiguous lookups retain at most eight
+path-local candidates; names with more than 256 compatible definitions stay unresolved rather than
+creating an unbounded speculative frontier. Unresolved occurrences remain searchable in the
+relationship evidence index so renamed and deleted declaration analysis can surface broken callers.
+SQLite retains every unresolved occurrence, while Tantivy stores one representative document per
+source owner, qualified target, and relation kind to avoid duplicate candidate hits and storage;
+text/fuzzy matches are always returned at lexical confidence and never promoted to structural edges.
+
+Graph output is advisory evidence, not a safety guarantee. External packages and cross-repository
+targets remain unresolved. Dynamic dispatch, runtime registration, reflection, generated code,
+macro expansion, and type-system behavior beyond syntax-visible declarations can create real
+dependencies the graph cannot prove. TypeScript function declarations and direct arrow/function
+expression variable declarations are structural symbol owners. Normal graph tools fail closed on an
+updating, incompatible, or live-file-stale transactional graph generation. Impact and path requests
+content-hash selected symbols immediately, verify SQLite/Tantivy generation counts, and establish a
+full filesystem audit on first use. That audit is reused for at most 30 seconds; file metadata,
+repository-generation changes, indexing, and `prepare_edit_target` invalidate or refresh it.
+`check_index_coverage` exposes the same readiness boundary explicitly, distinguishing an empty
+result from insufficient analysis.
+
+All four graph tools return a structured object rather than a bare array. The first field agents
+should inspect is `status`; common values include `ok`, `found`, `not_found`, `no_dependents`,
+`truncated`, `needs_index`, `invalid_base`, `symbol_not_found`, and `unsupported`. Compact nodes use
+the same handoff shape throughout: `symbolId`, `name`, `kind`, `file`, and `line`, plus bounded edge
+evidence where relevant. Recoverable results include `nextActions` with a tool name, reason, and
+arguments so clients can continue without parsing prose. `detail: "full"` retains logical keys,
+complete coverage, and all canonical response fields for diagnostics or custom clients. Impact,
+path, coverage, and change analysis report `liveAudit: "verified"` and can be conclusive only after
+the current audited generation and selected symbol hashes match the indexed graph generation.
 
 ## CLI Commands
 
@@ -547,8 +617,8 @@ This is the technical part that sits below the feature surface:
 
 - **Rust MCP server** with a shared local HTTP bridge
 - **Milvus** for dense semantic retrieval
-- **Tantivy** for lexical, path-aware, and exact-token retrieval
-- **SQLite** for symbol metadata and file outlines
+- **Tantivy** for lexical, path-aware, exact-token, and fuzzy relationship-evidence retrieval
+- **SQLite** for symbol metadata, file outlines, compact relationship adjacency, and graph coverage state
 - **Hybrid search planner** that routes and fuses dense, lexical, and symbol signals
 - **Bounded warm-reader cache** and global search budgets to keep latency and memory under control
 
