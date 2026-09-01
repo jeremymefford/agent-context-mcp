@@ -1398,6 +1398,9 @@ fn references_from_node(
                 .map(|(target, alias)| (kind, target, alias))
                 .collect()
         }
+        ("rust", "identifier" | "scoped_identifier") => rust_function_value_argument(node, text)
+            .map(|value| vec![(RelationKind::Calls, value, None)])
+            .unwrap_or_default(),
         ("rust", "call_expression") => node
             .child_by_field_name("function")
             .and_then(|child| child.utf8_text(text).ok())
@@ -1478,6 +1481,60 @@ fn references_from_node(
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
+    let arguments = node
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let invocation = arguments.parent()?;
+    let callable = match invocation.kind() {
+        "call_expression" => invocation.child_by_field_name("function"),
+        "method_call_expression" => invocation.child_by_field_name("method"),
+        _ => None,
+    }?;
+    let callable = callable.utf8_text(text).ok()?;
+    let callable_name = terminal_name(callable);
+    if !matches!(
+        callable_name.as_str(),
+        "all"
+            | "and_then"
+            | "any"
+            | "binary_search_by"
+            | "binary_search_by_key"
+            | "filter"
+            | "filter_map"
+            | "find"
+            | "find_map"
+            | "flat_map"
+            | "fold"
+            | "for_each"
+            | "inspect"
+            | "map"
+            | "map_err"
+            | "map_or_else"
+            | "map_while"
+            | "ok_or_else"
+            | "or_else"
+            | "position"
+            | "reduce"
+            | "retain"
+            | "retain_mut"
+            | "rposition"
+            | "scan"
+            | "skip_while"
+            | "sort_by"
+            | "sort_by_key"
+            | "sort_unstable_by"
+            | "sort_unstable_by_key"
+            | "take_while"
+            | "try_fold"
+            | "try_for_each"
+            | "unwrap_or_else"
+    ) {
+        return None;
+    }
+    node.utf8_text(text).ok().map(str::to_string)
 }
 
 fn parse_rust_impl(value: &str) -> Option<(RelationKind, String, Option<String>)> {
@@ -2243,6 +2300,41 @@ mod tests {
         assert_eq!(coverage.supported_files, 1);
         assert!(coverage.references >= 3);
         let _ = fs::remove_file(db);
+    }
+
+    #[test]
+    fn rust_relationships_capture_function_items_used_as_callbacks() {
+        let source = r#"
+            struct Parser;
+            impl Parser {
+                fn parse(value: &str) -> usize { value.len() }
+                fn caller(values: &[&str]) -> Vec<usize> {
+                    values.iter().map(Self::parse).collect()
+                }
+            }
+            fn report(_: std::num::ParseIntError) {}
+            fn fallible(value: &str) { let _ = value.parse::<u8>().map_err(report); }
+            fn live_test_connection() {}
+            fn passes_value(value: fn()) { value(); }
+            fn not_a_callback() { passes_value(live_test_connection); }
+        "#;
+        let path = Path::new("src/lib.rs");
+        let symbols = extract_symbols("/repo", "src/lib.rs", path, source, "now", "hash").unwrap();
+        let extracted =
+            extract_relationships("/repo", "src/lib.rs", path, source, &symbols, "hash").unwrap();
+
+        assert!(extracted.references.iter().any(|reference| {
+            reference.kind == RelationKind::Calls
+                && reference.target_qualified_name.as_deref() == Some("Self::parse")
+        }));
+        assert!(extracted.references.iter().any(|reference| {
+            reference.kind == RelationKind::Calls && reference.target_name == "report"
+        }));
+        assert!(!extracted.references.iter().any(|reference| {
+            reference.kind == RelationKind::Calls
+                && reference.target_name == "live_test_connection"
+                && reference.evidence == "live_test_connection"
+        }));
     }
 
     #[test]

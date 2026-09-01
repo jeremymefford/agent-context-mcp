@@ -1442,10 +1442,9 @@ pub fn source_role_for_path(relative_path: &str) -> &'static str {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    if normalized
-        .split('/')
-        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"))
+    if normalized.split('/').any(is_test_path_component)
         || basename.ends_with("_test.rs")
+        || basename.ends_with("_tests.rs")
         || basename.ends_with(".test.ts")
         || basename.ends_with(".test.tsx")
         || basename.ends_with(".spec.ts")
@@ -1465,6 +1464,12 @@ pub fn source_role_for_path(relative_path: &str) -> &'static str {
     } else {
         "production"
     }
+}
+
+fn is_test_path_component(component: &str) -> bool {
+    matches!(component, "test" | "tests" | "__tests__" | "spec" | "specs")
+        || component.ends_with("_test")
+        || component.ends_with("_tests")
 }
 
 fn assign_source_roles(
@@ -1491,11 +1496,13 @@ fn assign_source_roles(
         let test_container = symbol.container.as_deref().is_some_and(|container| {
             container
                 .split("::")
-                .any(|part| matches!(part.to_ascii_lowercase().as_str(), "test" | "tests"))
+                .any(|part| is_test_path_component(&part.to_ascii_lowercase()))
         });
         if header.contains("#[test]")
             || header.contains("#[tokio::test]")
             || header.contains("#[async_std::test]")
+            || header.contains("#[rstest]")
+            || header.contains("#[test_case]")
             || header.contains("cfg(test)")
             || test_container
         {
@@ -1626,7 +1633,7 @@ fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexedSymbol, SymbolStore, build_outline, extract_symbols};
+    use super::{IndexedSymbol, SymbolStore, build_outline, extract_symbols, source_role_for_path};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2089,6 +2096,39 @@ static int spellfix1_row_compare(const void *A, const void *B){
                 .iter()
                 .find(|symbol| symbol.name == "exercises_duplicate")
                 .is_some_and(|symbol| symbol.source_role == "test")
+        );
+    }
+
+    #[test]
+    fn rust_test_roles_cover_plural_files_and_named_test_modules() {
+        assert_eq!(source_role_for_path("src/lib_tests.rs"), "test");
+        assert_eq!(
+            source_role_for_path("src/support/lib_tests/helpers.rs"),
+            "test"
+        );
+        assert_eq!(source_role_for_path("src/contest/helpers.rs"), "production");
+
+        let path = std::path::Path::new("src/lib.rs");
+        let symbols = extract_symbols(
+            "/tmp/repo",
+            "src/lib.rs",
+            path,
+            "mod parser_tests { fn helper() {} }\nfn test_connection() {}",
+            "now",
+            "hash",
+        )
+        .unwrap();
+        assert!(
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == "helper")
+                .is_some_and(|symbol| symbol.source_role == "test")
+        );
+        assert!(
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == "test_connection")
+                .is_some_and(|symbol| symbol.source_role == "production")
         );
     }
 }

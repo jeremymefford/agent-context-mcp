@@ -961,6 +961,9 @@ struct ProcessFilesPlan<'a> {
     features: IndexFeatures,
     splitter: SplitterKind,
     total_files: usize,
+    progress_start: f64,
+    progress_end: f64,
+    progress_phase: &'static str,
     mode: IndexExecutionMode,
 }
 
@@ -4092,7 +4095,10 @@ impl Engine {
                         },
                         features,
                         splitter,
-                        total_files: 0,
+                        total_files: to_index.len(),
+                        progress_start: 0.0,
+                        progress_end: if features.graph { 85.0 } else { 94.0 },
+                        progress_phase: "indexing_files",
                         mode,
                     },
                     &to_index,
@@ -4121,6 +4127,13 @@ impl Engine {
                     .then_some(configured_embedding_fingerprint.clone()),
             };
             if features.graph {
+                self.record_indexing_progress(
+                    &ctx.requested_root,
+                    &overlay.repo_key,
+                    88.0,
+                    "resolving_graph",
+                )
+                .await?;
                 let suppressed_paths = overlay_suppressed_paths(&state);
                 self.resolve_overlay_graph(
                     &overlay.storage_root,
@@ -4288,7 +4301,7 @@ impl Engine {
                     repo_key.clone(),
                     SnapshotEntry::indexing(
                         0.0,
-                        "running",
+                        "scanning",
                         profile_name.clone(),
                         configured_embedding_fingerprint.clone(),
                     ),
@@ -4303,12 +4316,16 @@ impl Engine {
         let custom_extensions = custom_extensions.to_vec();
         let ignore_patterns = ignore_patterns.to_vec();
         let indexing_policy = self.inner.config.indexing.policy_for_repo(repo);
+        let scan_repo_path = repo_path.clone();
+        let scan_custom_extensions = custom_extensions.clone();
+        let scan_ignore_patterns = ignore_patterns.clone();
+        let scan_indexing_policy = indexing_policy.clone();
         let current_files = run_low_priority_blocking("scan_repo", move || {
             scan_repo(
-                &repo_path,
-                &custom_extensions,
-                &ignore_patterns,
-                &indexing_policy,
+                &scan_repo_path,
+                &scan_custom_extensions,
+                &scan_ignore_patterns,
+                &scan_indexing_policy,
             )
         })
         .await?;
@@ -4368,9 +4385,10 @@ impl Engine {
                         .await?;
                 }
                 let repo_path = repo.to_path_buf();
+                let repo_path_for_clear = repo_path.clone();
                 let local_index = self.inner.local_index.clone();
                 run_low_priority_blocking("clear_repo_local_index", move || {
-                    local_index.clear_repo(&repo_path)
+                    local_index.clear_repo(&repo_path_for_clear)
                 })
                 .await?;
                 let symbol_store = self.inner.symbol_store.clone();
@@ -4407,7 +4425,7 @@ impl Engine {
                         .await?;
                 }
                 let files = current_files.values().cloned().collect::<Vec<_>>();
-                let processing = self
+                let mut processing = self
                     .process_files(
                         ProcessFilesPlan {
                             repo,
@@ -4423,19 +4441,218 @@ impl Engine {
                             features,
                             splitter,
                             total_files: current_files.len(),
+                            progress_start: 0.0,
+                            progress_end: if features.graph { 85.0 } else { 94.0 },
+                            progress_phase: "indexing_files",
                             mode,
                         },
                         &files,
                     )
                     .await?;
-                let indexed_hashes = current_hashes
+                let mut indexed_hashes = current_hashes
                     .iter()
                     .filter(|(path, _)| processing.indexed_paths.contains(*path))
                     .map(|(path, hash)| (path.clone(), hash.clone()))
                     .collect::<BTreeMap<_, _>>();
                 if features.graph {
+                    self.record_indexing_progress(repo, &repo_key, 88.0, "resolving_graph")
+                        .await?;
                     self.resolve_graph(repo, &repo_key, &[]).await?;
                 }
+                self.record_indexing_progress(repo, &repo_key, 95.0, "reconciling")
+                    .await?;
+                let reconcile_repo_path = repo_path.clone();
+                let reconcile_custom_extensions = custom_extensions.clone();
+                let reconcile_ignore_patterns = ignore_patterns.clone();
+                let reconcile_indexing_policy = indexing_policy.clone();
+                let reconciled_files = run_low_priority_blocking("reconcile_repo_scan", move || {
+                    scan_repo(
+                        &reconcile_repo_path,
+                        &reconcile_custom_extensions,
+                        &reconcile_ignore_patterns,
+                        &reconcile_indexing_policy,
+                    )
+                })
+                .await?;
+                let reconciled_hashes = reconciled_files
+                    .iter()
+                    .map(|(path, file)| (path.clone(), file.hash.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let reconciliation = diff_files(&current_hashes, &reconciled_hashes);
+                let reconciliation_changed = !reconciliation.added.is_empty()
+                    || !reconciliation.modified.is_empty()
+                    || !reconciliation.removed.is_empty();
+
+                if reconciliation_changed {
+                    if features.semantic {
+                        for relative_path in reconciliation
+                            .removed
+                            .iter()
+                            .chain(reconciliation.modified.iter())
+                        {
+                            let ids = self
+                                .inner
+                                .milvus
+                                .query_ids_for_path(&collection_name, relative_path)
+                                .await?;
+                            self.inner.milvus.delete_ids(&collection_name, &ids).await?;
+                            let symbol_ids = self
+                                .inner
+                                .milvus
+                                .query_ids_for_path(&symbol_collection_name, relative_path)
+                                .await?;
+                            self.inner
+                                .milvus
+                                .delete_ids(&symbol_collection_name, &symbol_ids)
+                                .await?;
+                        }
+                    }
+                    let replaced_paths = reconciliation
+                        .removed
+                        .iter()
+                        .chain(reconciliation.modified.iter())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !replaced_paths.is_empty() {
+                        if features.lexical {
+                            let local_index = self.inner.local_index.clone();
+                            let repo_path = repo.to_path_buf();
+                            let paths = replaced_paths.clone();
+                            run_low_priority_blocking("reconcile_delete_local_paths", move || {
+                                local_index.delete_paths(&repo_path, &paths)
+                            })
+                            .await?;
+                        }
+                        if features.any() {
+                            let symbol_store = self.inner.symbol_store.clone();
+                            let repo_key = repo_key.clone();
+                            let paths = replaced_paths.clone();
+                            run_low_priority_blocking("reconcile_delete_symbol_rows", move || {
+                                for path in paths {
+                                    symbol_store.delete_file(&repo_key, &path)?;
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                        }
+                        if features.graph {
+                            let graph_store = self.inner.graph_store.clone();
+                            let repo_key = repo_key.clone();
+                            let paths = replaced_paths.clone();
+                            run_low_priority_blocking("reconcile_delete_graph_rows", move || {
+                                for path in paths {
+                                    graph_store.delete_file(&repo_key, &path)?;
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                        }
+                    }
+
+                    let to_refresh = reconciliation
+                        .added
+                        .iter()
+                        .chain(reconciliation.modified.iter())
+                        .filter_map(|path| reconciled_files.get(path).cloned())
+                        .collect::<Vec<_>>();
+                    let refreshed = self
+                        .process_files(
+                            ProcessFilesPlan {
+                                repo,
+                                storage_repo: repo,
+                                repo_key: &repo_key,
+                                profile_name: profile_name.as_deref(),
+                                collections: IndexCollections {
+                                    chunk: features
+                                        .semantic
+                                        .then_some(collection_name.as_str()),
+                                    symbol: features
+                                        .semantic
+                                        .then_some(symbol_collection_name.as_str()),
+                                },
+                                features,
+                                splitter,
+                                total_files: to_refresh.len(),
+                                progress_start: 95.0,
+                                progress_end: 98.0,
+                                progress_phase: "reconciling_changes",
+                                mode,
+                            },
+                            &to_refresh,
+                        )
+                        .await?;
+
+                    for path in &replaced_paths {
+                        indexed_hashes.remove(path);
+                        processing.indexed_paths.remove(path);
+                    }
+                    for path in &refreshed.indexed_paths {
+                        if let Some(hash) = reconciled_hashes.get(path) {
+                            indexed_hashes.insert(path.clone(), hash.clone());
+                        }
+                    }
+                    processing
+                        .indexed_paths
+                        .extend(refreshed.indexed_paths.iter().cloned());
+                    processing.total_chunks = processing
+                        .total_chunks
+                        .saturating_add(refreshed.total_chunks);
+                    if refreshed.status == IndexCompletionStatus::LimitReached {
+                        processing.status = IndexCompletionStatus::LimitReached;
+                    }
+                    if features.graph {
+                        let mut refresh_paths = replaced_paths;
+                        refresh_paths.extend(refreshed.indexed_paths);
+                        refresh_paths.sort();
+                        refresh_paths.dedup();
+                        self.record_indexing_progress(
+                            repo,
+                            &repo_key,
+                            98.0,
+                            "resolving_reconciled_graph",
+                        )
+                        .await?;
+                        self.resolve_graph(repo, &repo_key, &refresh_paths).await?;
+                    }
+                }
+
+                if reconciliation_changed {
+                    self.record_indexing_progress(repo, &repo_key, 99.0, "verifying_snapshot")
+                        .await?;
+                    let verify_repo_path = repo_path.clone();
+                    let verify_custom_extensions = custom_extensions.clone();
+                    let verify_ignore_patterns = ignore_patterns.clone();
+                    let verify_indexing_policy = indexing_policy.clone();
+                    let verified_files =
+                        run_low_priority_blocking("verify_repo_scan", move || {
+                            scan_repo(
+                                &verify_repo_path,
+                                &verify_custom_extensions,
+                                &verify_ignore_patterns,
+                                &verify_indexing_policy,
+                            )
+                        })
+                        .await?;
+                    let verified_hashes = verified_files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.hash.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    let final_drift = diff_files(&reconciled_hashes, &verified_hashes);
+                    if !final_drift.added.is_empty()
+                        || !final_drift.modified.is_empty()
+                        || !final_drift.removed.is_empty()
+                    {
+                        bail!(
+                            "repository changed during final index reconciliation (added={}, modified={}, removed={}); retry indexing",
+                            final_drift.added.len(),
+                            final_drift.modified.len(),
+                            final_drift.removed.len()
+                        );
+                    }
+                }
+                self.record_indexing_progress(repo, &repo_key, 99.0, "finalizing")
+                    .await?;
+                processing.processed_files = indexed_hashes.len() as u64;
                 save_merkle_snapshot(&merkle_path, &indexed_hashes, features).await?;
                 if features.graph {
                     let graph_root_hash = build_root_hash(&indexed_hashes);
@@ -4642,6 +4859,9 @@ impl Engine {
                             features: retained_features,
                             splitter,
                             total_files: to_index.len(),
+                            progress_start: 0.0,
+                            progress_end: if features.graph { 85.0 } else { 94.0 },
+                            progress_phase: "indexing_changed_files",
                             mode,
                         },
                         &to_index,
@@ -4671,6 +4891,9 @@ impl Engine {
                                 features: newly_enabled,
                                 splitter,
                                 total_files: current_files.len(),
+                                progress_start: 0.0,
+                                progress_end: if features.graph { 85.0 } else { 94.0 },
+                                progress_phase: "backfilling_features",
                                 mode,
                             },
                             &files,
@@ -4708,6 +4931,8 @@ impl Engine {
                 graph_refresh_paths.sort();
                 graph_refresh_paths.dedup();
                 if features.graph && !graph_refresh_paths.is_empty() {
+                    self.record_indexing_progress(repo, &repo_key, 88.0, "resolving_graph")
+                        .await?;
                     self.resolve_graph(repo, &repo_key, &graph_refresh_paths)
                         .await?;
                 }
@@ -4717,6 +4942,37 @@ impl Engine {
                         !graph_refresh_paths.is_empty(),
                     )
                     .await?;
+                }
+                self.record_indexing_progress(repo, &repo_key, 99.0, "verifying_snapshot")
+                    .await?;
+                let verify_repo_path = repo_path.clone();
+                let verify_custom_extensions = custom_extensions.clone();
+                let verify_ignore_patterns = ignore_patterns.clone();
+                let verify_indexing_policy = indexing_policy.clone();
+                let verified_files = run_low_priority_blocking("verify_repo_scan", move || {
+                    scan_repo(
+                        &verify_repo_path,
+                        &verify_custom_extensions,
+                        &verify_ignore_patterns,
+                        &verify_indexing_policy,
+                    )
+                })
+                .await?;
+                let verified_hashes = verified_files
+                    .iter()
+                    .map(|(path, file)| (path.clone(), file.hash.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let final_drift = diff_files(&current_hashes, &verified_hashes);
+                if !final_drift.added.is_empty()
+                    || !final_drift.modified.is_empty()
+                    || !final_drift.removed.is_empty()
+                {
+                    bail!(
+                        "repository changed during incremental index finalization (added={}, modified={}, removed={}); retry indexing",
+                        final_drift.added.len(),
+                        final_drift.modified.len(),
+                        final_drift.removed.len()
+                    );
                 }
                 save_merkle_snapshot(&merkle_path, &persisted_hashes, features).await?;
                 if features.graph {
@@ -4762,47 +5018,49 @@ impl Engine {
 
         match outcome {
             Ok((processing, changes, coverage)) => {
-                if features.semantic
-                    && vector_release_needed(full_reindex, &changes)
-                    && let Err(error) = self
+                if features.semantic && vector_release_needed(full_reindex, &changes) {
+                    self.record_indexing_progress(repo, &repo_key, 99.0, "maintaining_vectors")
+                        .await?;
+                    if let Err(error) = self
                         .maintain_vector_collections(
                             &[collection_name.clone(), symbol_collection_name.clone()],
                             vector_flush_needed(full_reindex, &changes),
                         )
                         .await
-                {
-                    let message = format!("vector maintenance failed: {error}");
-                    self.inner
-                        .snapshot
-                        .update(|snapshot| {
-                            let last_progress =
-                                snapshot.codebases.get(&repo_key).and_then(|entry| {
-                                    entry
-                                        .indexing_percentage
-                                        .or(entry.last_attempted_percentage)
-                                });
-                            snapshot.codebases.insert(
-                                repo_key.clone(),
-                                SnapshotEntry::failed(
-                                    message.clone(),
-                                    last_progress,
-                                    profile_name.clone(),
-                                    configured_embedding_fingerprint.clone(),
-                                ),
-                            );
-                        })
-                        .await?;
-                    return Ok(RepoIndexResult {
-                        repo: repo_key,
-                        indexed_files: None,
-                        total_chunks: None,
-                        index_status: Some("failed".to_string()),
-                        graph_status: Some("failed".to_string()),
-                        relationship_count: None,
-                        full_reindex,
-                        changes,
-                        error: Some(message),
-                    });
+                    {
+                        let message = format!("vector maintenance failed: {error}");
+                        self.inner
+                            .snapshot
+                            .update(|snapshot| {
+                                let last_progress =
+                                    snapshot.codebases.get(&repo_key).and_then(|entry| {
+                                        entry
+                                            .indexing_percentage
+                                            .or(entry.last_attempted_percentage)
+                                    });
+                                snapshot.codebases.insert(
+                                    repo_key.clone(),
+                                    SnapshotEntry::failed(
+                                        message.clone(),
+                                        last_progress,
+                                        profile_name.clone(),
+                                        configured_embedding_fingerprint.clone(),
+                                    ),
+                                );
+                            })
+                            .await?;
+                        return Ok(RepoIndexResult {
+                            repo: repo_key,
+                            indexed_files: None,
+                            total_chunks: None,
+                            index_status: Some("failed".to_string()),
+                            graph_status: Some("failed".to_string()),
+                            relationship_count: None,
+                            full_reindex,
+                            changes,
+                            error: Some(message),
+                        });
+                    }
                 }
                 let fingerprint = fingerprint_repo(repo).ok();
                 let index_status = index_status_for_coverage(processing.status, coverage);
@@ -5936,6 +6194,7 @@ impl Engine {
         repo: &Path,
         repo_key: &str,
         progress: f64,
+        phase: &str,
     ) -> Result<()> {
         let semantic_enabled = self.index_features_for_repo(repo).semantic;
         let profile_name = if semantic_enabled {
@@ -5964,9 +6223,10 @@ impl Engine {
                             configured_embedding_fingerprint.clone(),
                         )
                     });
+                let progress = entry.indexing_percentage.unwrap_or_default().max(progress);
                 entry.embedding_profile = profile_name.clone();
                 entry.embedding_fingerprint = configured_embedding_fingerprint.clone();
-                entry.set_indexing_progress(progress, "running");
+                entry.set_indexing_progress(progress, phase);
             })
             .await?;
         Ok(())
@@ -6308,10 +6568,17 @@ impl Engine {
             processed_files += 1;
             total_chunks += chunk_count;
             if plan.total_files > 0 {
-                let progress = (processed_files as f64 / plan.total_files as f64) * 100.0;
+                let ratio = processed_files as f64 / plan.total_files as f64;
+                let progress =
+                    plan.progress_start + ratio * (plan.progress_end - plan.progress_start);
                 if progress_tracker.should_persist(progress) {
-                    self.record_indexing_progress(plan.repo, plan.repo_key, progress)
-                        .await?;
+                    self.record_indexing_progress(
+                        plan.repo,
+                        plan.repo_key,
+                        progress,
+                        plan.progress_phase,
+                    )
+                    .await?;
                 }
             }
         }
