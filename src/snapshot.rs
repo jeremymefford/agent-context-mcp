@@ -202,7 +202,7 @@ impl SnapshotStore {
 
         for (repo, entry) in &mut snapshot.codebases {
             if entry.status == "indexing" && !resumable.contains(repo) {
-                *entry = SnapshotEntry::failed(
+                entry.set_failed(
                     reason.to_string(),
                     entry
                         .indexing_percentage
@@ -329,6 +329,43 @@ impl WorktreeSnapshotEntry {
             last_updated: Some(timestamp()),
         }
     }
+
+    pub fn set_indexing(
+        &mut self,
+        canonical_root: impl Into<String>,
+        repo_identity: impl Into<String>,
+        overlay_id: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) {
+        self.status = "indexing".to_string();
+        self.canonical_root = canonical_root.into();
+        self.repo_identity = repo_identity.into();
+        self.overlay_id = overlay_id.into();
+        self.overlay_status = Some("queued".to_string());
+        self.overlay_mismatch_reason = None;
+        self.embedding_profile = embedding_profile;
+        if embedding_fingerprint.is_some() {
+            self.embedding_fingerprint = embedding_fingerprint;
+        }
+        self.last_updated = Some(timestamp());
+    }
+
+    pub fn set_failed(
+        &mut self,
+        message: impl Into<String>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) {
+        self.status = "indexfailed".to_string();
+        self.overlay_status = Some("failed".to_string());
+        self.overlay_mismatch_reason = Some(message.into());
+        self.embedding_profile = embedding_profile;
+        if embedding_fingerprint.is_some() {
+            self.embedding_fingerprint = embedding_fingerprint;
+        }
+        self.last_updated = Some(timestamp());
+    }
 }
 
 impl SnapshotEntry {
@@ -381,38 +418,29 @@ impl SnapshotEntry {
         }
     }
 
-    pub fn failed(
-        message: impl Into<String>,
-        last_attempted_percentage: Option<f64>,
-        embedding_profile: Option<String>,
-        embedding_fingerprint: Option<String>,
-    ) -> Self {
-        Self {
-            status: "indexfailed".to_string(),
-            indexed_files: None,
-            total_chunks: None,
-            indexing_percentage: None,
-            last_attempted_percentage,
-            index_status: Some("failed".to_string()),
-            error_message: Some(message.into()),
-            embedding_profile,
-            embedding_fingerprint,
-            last_updated: Some(timestamp()),
-            last_audit: None,
-            last_head: None,
-            last_index_mtime: None,
-            last_root_mtime: None,
-        }
-    }
-
     pub fn set_indexing_progress(&mut self, progress: f64, index_status: impl Into<String>) {
         self.status = "indexing".to_string();
-        self.indexed_files = None;
-        self.total_chunks = None;
         self.indexing_percentage = Some(progress);
         self.last_attempted_percentage = Some(progress);
         self.index_status = Some(index_status.into());
         self.error_message = None;
+        self.last_updated = Some(timestamp());
+    }
+
+    pub fn set_failed(
+        &mut self,
+        message: impl Into<String>,
+        last_attempted_percentage: Option<f64>,
+        embedding_profile: Option<String>,
+        embedding_fingerprint: Option<String>,
+    ) {
+        self.status = "indexfailed".to_string();
+        self.indexing_percentage = None;
+        self.last_attempted_percentage = last_attempted_percentage;
+        self.index_status = Some("failed".to_string());
+        self.error_message = Some(message.into());
+        self.embedding_profile = embedding_profile;
+        self.embedding_fingerprint = embedding_fingerprint;
         self.last_updated = Some(timestamp());
     }
 }
@@ -435,7 +463,7 @@ fn default_search_root_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_replace;
+    use super::{SnapshotEntry, WorktreeSnapshotEntry, atomic_replace};
     use serde_json::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -472,5 +500,67 @@ mod tests {
         assert_eq!(names, vec!["state.json"]);
 
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn refresh_progress_and_failure_preserve_last_good_coverage() {
+        let mut entry = SnapshotEntry::indexed_with_status(
+            Some(561),
+            Some(16_448),
+            "complete",
+            Some("hosted".to_string()),
+            Some("fingerprint".to_string()),
+        );
+
+        entry.set_indexing_progress(88.0, "resolving_graph");
+        entry.set_failed(
+            "compaction failed",
+            Some(88.0),
+            Some("hosted".to_string()),
+            Some("fingerprint".to_string()),
+        );
+
+        assert_eq!(entry.status, "indexfailed");
+        assert_eq!(entry.indexed_files, Some(561));
+        assert_eq!(entry.total_chunks, Some(16_448));
+        assert_eq!(entry.last_attempted_percentage, Some(88.0));
+    }
+
+    #[test]
+    fn queued_overlay_refresh_preserves_last_good_coverage() {
+        let mut entry = WorktreeSnapshotEntry::indexed(
+            "/repo",
+            "identity",
+            "overlay",
+            "complete",
+            12,
+            3,
+            4096,
+            Some("hosted".to_string()),
+            Some("fingerprint".to_string()),
+        );
+
+        entry.set_indexing(
+            "/repo",
+            "identity",
+            "overlay",
+            Some("hosted".to_string()),
+            None,
+        );
+
+        assert_eq!(entry.status, "indexing");
+        assert_eq!(entry.overlay_status.as_deref(), Some("queued"));
+        assert_eq!(entry.changed_files, Some(12));
+        assert_eq!(entry.deleted_files, Some(3));
+        assert_eq!(entry.overlay_bytes, Some(4096));
+        assert_eq!(entry.embedding_fingerprint.as_deref(), Some("fingerprint"));
+
+        entry.set_failed("refresh failed", Some("hosted".to_string()), None);
+        assert_eq!(entry.status, "indexfailed");
+        assert_eq!(entry.overlay_status.as_deref(), Some("failed"));
+        assert_eq!(entry.changed_files, Some(12));
+        assert_eq!(entry.deleted_files, Some(3));
+        assert_eq!(entry.overlay_bytes, Some(4096));
+        assert_eq!(entry.embedding_fingerprint.as_deref(), Some("fingerprint"));
     }
 }

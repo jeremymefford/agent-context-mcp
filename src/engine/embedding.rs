@@ -565,7 +565,7 @@ fn ollama_runtime_error(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     body.contains("connection reset by peer")
         || body.contains("connection refused")
-        || (body.contains("/tokenize") && body.contains("read tcp"))
+        || (body.contains("/tokenize") && (body.contains("read tcp") || body.contains("eof")))
 }
 
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
@@ -642,9 +642,12 @@ mod tests {
     }
 
     #[test]
-    fn retries_ollama_tokenizer_connection_resets_with_longer_backoff() {
+    fn retries_transient_ollama_tokenizer_failures_with_longer_backoff() {
         assert!(ollama_runtime_error(
             "Post \\\"http://127.0.0.1:55994/tokenize\\\": read tcp: connection reset by peer"
+        ));
+        assert!(ollama_runtime_error(
+            "Post \\\"http://127.0.0.1:49693/tokenize\\\": EOF"
         ));
         assert!(!ollama_runtime_error("invalid dimensions"));
         assert!(retry_delay_for("Ollama embeddings", 0) > retry_delay(0));

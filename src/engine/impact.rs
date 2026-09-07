@@ -129,15 +129,15 @@ struct TraversalStep {
 }
 
 #[derive(Clone)]
-struct GraphSource {
-    repo_key: String,
-    storage_repo: std::path::PathBuf,
-    suppressed_paths: BTreeSet<String>,
+pub(super) struct GraphSource {
+    pub(super) repo_key: String,
+    pub(super) storage_repo: std::path::PathBuf,
+    pub(super) suppressed_paths: BTreeSet<String>,
 }
 
-struct GraphView {
-    sources: Vec<GraphSource>,
-    coverage: RepoRelationshipCoverage,
+pub(super) struct GraphView {
+    pub(super) sources: Vec<GraphSource>,
+    pub(super) coverage: RepoRelationshipCoverage,
 }
 
 impl Engine {
@@ -724,7 +724,7 @@ impl Engine {
         })
     }
 
-    async fn verified_graph_view_for_repo(
+    pub(super) async fn verified_graph_view_for_repo(
         &self,
         repo: &Path,
         require_ready: bool,
@@ -1126,7 +1126,7 @@ fn hash_metadata(hasher: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
 fn relation_weight(kind: RelationKind) -> f64 {
     match kind {
         RelationKind::Calls | RelationKind::Implements | RelationKind::Inherits => 1.0,
-        RelationKind::TypeUses => 0.9,
+        RelationKind::TypeUses | RelationKind::ValueUses => 0.9,
         RelationKind::Reexports => 0.85,
         RelationKind::Imports => 0.75,
     }

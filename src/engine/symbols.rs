@@ -631,6 +631,25 @@ impl SymbolStore {
         Ok(symbols)
     }
 
+    pub fn all_symbols(&self, repo: &str) -> Result<Vec<IndexedSymbol>> {
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT symbol_id, logical_key, repo, relative_path, name, kind, container,
+                        language, start_line, end_line, indexed_at, file_hash, parent_symbol_id,
+                        parent_logical_key, qualified_name, signature, source_role, identity_stable
+                 FROM symbols
+                 WHERE repo = ?1
+                 ORDER BY relative_path ASC, start_line ASC, end_line ASC, logical_key ASC",
+            )
+            .context("preparing repository symbol query")?;
+        let rows = statement
+            .query_map(params![repo], map_symbol_row)
+            .context("querying repository symbols")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting repository symbols")
+    }
+
     pub fn file_symbols(&self, repo: &str, relative_path: &str) -> Result<Vec<IndexedSymbol>> {
         let connection = self.open()?;
         let mut statement = connection
@@ -1442,7 +1461,9 @@ pub fn source_role_for_path(relative_path: &str) -> &'static str {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    if normalized.split('/').any(is_test_path_component)
+    if normalized
+        .split('/')
+        .any(|part| is_test_path_component(part) || matches!(part, "bench" | "benches"))
         || basename.ends_with("_test.rs")
         || basename.ends_with("_tests.rs")
         || basename.ends_with(".test.ts")
@@ -2107,6 +2128,10 @@ static int spellfix1_row_compare(const void *A, const void *B){
             "test"
         );
         assert_eq!(source_role_for_path("src/contest/helpers.rs"), "production");
+        assert_eq!(
+            source_role_for_path("benchmarks/criterion/benches/scan_hotpaths.rs"),
+            "test"
+        );
 
         let path = std::path::Path::new("src/lib.rs");
         let symbols = extract_symbols(

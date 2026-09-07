@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tantivy::collector::{DocSetCollector, TopDocs};
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT, TantivyDocument, Value as _,
@@ -176,9 +177,7 @@ impl LocalIndexStore {
         }
         if let Some(handle) = self.open_existing_chunk_index(repo)? {
             let schema = ChunkSchema::from_index(&handle.index)?;
-            let writer = handle
-                .index
-                .writer::<TantivyDocument>(32_000_000)
+            let writer = explicit_merge_writer(&handle.index, 32_000_000)
                 .context("opening chunk index writer")?;
             for relative_path in relative_paths {
                 writer.delete_term(Term::from_field_text(
@@ -200,9 +199,7 @@ impl LocalIndexStore {
         }
         if let Some(handle) = self.open_existing_symbol_index(repo)? {
             let schema = SymbolSchema::from_index(&handle.index)?;
-            let writer = handle
-                .index
-                .writer::<TantivyDocument>(16_000_000)
+            let writer = explicit_merge_writer(&handle.index, 16_000_000)
                 .context("opening symbol index writer")?;
             for relative_path in relative_paths {
                 writer.delete_term(Term::from_field_text(
@@ -231,9 +228,7 @@ impl LocalIndexStore {
         }
         let handle = self.open_or_create_chunk_index(repo)?;
         let schema = ChunkSchema::from_index(&handle.index)?;
-        let writer = handle
-            .index
-            .writer::<TantivyDocument>(64_000_000)
+        let writer = explicit_merge_writer(&handle.index, 64_000_000)
             .context("opening chunk index writer")?;
         for document in documents {
             writer
@@ -288,9 +283,7 @@ impl LocalIndexStore {
         }
         let handle = self.open_or_create_symbol_index(repo)?;
         let schema = SymbolSchema::from_index(&handle.index)?;
-        let writer = handle
-            .index
-            .writer::<TantivyDocument>(16_000_000)
+        let writer = explicit_merge_writer(&handle.index, 16_000_000)
             .context("opening symbol index writer")?;
         for (relative_path, documents) in replacements {
             writer.delete_term(Term::from_field_text(
@@ -343,9 +336,7 @@ impl LocalIndexStore {
         }
         let handle = self.open_or_create_relation_index(repo)?;
         let schema = RelationSchema::from_index(&handle.index)?;
-        let writer = handle
-            .index
-            .writer::<TantivyDocument>(32_000_000)
+        let writer = explicit_merge_writer(&handle.index, 32_000_000)
             .context("opening relation index writer")?;
         for source_path in source_paths {
             writer.delete_term(Term::from_field_text(schema.source_path_raw, source_path));
@@ -585,6 +576,27 @@ impl LocalIndexStore {
         Ok(handle.reader.searcher().num_docs())
     }
 
+    pub fn chunk_document_count(&self, repo: &Path) -> Result<Option<u64>> {
+        let repo_root = self.repo_root(repo);
+        if let Some(handle) = self.cached_index(&repo_root, CachedIndexKind::Chunk)? {
+            return Ok(Some(handle.reader.searcher().num_docs()));
+        }
+
+        // Status probes must not trigger cold-open maintenance or compaction.
+        let path = self.chunk_index_dir(repo);
+        if !path.join("meta.json").exists() {
+            return Ok(None);
+        }
+        let index = Index::open_in_dir(&path)
+            .with_context(|| format!("opening Tantivy index status {}", path.display()))?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .with_context(|| format!("opening Tantivy status reader {}", path.display()))?;
+        Ok(Some(reader.searcher().num_docs()))
+    }
+
     pub fn chunk_coverage(&self, repo: &Path) -> Result<ChunkIndexCoverage> {
         let Some(handle) = self.open_existing_chunk_index(repo)? else {
             return Ok(ChunkIndexCoverage::default());
@@ -792,11 +804,28 @@ impl LocalIndexStore {
         };
         Ok(handle.index.searchable_segment_metas()?.len())
     }
+
+    #[cfg(test)]
+    fn relation_segment_count(&self, repo: &Path) -> Result<usize> {
+        let Some(handle) = self.open_existing_relation_index(repo)? else {
+            return Ok(0);
+        };
+        Ok(handle.index.searchable_segment_metas()?.len())
+    }
 }
 
 fn next_access_tick(state: &mut RepoCacheState) -> u64 {
     state.access_tick = state.access_tick.saturating_add(1);
     state.access_tick
+}
+
+fn explicit_merge_writer(index: &Index, memory_budget: usize) -> Result<IndexWriter> {
+    let writer = index.writer::<TantivyDocument>(memory_budget)?;
+    // Set this before documents can flush. A large batch may create segments
+    // while it is still being added, and the default policy could otherwise
+    // race the explicit post-commit compaction below.
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    Ok(writer)
 }
 
 fn finish_writer(
@@ -819,8 +848,7 @@ fn maintain_existing_index(index: &Index, kind: CachedIndexKind, path: &Path) ->
         return Ok(());
     }
 
-    let mut writer = index
-        .writer::<TantivyDocument>(64_000_000)
+    let mut writer = explicit_merge_writer(index, 64_000_000)
         .with_context(|| format!("opening Tantivy maintenance writer {}", path.display()))?;
     compact_index_if_needed(index, &mut writer, kind, path)?;
     writer
@@ -1477,8 +1505,8 @@ fn u64_value(document: &TantivyDocument, field: Field) -> Result<u64> {
 mod tests {
     use super::{
         CachedIndexKind, ChunkIndexDoc, ChunkSearchRequest, LocalIndexStore, QueryFlavor,
-        SYMBOL_SEGMENT_COMPACTION_THRESHOLD, SymbolIndexDoc, SymbolSearchRequest,
-        deleted_docs_need_compaction,
+        RELATION_SEGMENT_COMPACTION_THRESHOLD, SYMBOL_SEGMENT_COMPACTION_THRESHOLD, SymbolIndexDoc,
+        SymbolSearchRequest, deleted_docs_need_compaction, explicit_merge_writer,
     };
     use crate::engine::relationships::{CONFIDENCE_LEXICAL, RelationKind, ResolvedRelation};
     use std::path::Path;
@@ -1501,6 +1529,20 @@ mod tests {
             1_000,
             CachedIndexKind::Relation
         ));
+    }
+
+    #[test]
+    fn explicit_compaction_writer_disables_automatic_merging_before_use() {
+        let root = temp_path("explicit-merge-policy");
+        let store = LocalIndexStore::new(root.clone(), 4);
+        let repo = std::path::Path::new("/tmp/example");
+        let handle = store.open_or_create_relation_index(repo).unwrap();
+        let writer = explicit_merge_writer(&handle.index, 16_000_000).unwrap();
+
+        assert_eq!(format!("{:?}", writer.get_merge_policy()), "NoMergePolicy");
+        writer.wait_merging_threads().unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1645,6 +1687,51 @@ mod tests {
         assert!(
             store.symbol_segment_count(repo).unwrap() <= SYMBOL_SEGMENT_COMPACTION_THRESHOLD,
             "symbol index should stay below the maintenance segment threshold"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relationship_index_maintenance_compacts_many_small_commits() {
+        let root = temp_path("relationship-maintenance");
+        let store = LocalIndexStore::new(root.clone(), 4);
+        let repo = std::path::Path::new("/tmp/example");
+
+        for index in 0..(RELATION_SEGMENT_COMPACTION_THRESHOLD + 8) {
+            let source_path = format!("src/generated_{index}.rs");
+            store
+                .replace_relation_docs_for_paths(
+                    repo,
+                    std::slice::from_ref(&source_path),
+                    &[ResolvedRelation {
+                        reference_id: format!("reference-{index}"),
+                        repo: repo.display().to_string(),
+                        source_key: format!("source-{index}"),
+                        source_symbol_id: None,
+                        source_path: source_path.clone(),
+                        target_key: Some("target".to_string()),
+                        target_symbol_id: None,
+                        target_path: Some("src/target.rs".to_string()),
+                        target_name: "target".to_string(),
+                        target_qualified_name: Some("crate::target".to_string()),
+                        kind: RelationKind::Calls,
+                        confidence: 900,
+                        resolution: "same_module_unique".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                        evidence: "target()".to_string(),
+                        source_role: "production".to_string(),
+                        language: "rust".to_string(),
+                        file_hash: format!("hash-{index}"),
+                    }],
+                )
+                .unwrap();
+        }
+
+        assert!(
+            store.relation_segment_count(repo).unwrap() <= RELATION_SEGMENT_COMPACTION_THRESHOLD,
+            "relationship index should stay below the maintenance segment threshold"
         );
 
         let _ = std::fs::remove_dir_all(root);

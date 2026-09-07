@@ -504,6 +504,7 @@ mod tests {
             collection_name: format!("collection_{status}"),
             features: crate::config::IndexFeatures::all(),
             status: status.to_string(),
+            search_available: status == "indexed",
             indexed_files: None,
             total_chunks: None,
             index_status: index_status.map(str::to_string),

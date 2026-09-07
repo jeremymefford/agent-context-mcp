@@ -8,6 +8,7 @@ pub mod milvus;
 pub mod relationships;
 pub mod splitter;
 pub mod symbols;
+pub mod trim;
 
 use crate::config::{
     Config, ExclusionProfile, IndexFeatures, RepoIndexPolicy, ResolvedScope, ScopeKind,
@@ -59,6 +60,7 @@ const RRF_K: f64 = 100.0;
 const CONTENT_HASH_ALGORITHM: &str = "xxh3_128";
 const LEGACY_CONTENT_HASH_ALGORITHM: &str = "sha256";
 const SNAPSHOT_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+const SEARCH_REQUEST_QUEUE_WARN_AFTER: Duration = Duration::from_millis(500);
 const INDEX_FORMAT_VERSION: &str = "v2";
 const SEARCH_ROOT_VERSION: &str = "v1";
 const CHUNK_COLLECTION_PREFIX: &str = "hybrid_code_chunks_";
@@ -167,6 +169,7 @@ struct SearchBudgets {
     requests: Arc<Semaphore>,
     repo_searches: Arc<Semaphore>,
     lexical_tasks: Arc<Semaphore>,
+    interactive_lexical_tasks: Arc<Semaphore>,
     dense_tasks: Arc<Semaphore>,
 }
 
@@ -570,6 +573,7 @@ pub struct RepoStatus {
     pub collection_name: String,
     pub features: IndexFeatures,
     pub status: String,
+    pub search_available: bool,
     pub indexed_files: Option<u64>,
     pub total_chunks: Option<u64>,
     pub index_status: Option<String>,
@@ -1016,16 +1020,28 @@ impl SearchBudgets {
             requests: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             repo_searches: Arc::new(Semaphore::new(config.max_concurrent_repo_searches)),
             lexical_tasks: Arc::new(Semaphore::new(config.max_concurrent_lexical_tasks)),
+            interactive_lexical_tasks: Arc::new(Semaphore::new(1)),
             dense_tasks: Arc::new(Semaphore::new(config.max_concurrent_dense_tasks)),
         }
     }
 
     async fn acquire_request(&self) -> Result<OwnedSemaphorePermit> {
-        self.requests
+        let started = Instant::now();
+        let permit = self
+            .requests
             .clone()
             .acquire_owned()
             .await
-            .context("acquiring global search request budget")
+            .context("acquiring global search request budget")?;
+        let elapsed = started.elapsed();
+        if elapsed >= SEARCH_REQUEST_QUEUE_WARN_AFTER {
+            eprintln!(
+                "[warn] {} search request waited {}ms for the global request budget",
+                crate::snapshot::timestamp(),
+                elapsed.as_millis()
+            );
+        }
+        Ok(permit)
     }
 
     async fn acquire_repo_search(&self) -> Result<OwnedSemaphorePermit> {
@@ -1042,6 +1058,17 @@ impl SearchBudgets {
             .acquire_owned()
             .await
             .context("acquiring global lexical search budget")
+    }
+
+    async fn acquire_interactive_lexical(&self) -> Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = self.lexical_tasks.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        self.interactive_lexical_tasks
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquiring reserved interactive lexical search budget")
     }
 
     async fn acquire_dense(&self) -> Result<OwnedSemaphorePermit> {
@@ -1237,6 +1264,28 @@ impl Engine {
         ))
     }
 
+    fn repo_embedding_identity_status_for_status(
+        &self,
+        snapshot: &Snapshot,
+        repo: &Path,
+    ) -> Result<RepoEmbeddingIdentityStatus> {
+        let repo_key = repo.display().to_string();
+        let entry = snapshot.codebases.get(&repo_key);
+        let semantic_enabled = self.index_features_for_repo(repo).semantic;
+        let profile_name = if semantic_enabled {
+            self.embedding_profile_name_for_repo(repo)?.to_string()
+        } else {
+            "disabled".to_string()
+        };
+        Ok(repo_embedding_identity_status_for_snapshot(
+            snapshot,
+            entry,
+            &profile_name,
+            None,
+            semantic_enabled,
+        ))
+    }
+
     pub async fn healthcheck(&self) -> Result<()> {
         self.inner.milvus.healthcheck().await?;
         let _ = self.configured_embedding_fingerprints().await?;
@@ -1400,7 +1449,7 @@ impl Engine {
                     if let Some(entry) = snapshot.codebases.get_mut(&repo_key)
                         && entry.status == "indexing"
                     {
-                        *entry = SnapshotEntry::failed(
+                        entry.set_failed(
                             reason.to_string(),
                             entry
                                 .indexing_percentage
@@ -1428,15 +1477,24 @@ impl Engine {
                 self.inner
                     .snapshot
                     .update(|snapshot| {
-                        snapshot.worktrees.insert(
-                            worktree_key.clone(),
-                            WorktreeSnapshotEntry::indexing(
-                                canonical_root.clone(),
-                                repo_identity.clone(),
-                                overlay_id.clone(),
-                                profile_name.clone(),
-                                embedding_fingerprint.clone(),
-                            ),
+                        let entry = snapshot
+                            .worktrees
+                            .entry(worktree_key.clone())
+                            .or_insert_with(|| {
+                                WorktreeSnapshotEntry::indexing(
+                                    canonical_root.clone(),
+                                    repo_identity.clone(),
+                                    overlay_id.clone(),
+                                    profile_name.clone(),
+                                    embedding_fingerprint.clone(),
+                                )
+                            });
+                        entry.set_indexing(
+                            canonical_root.clone(),
+                            repo_identity.clone(),
+                            overlay_id.clone(),
+                            profile_name.clone(),
+                            embedding_fingerprint.clone(),
                         );
                     })
                     .await?;
@@ -1450,10 +1508,14 @@ impl Engine {
             self.inner
                 .snapshot
                 .update(|snapshot| {
-                    snapshot.codebases.insert(
-                        repo_key.clone(),
-                        SnapshotEntry::indexing(0.0, "queued", profile_name.clone(), None),
-                    );
+                    let entry = snapshot
+                        .codebases
+                        .entry(repo_key.clone())
+                        .or_insert_with(|| {
+                            SnapshotEntry::indexing(0.0, "queued", profile_name.clone(), None)
+                        });
+                    entry.embedding_profile = profile_name.clone();
+                    entry.set_indexing_progress(0.0, "queued");
                 })
                 .await?;
         }
@@ -1706,6 +1768,23 @@ impl Engine {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         let _permit = self.acquire_lexical_budget().await?;
+        run_low_priority_blocking(label, work).await
+    }
+
+    async fn run_interactive_lexical_blocking<T, F>(
+        &self,
+        label: &'static str,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let _permit = self
+            .inner
+            .search_budgets
+            .acquire_interactive_lexical()
+            .await?;
         run_low_priority_blocking(label, work).await
     }
 
@@ -2186,7 +2265,6 @@ impl Engine {
         if !text_search_has_bounded_target(&scope, &request) {
             bail!("search_text requires `file`, `pathPrefix`, or a repo-bounded scope");
         }
-        let _request_permit = self.acquire_request_budget().await?;
         let parallelism = self.inner.config.search.max_concurrent_repo_searches.max(1);
         let scope_repos = scope.repos;
 
@@ -2195,11 +2273,7 @@ impl Engine {
             let request = request.clone();
             let repo_name = repo.display().to_string();
             async move {
-                let result = async {
-                    let _repo_permit = engine.acquire_repo_search_budget().await?;
-                    engine.search_text_repo(&repo, &request).await
-                }
-                .await;
+                let result = engine.search_text_repo(&repo, &request).await;
                 (repo_name, result)
             }
         }))
@@ -2260,7 +2334,6 @@ impl Engine {
                 "prepare_edit_target requires `lineHint`, `query`, or `symbolName` when `file` is provided"
             );
         }
-        let _request_permit = self.acquire_request_budget().await?;
         if let Some(symbol_id) = &request.symbol_id {
             return self
                 .prepare_symbol_edit_target(scope, symbol_id, &request)
@@ -2402,7 +2475,7 @@ impl Engine {
             let repo_path = repo.to_path_buf();
             let indexing_policy = indexing_policy.clone();
             return self
-                .run_search_lexical_blocking("search_text_repo_candidates", move || {
+                .run_interactive_lexical_blocking("search_text_repo_candidates", move || {
                     collect_live_candidate_files(
                         &repo_path,
                         None,
@@ -2430,7 +2503,7 @@ impl Engine {
         let repo_path = repo.to_path_buf();
         let indexing_policy = indexing_policy.clone();
         let fallback: Vec<String> = self
-            .run_search_lexical_blocking("search_text_fallback_candidates", move || {
+            .run_interactive_lexical_blocking("search_text_fallback_candidates", move || {
                 collect_live_candidate_files(
                     &repo_path,
                     path_prefix.as_deref(),
@@ -2452,7 +2525,7 @@ impl Engine {
         let ctx = self.repo_context(repo)?;
         let chunk_request = text_search_chunk_request(request);
         let canonical_hits = self
-            .run_search_lexical_blocking("search_text_shortlist", {
+            .run_interactive_lexical_blocking("search_text_shortlist", {
                 let repo_path = ctx.canonical_root.clone();
                 let local_index = self.inner.local_index.clone();
                 let request = chunk_request.clone();
@@ -2479,7 +2552,7 @@ impl Engine {
         };
         let overlay_files = if overlay_state_has_search_index(&overlay_state) {
             let overlay_hits = self
-                .run_search_lexical_blocking("search_text_overlay_shortlist", {
+                .run_interactive_lexical_blocking("search_text_overlay_shortlist", {
                     let repo_path = overlay.storage_root.clone();
                     let local_index = self.inner.local_index.clone();
                     let request = chunk_request;
@@ -2760,7 +2833,6 @@ impl Engine {
         let mut cache = LiveFileRequestCache::new();
 
         for repo in repos {
-            let _repo_permit = self.acquire_repo_search_budget().await?;
             let snapshot = match self.load_live_file(&repo, &file, &mut cache).await {
                 Ok(snapshot) => snapshot,
                 Err(_) => continue,
@@ -3056,7 +3128,7 @@ impl Engine {
         let repo_path = repo.to_path_buf();
         let live_files = self.inner.live_files.clone();
         let snapshot = self
-            .run_search_lexical_blocking("load_live_file", move || {
+            .run_interactive_lexical_blocking("load_live_file", move || {
                 live_files.load_snapshot(&repo_path, &normalized)
             })
             .await?;
@@ -3115,7 +3187,7 @@ impl Engine {
         let chunk_path = normalized_path.clone();
         let local_index = self.inner.local_index.clone();
         let chunk_metadata = self
-            .run_search_lexical_blocking("indexed_file_chunk_metadata", move || {
+            .run_interactive_lexical_blocking("indexed_file_chunk_metadata", move || {
                 let chunks = local_index.chunks_for_file(&repo_path, &chunk_path)?;
                 Ok::<_, anyhow::Error>(
                     chunks
@@ -3138,7 +3210,7 @@ impl Engine {
         let repo_key = repo_key.to_string();
         let symbol_path = normalized_path.clone();
         let symbol_store = self.inner.symbol_store.clone();
-        self.run_search_lexical_blocking("indexed_file_symbol_metadata", move || {
+        self.run_interactive_lexical_blocking("indexed_file_symbol_metadata", move || {
             let symbols = symbol_store.file_symbols(&repo_key, &symbol_path)?;
             Ok::<_, anyhow::Error>(
                 symbols
@@ -3174,7 +3246,7 @@ impl Engine {
             let symbol_store = self.inner.symbol_store.clone();
             let symbol_id = symbol_id.clone();
             let symbol = self
-                .run_search_lexical_blocking("resolve_symbol_for_edit", move || {
+                .run_interactive_lexical_blocking("resolve_symbol_for_edit", move || {
                     symbol_store.symbol_by_id(&repo_key, &symbol_id)
                 })
                 .await?;
@@ -3546,19 +3618,10 @@ impl Engine {
 
     pub async fn status_scope(&self, scope: ResolvedScope) -> Result<StatusReport> {
         let snapshot = self.inner.snapshot.read().await?;
-        let semantic_enabled = scope
-            .repos
-            .iter()
-            .any(|repo| self.index_features_for_repo(repo).semantic);
-        let configured_embedding_fingerprints = if semantic_enabled {
-            self.configured_embedding_fingerprints().await?
-        } else {
-            BTreeMap::new()
-        };
         let identity_status = index_identity_status_for_snapshot(
             &snapshot,
             self.inner.config.embedding.default_profile_name(),
-            &configured_embedding_fingerprints,
+            &BTreeMap::new(),
         );
         let mut repos = Vec::new();
         let mut indexed_files = 0u64;
@@ -3720,32 +3783,47 @@ impl Engine {
         changes: RepoChangeSummary,
         index_status: &str,
     ) -> Result<RepoIndexResult> {
-        let failed_state = failed_overlay_state(
-            overlay,
-            worktree_key,
-            canonical_key,
-            profile_name.clone(),
-            embedding_fingerprint.clone(),
-        );
-        if self.save_overlay_state(&failed_state).await.is_err() {
-            self.remove_overlay_state_if_present(&overlay.resolution.overlay_id)
-                .await?;
+        if self
+            .load_overlay_state(overlay)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let failed_state = failed_overlay_state(
+                overlay,
+                worktree_key,
+                canonical_key,
+                profile_name.clone(),
+                embedding_fingerprint.clone(),
+            );
+            if self.save_overlay_state(&failed_state).await.is_err() {
+                self.remove_overlay_state_if_present(&overlay.resolution.overlay_id)
+                    .await?;
+            }
         }
         self.set_graph_state(&overlay.repo_key, "failed", None)
             .await?;
         self.inner
             .snapshot
             .update(|snapshot| {
-                snapshot.worktrees.insert(
-                    worktree_key.to_string(),
-                    WorktreeSnapshotEntry::failed(
-                        canonical_key.to_string(),
-                        overlay.resolution.repo_identity.clone(),
-                        overlay.resolution.overlay_id.clone(),
-                        message.clone(),
-                        profile_name.clone(),
-                        embedding_fingerprint.clone(),
-                    ),
+                let entry = snapshot
+                    .worktrees
+                    .entry(worktree_key.to_string())
+                    .or_insert_with(|| {
+                        WorktreeSnapshotEntry::failed(
+                            canonical_key.to_string(),
+                            overlay.resolution.repo_identity.clone(),
+                            overlay.resolution.overlay_id.clone(),
+                            message.clone(),
+                            profile_name.clone(),
+                            embedding_fingerprint.clone(),
+                        )
+                    });
+                entry.set_failed(
+                    message.clone(),
+                    profile_name.clone(),
+                    embedding_fingerprint.clone(),
                 );
             })
             .await?;
@@ -4297,15 +4375,20 @@ impl Engine {
         self.inner
             .snapshot
             .update(|snapshot| {
-                snapshot.codebases.insert(
-                    repo_key.clone(),
-                    SnapshotEntry::indexing(
-                        0.0,
-                        "scanning",
-                        profile_name.clone(),
-                        configured_embedding_fingerprint.clone(),
-                    ),
-                );
+                let entry = snapshot
+                    .codebases
+                    .entry(repo_key.clone())
+                    .or_insert_with(|| {
+                        SnapshotEntry::indexing(
+                            0.0,
+                            "scanning",
+                            profile_name.clone(),
+                            configured_embedding_fingerprint.clone(),
+                        )
+                    });
+                entry.embedding_profile = profile_name.clone();
+                entry.embedding_fingerprint = configured_embedding_fingerprint.clone();
+                entry.set_indexing_progress(0.0, "scanning");
             })
             .await?;
 
@@ -5038,15 +5121,14 @@ impl Engine {
                                             .indexing_percentage
                                             .or(entry.last_attempted_percentage)
                                     });
-                                snapshot.codebases.insert(
-                                    repo_key.clone(),
-                                    SnapshotEntry::failed(
+                                if let Some(entry) = snapshot.codebases.get_mut(&repo_key) {
+                                    entry.set_failed(
                                         message.clone(),
                                         last_progress,
                                         profile_name.clone(),
                                         configured_embedding_fingerprint.clone(),
-                                    ),
-                                );
+                                    );
+                                }
                             })
                             .await?;
                         return Ok(RepoIndexResult {
@@ -5118,15 +5200,14 @@ impl Engine {
                                 .indexing_percentage
                                 .or(entry.last_attempted_percentage)
                         });
-                        snapshot.codebases.insert(
-                            repo_key.clone(),
-                            SnapshotEntry::failed(
+                        if let Some(entry) = snapshot.codebases.get_mut(&repo_key) {
+                            entry.set_failed(
                                 message.clone(),
                                 last_progress,
                                 profile_name.clone(),
                                 configured_embedding_fingerprint.clone(),
-                            ),
-                        );
+                            );
+                        }
                     })
                     .await?;
                 Ok(RepoIndexResult {
@@ -5924,84 +6005,82 @@ impl Engine {
         let collection_name = collection_name(repo);
         let features = self.index_features_for_repo(repo);
         let entry = snapshot.codebases.get(&repo_key).cloned();
-        let identity = self.repo_embedding_identity_status(snapshot, repo).await?;
-
-        if matches!(
-            entry.as_ref().map(|value| value.status.as_str()),
-            Some("indexed")
-        ) && features.semantic
-            && !self
-                .inner
-                .milvus
-                .refresh_collection_presence(&collection_name)
-                .await?
-        {
-            self.inner.snapshot.remove(&repo_key).await?;
-            return Ok(RepoStatus {
-                repo: repo_key.clone(),
-                repo_label: repo_basename(&repo_key),
-                collection_name,
-                features,
-                status: "not_indexed".to_string(),
-                indexed_files: None,
-                total_chunks: None,
-                index_status: None,
-                graph_status: None,
-                relationship_count: None,
-                indexing_percentage: None,
-                last_attempted_percentage: None,
-                error_message: None,
-                embedding_profile: features.semantic.then_some(identity.profile_name),
-                configured_embedding_fingerprint: identity.configured_fingerprint,
-                stored_embedding_fingerprint: identity.stored_fingerprint,
-                embedding_mismatch_reason: identity.reason,
-                repo_type: None,
-                canonical_repo_label: None,
-                overlay_status: None,
-                changed_files: None,
-                deleted_files: None,
-                overlay_bytes: None,
-                overlay_mismatch_reason: None,
-            });
-        }
+        let identity = self.repo_embedding_identity_status_for_status(snapshot, repo)?;
+        let committed_file_count = if features.lexical {
+            load_merkle_snapshot(&merkle_snapshot_path(&self.inner.config.merkle_dir(), repo))
+                .await
+                .ok()
+                .map(|snapshot| snapshot.file_hashes.len() as u64)
+        } else {
+            None
+        };
+        let lexical_document_count = if features.lexical {
+            let local_index = self.inner.local_index.clone();
+            let repo = repo.to_path_buf();
+            self.run_interactive_lexical_blocking("status_chunk_document_count", move || {
+                local_index.chunk_document_count(&repo)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        // Status must remain available when an optional backend is degraded. Live
+        // Milvus health belongs to `doctor`; searches report per-repository
+        // semantic failures without erasing the committed lexical state.
+        let semantic_index_available = features.semantic
+            && entry.as_ref().is_some_and(|entry| {
+                entry.status == "indexed"
+                    || entry.indexed_files.is_some()
+                    || entry.total_chunks.is_some()
+            })
+            && identity.reason.is_none();
 
         Ok(match entry {
-            Some(entry) => RepoStatus {
-                repo: repo_key.clone(),
-                repo_label: repo_basename(&repo_key),
-                collection_name,
-                features,
-                status: entry.status,
-                indexed_files: entry.indexed_files,
-                total_chunks: entry.total_chunks,
-                index_status: entry.index_status,
-                graph_status: None,
-                relationship_count: None,
-                indexing_percentage: entry.indexing_percentage,
-                last_attempted_percentage: entry.last_attempted_percentage,
-                error_message: entry.error_message,
-                embedding_profile: if features.semantic {
-                    entry.embedding_profile.or(Some(identity.profile_name))
-                } else {
-                    None
-                },
-                configured_embedding_fingerprint: identity.configured_fingerprint,
-                stored_embedding_fingerprint: identity.stored_fingerprint,
-                embedding_mismatch_reason: identity.reason,
-                repo_type: None,
-                canonical_repo_label: None,
-                overlay_status: None,
-                changed_files: None,
-                deleted_files: None,
-                overlay_bytes: None,
-                overlay_mismatch_reason: None,
-            },
+            Some(entry) => {
+                let indexed_files = entry.indexed_files.or(committed_file_count);
+                let total_chunks = entry.total_chunks.or(lexical_document_count);
+                let search_available = lexical_document_count.is_some() || semantic_index_available;
+                RepoStatus {
+                    repo: repo_key.clone(),
+                    repo_label: repo_basename(&repo_key),
+                    collection_name,
+                    features,
+                    status: entry.status,
+                    search_available,
+                    indexed_files,
+                    total_chunks,
+                    index_status: entry.index_status,
+                    graph_status: None,
+                    relationship_count: None,
+                    indexing_percentage: entry.indexing_percentage,
+                    last_attempted_percentage: entry.last_attempted_percentage,
+                    error_message: entry.error_message,
+                    embedding_profile: if features.semantic {
+                        entry.embedding_profile.or(Some(identity.profile_name))
+                    } else {
+                        None
+                    },
+                    configured_embedding_fingerprint: identity.configured_fingerprint,
+                    stored_embedding_fingerprint: identity.stored_fingerprint,
+                    embedding_mismatch_reason: identity.reason,
+                    repo_type: None,
+                    canonical_repo_label: None,
+                    overlay_status: None,
+                    changed_files: None,
+                    deleted_files: None,
+                    overlay_bytes: None,
+                    overlay_mismatch_reason: None,
+                }
+            }
             None => RepoStatus {
                 repo: repo_key.clone(),
                 repo_label: repo_basename(&repo_key),
                 collection_name,
                 features,
                 status: "not_indexed".to_string(),
+                search_available: false,
                 indexed_files: None,
                 total_chunks: None,
                 index_status: None,
@@ -6041,11 +6120,9 @@ impl Engine {
             .semantic
             .then(|| self.overlay_profile_name(ctx).map(str::to_string))
             .transpose()?;
-        let configured_fingerprint = if let Some(profile_name) = profile_name.as_deref() {
-            self.inner.embedding.fingerprint(profile_name).await.ok()
-        } else {
-            None
-        };
+        // Status is deliberately offline: backend reachability and live embedding
+        // fingerprints are checked by doctor and by semantic queries themselves.
+        let configured_fingerprint = None;
         let stored_fingerprint = entry
             .as_ref()
             .and_then(|entry| entry.embedding_fingerprint.clone());
@@ -6062,15 +6139,37 @@ impl Engine {
             .as_ref()
             .and_then(|entry| entry.overlay_mismatch_reason.clone())
             .or_else(|| fingerprint_mismatch.clone());
-        let coverage = {
+        let (overlay_document_count, canonical_document_count) = {
             let storage_root = overlay.storage_root.clone();
+            let canonical_root = ctx.canonical_root.clone();
             let local_index = self.inner.local_index.clone();
-            self.run_search_lexical_blocking("overlay_status_chunk_coverage", move || {
-                local_index.chunk_coverage(&storage_root)
-            })
+            self.run_interactive_lexical_blocking(
+                "overlay_status_chunk_document_count",
+                move || {
+                    Ok((
+                        local_index.chunk_document_count(&storage_root)?,
+                        local_index.chunk_document_count(&canonical_root)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap_or((None, None))
+        };
+        let overlay_state_available = self
+            .load_overlay_state(overlay)
             .await
             .ok()
-        };
+            .flatten()
+            .as_ref()
+            .is_some_and(overlay_state_has_search_index);
+        let canonical_committed = snapshot.codebases.get(&canonical_key).is_some_and(|entry| {
+            entry.status == "indexed"
+                || entry.indexed_files.is_some()
+                || entry.total_chunks.is_some()
+        });
+        let semantic_index_available = features.semantic
+            && fingerprint_mismatch.is_none()
+            && (overlay_state_available || canonical_committed);
         let default_overlay_status = if snapshot.codebases.contains_key(&canonical_key) {
             "not_indexed"
         } else {
@@ -6084,11 +6183,11 @@ impl Engine {
                 collection_name: overlay.chunk_collection.clone(),
                 features,
                 status: entry.status,
-                indexed_files: coverage
-                    .as_ref()
-                    .map(|coverage| coverage.indexed_files)
-                    .or(entry.changed_files),
-                total_chunks: coverage.as_ref().map(|coverage| coverage.total_chunks),
+                search_available: overlay_document_count.is_some()
+                    || canonical_document_count.is_some()
+                    || semantic_index_available,
+                indexed_files: entry.changed_files,
+                total_chunks: overlay_document_count,
                 index_status: entry.overlay_status.clone(),
                 graph_status: None,
                 relationship_count: None,
@@ -6113,6 +6212,9 @@ impl Engine {
                 collection_name: overlay.chunk_collection.clone(),
                 features,
                 status: "not_indexed".to_string(),
+                search_available: overlay_document_count.is_some()
+                    || canonical_document_count.is_some()
+                    || semantic_index_available,
                 indexed_files: None,
                 total_chunks: None,
                 index_status: Some(default_overlay_status.to_string()),
@@ -7218,9 +7320,10 @@ pub fn render_status_text(result: &StatusReport) -> String {
             String::new()
         };
         lines.push(format!(
-            "{} status={} index_status={} graph_status={} relationships={} files={} chunks={}{}{}{}",
+            "{} status={} search_available={} index_status={} graph_status={} relationships={} files={} chunks={}{}{}{}",
             repo.repo,
             repo.status,
+            repo.search_available,
             repo.index_status.as_deref().unwrap_or("unknown"),
             repo.graph_status.as_deref().unwrap_or("unknown"),
             repo.relationship_count.unwrap_or(0),
@@ -10381,6 +10484,26 @@ repos = ["{}"]
         }
 
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_lexical_work_uses_reserved_lane_when_bulk_lane_is_full() {
+        let budgets = SearchBudgets::new(&SearchConfig {
+            max_concurrent_requests: 1,
+            max_concurrent_repo_searches: 1,
+            max_concurrent_lexical_tasks: 1,
+            max_concurrent_dense_tasks: 1,
+            max_warm_repos: 1,
+        });
+        let _bulk = budgets.acquire_lexical().await.unwrap();
+
+        let _interactive = tokio::time::timeout(
+            Duration::from_millis(50),
+            budgets.acquire_interactive_lexical(),
+        )
+        .await
+        .expect("interactive work should not wait for the saturated bulk lane")
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

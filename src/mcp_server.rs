@@ -6,6 +6,11 @@ use crate::engine::impact::{
 use crate::engine::relationships::RepoRelationshipCoverage;
 use crate::engine::splitter::SplitterKind;
 use crate::engine::symbols::OutlineNode;
+use crate::engine::trim::{
+    DeadCodeAnalysis, DeadCodeClassification, DeadCodeGroup, DeadCodeRequest, EstimateTrimRequest,
+    ExplainRemovalRequest, RemovalExplanation, RemovalValidation, TrimEstimate,
+    ValidateRemovalRequest,
+};
 use crate::engine::{
     EditTargetAnchor, EditTargetReasonCode, EditTargetStatus, Engine, FileOutlineResponse,
     PREPARE_READY_MAX_LINES, PrepareEditTargetRequest, PrepareEditTargetResponse, RepoSearchError,
@@ -18,7 +23,10 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     body::Bytes,
+    extract::Request,
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
 use futures::FutureExt;
@@ -54,6 +62,8 @@ use tokio_util::sync::CancellationToken;
 const INDEX_WORKER_STALE_AFTER: Duration = Duration::from_secs(300);
 const INDEX_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const BACKGROUND_INDEX_TRANSIENT_RETRIES: u8 = 2;
+const MCP_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+const SLOW_HTTP_REQUEST: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct NativeServer {
@@ -577,6 +587,82 @@ struct AnalyzeChangesArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct AnalyzeDeadCodeArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default = "default_dead_code_groups")]
+    max_groups: usize,
+    #[serde(default = "default_true")]
+    include_tests: bool,
+    #[serde(default = "default_true")]
+    include_risk_candidates: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ExplainRemovalArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    group_id: String,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ValidateRemovalArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    group_ids: Vec<String>,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default)]
+    all_features: bool,
+    #[serde(default)]
+    include_tests: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct EstimateTrimArgs {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: u64,
+    #[serde(default = "default_dead_code_groups")]
+    max_groups: usize,
+    #[serde(default = "default_true")]
+    include_tests: bool,
+    #[serde(default = "default_true")]
+    include_risk_candidates: bool,
+    #[serde(default)]
+    validate: bool,
+    #[serde(default = "default_validation_group_limit")]
+    validation_group_limit: usize,
+    #[serde(default)]
+    all_features: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SearchTextArgs {
     #[serde(default)]
     scope: Option<String>,
@@ -945,7 +1031,7 @@ pub async fn serve(
         },
         Default::default(),
         StreamableHttpServerConfig::default()
-            .with_sse_keep_alive(None)
+            .with_sse_keep_alive(Some(MCP_SSE_KEEP_ALIVE))
             .with_cancellation_token(cancellation.child_token()),
     );
 
@@ -958,7 +1044,8 @@ pub async fn serve(
                 move |payload| enqueue_refresh(server.clone(), payload)
             }),
         )
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(log_slow_http_request));
 
     let listener = TcpListener::bind(listen)
         .await
@@ -974,7 +1061,7 @@ pub async fn serve(
         .context("serving native HTTP MCP endpoint")
 }
 
-const SERVER_INSTRUCTIONS: &str = "Start with list_scopes once, then use search_symbols for exact definitions, search_code for discovery, search_text for exact literals instead of shell rg when indexed, and get_file_outline for known-file structure. Check get_indexing_status.features when a repository lacks an expected retrieval surface: lexical, semantic, and graph indexing can each be disabled per repository, and tool warnings identify disabled search channels. Request includeSymbolId when a symbol will feed analyze_impact, trace_path, or prepare_edit_target; graph tools also accept file+line selectors. Use analyze_impact for callers and affected tests, trace_path for a directed dependency explanation, analyze_changes for baseRef-to-working-tree risk, and check_index_coverage before interpreting an empty graph result. Graph responses use compact agent-ready objects by default; request detail=full only when complete canonical metadata is needed. Follow status and nextActions instead of treating needs_index, symbol_not_found, not_found, or truncation as proof of no dependency. Confidence >=650 is structural; lower values are possible evidence only. Rust and TypeScript are the guaranteed graph languages. Use prepare_edit_target only as the final pre-patch step after the exact edit location is known. Relationship analysis requires index format v2 and never rebuilds automatically. scope defaults to the configured default group.";
+const SERVER_INSTRUCTIONS: &str = "Start with list_scopes once, then use search_symbols for exact definitions, search_code for discovery, search_text for exact literals instead of shell rg when indexed, and get_file_outline for known-file structure. Check get_indexing_status.features and searchAvailable when a repository lacks an expected retrieval surface: lexical, semantic, and graph indexing can each be disabled per repository, a failed refresh can leave the last committed search index available, and tool warnings identify disabled search channels. Request includeSymbolId when a symbol will feed analyze_impact, trace_path, or prepare_edit_target; graph tools also accept file+line selectors. Use analyze_impact for callers and affected tests, trace_path for a directed dependency explanation, analyze_changes for baseRef-to-working-tree risk, and check_index_coverage before interpreting an empty graph result. For repository trimming, start with analyze_dead_code, inspect candidate groups with explain_removal, validate selected groups in disposable storage with validate_removal, and use estimate_trim for bounded aggregate LOC. Never describe candidateLoc as safely removable; only compilerValidatedLoc has passed the configured compiler check, and public API, macro, feature-gated, plugin, serialization, dynamic-dispatch, unresolved-reference, and external-consumer risks remain explicit blockers. Graph responses use compact agent-ready objects by default; request detail=full only when complete canonical metadata is needed. Follow status and nextActions instead of treating needs_index, symbol_not_found, not_found, or truncation as proof of no dependency. Confidence >=650 is structural; lower values are possible evidence only. Rust and TypeScript are the guaranteed impact languages; repository trim analysis and compiler validation currently target Rust. Use prepare_edit_target only as the final pre-patch step after the exact edit location is known. Relationship analysis requires index format v2 and never rebuilds automatically. scope defaults to the configured default group.";
 
 pub fn tool_list() -> Vec<Tool> {
     vec![
@@ -1034,6 +1121,26 @@ pub fn tool_list() -> Vec<Tool> {
             "Decide whether graph results are trustworthy enough to interpret. Reports readiness, stale files, supported coverage, resolution tiers, and the exact indexing action when refresh is required.",
             coverage_schema(),
         ),
+        build_graph_tool(
+            "analyze_dead_code",
+            "Census Rust declarations that are unreachable, test-only, legacy-looking, or blocked by dynamic/public API risk. Groups cycles into removal units and reports exact declaration LOC without editing the repository.",
+            analyze_dead_code_schema(),
+        ),
+        build_graph_tool(
+            "explain_removal",
+            "Explain one dead-code group, including its SCC members, exact removal ranges, test reachability, confidence, and blockers.",
+            explain_removal_schema(),
+        ),
+        build_graph_tool(
+            "validate_removal",
+            "Remove selected dead-code groups only inside a disposable checkout and run a fixed Cargo check. The configured source checkout is never edited.",
+            validate_removal_schema(),
+        ),
+        build_graph_tool(
+            "estimate_trim",
+            "Aggregate candidate, clean, review-required, risk-excluded, and optionally compiler-validated Rust LOC into a defensible repository trim estimate.",
+            estimate_trim_schema(),
+        ),
         build_tool(
             "explain_search",
             "Explain how search_code will classify and weight a query.",
@@ -1067,6 +1174,25 @@ pub fn tool_list() -> Vec<Tool> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn log_slow_http_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_HTTP_REQUEST || !response.status().is_success() {
+        eprintln!(
+            "[warn] {} HTTP {} {} completed status={} elapsed_ms={}",
+            crate::snapshot::timestamp(),
+            method,
+            path,
+            response.status(),
+            elapsed.as_millis()
+        );
+    }
+    response
 }
 
 async fn enqueue_refresh(server: NativeServer, body: Bytes) -> (StatusCode, String) {
@@ -1599,6 +1725,196 @@ impl ServerHandler for NativeServer {
                     Ok(tool_success(
                         summary,
                         Some(coverage_response_value(&result, detail, &scope.id)),
+                    ))
+                }
+                "analyze_dead_code" => {
+                    let args: AnalyzeDeadCodeArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .analyze_dead_code(
+                            scope.clone(),
+                            DeadCodeRequest {
+                                repo: repo.clone(),
+                                min_confidence: args.min_confidence.min(1_000),
+                                max_groups: args.max_groups.clamp(1, 2_000),
+                                include_tests: args.include_tests,
+                                include_risk_candidates: args.include_risk_candidates,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            return trim_needs_index_response(
+                                &self.engine,
+                                scope,
+                                repo.as_deref(),
+                                "Dead-code analysis needs a current relationship index",
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(internal_error(error)),
+                    };
+                    let summary = format!(
+                        "Dead-code analysis `{}`: {} groups, {} candidate LOC, {} clean candidate LOC{}",
+                        result.status,
+                        result.groups.len(),
+                        result.totals.candidate_loc,
+                        result.totals.clean_candidate_loc,
+                        if result.truncated { " (truncated)" } else { "" }
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(dead_code_response_value(&result)),
+                    ))
+                }
+                "explain_removal" => {
+                    let args: ExplainRemovalArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .explain_removal(
+                            scope.clone(),
+                            ExplainRemovalRequest {
+                                repo: repo.clone(),
+                                group_id: args.group_id,
+                                min_confidence: args.min_confidence.min(1_000),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            return trim_needs_index_response(
+                                &self.engine,
+                                scope,
+                                repo.as_deref(),
+                                "Removal explanation needs a current relationship index",
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(internal_error(error)),
+                    };
+                    let summary = match result.group.as_ref() {
+                        Some(group) => format!(
+                            "Removal group found: {} symbols, {} LOC, {} blockers",
+                            group.symbols.len(),
+                            group.source_loc,
+                            group.blockers.len()
+                        ),
+                        None => "Removal group was not found in the current analysis".to_string(),
+                    };
+                    Ok(tool_success(
+                        summary,
+                        Some(removal_explanation_response_value(&result)),
+                    ))
+                }
+                "validate_removal" => {
+                    let args: ValidateRemovalArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .validate_removal(
+                            scope.clone(),
+                            ValidateRemovalRequest {
+                                repo: repo.clone(),
+                                group_ids: args.group_ids,
+                                min_confidence: args.min_confidence.min(1_000),
+                                all_features: args.all_features,
+                                include_tests: args.include_tests,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            return trim_needs_index_response(
+                                &self.engine,
+                                scope,
+                                repo.as_deref(),
+                                "Removal validation needs a current relationship index",
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(internal_error(error)),
+                    };
+                    let summary = format!(
+                        "Removal validation `{}`: {}/{} groups and {}/{} LOC compiler-validated",
+                        result.status,
+                        result.validated_group_ids.len(),
+                        result.group_ids.len(),
+                        result.compiler_validated_loc,
+                        result.requested_loc,
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(removal_validation_response_value(&result)),
+                    ))
+                }
+                "estimate_trim" => {
+                    let args: EstimateTrimArgs = parse_args(args)?;
+                    let scope = self
+                        .engine
+                        .config()
+                        .resolve_mcp_scope(args.scope.as_deref(), args.path.as_deref())
+                        .map_err(invalid_params)?;
+                    let repo = normalize_optional_string(&args.repo);
+                    let result = match self
+                        .engine
+                        .estimate_trim(
+                            scope.clone(),
+                            EstimateTrimRequest {
+                                repo: repo.clone(),
+                                min_confidence: args.min_confidence.min(1_000),
+                                max_groups: args.max_groups.clamp(1, 2_000),
+                                include_tests: args.include_tests,
+                                include_risk_candidates: args.include_risk_candidates,
+                                validate: args.validate,
+                                validation_group_limit: args.validation_group_limit,
+                                all_features: args.all_features,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if graph_requires_index(&error) => {
+                            return trim_needs_index_response(
+                                &self.engine,
+                                scope,
+                                repo.as_deref(),
+                                "Trim estimation needs a current relationship index",
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(internal_error(error)),
+                    };
+                    let summary = format!(
+                        "Trim estimate: {} candidate LOC, {} clean, {} compiler-validated, {} review-required, {} risk-excluded",
+                        result.analysis.totals.candidate_loc,
+                        result.analysis.totals.clean_candidate_loc,
+                        result.analysis.totals.compiler_validated_loc,
+                        result.analysis.totals.review_required_loc,
+                        result.analysis.totals.excluded_risk_loc,
+                    );
+                    Ok(tool_success(
+                        summary,
+                        Some(trim_estimate_response_value(&result)),
                     ))
                 }
                 "get_file_outline" => {
@@ -2156,7 +2472,7 @@ impl NativeServer {
                 retry.retry_attempt = retry.retry_attempt.saturating_add(1);
                 retry.snapshot_queued = true;
                 eprintln!(
-                    "[warn] background indexing worker generation={generation} will retry {repo_key} after transient embedding failure (attempt {}/{})",
+                    "[warn] background indexing worker generation={generation} will retry {repo_key} after transient backend failure (attempt {}/{})",
                     retry.retry_attempt,
                     BACKGROUND_INDEX_TRANSIENT_RETRIES
                 );
@@ -2224,10 +2540,16 @@ impl NativeServer {
 
 fn retryable_background_index_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("ollama embeddings")
-        && (error.contains("connection reset by peer")
-            || error.contains("connection refused")
-            || (error.contains("/tokenize") && error.contains("read tcp")))
+    let transient_transport = error.contains("connection reset by peer")
+        || error.contains("connection refused")
+        || error.contains("tcp connect error")
+        || error.contains("error sending request")
+        || error.contains("timed out");
+    (error.contains("ollama embeddings")
+        && (transient_transport
+            || (error.contains("/tokenize")
+                && (error.contains("read tcp") || error.contains("eof")))))
+        || (error.contains("milvus api") && transient_transport)
 }
 
 fn build_tool(
@@ -2759,6 +3081,32 @@ fn graph_action(tool: &str, reason: &str, arguments: Value) -> Value {
     })
 }
 
+async fn trim_needs_index_response(
+    engine: &Engine,
+    scope: ResolvedScope,
+    repo: Option<&str>,
+    summary: &str,
+) -> std::result::Result<CallToolResult, McpError> {
+    let coverage = engine
+        .relationship_readiness(scope.clone(), repo)
+        .await
+        .map_err(internal_error)?;
+    Ok(tool_success(
+        summary.to_string(),
+        Some(json!({
+            "status": "needs_index",
+            "needsIndex": true,
+            "reason": "relationship graph is stale, incomplete, or incompatible",
+            "coverage": coverage,
+            "nextActions": [graph_action(
+                "index_codebase",
+                "Refresh this scope before retrying repository trim analysis.",
+                json!({"scope": scope.id, "force": false}),
+            )],
+        })),
+    ))
+}
+
 fn graph_value_with_status<T: Serialize>(status: &str, value: &T, actions: Vec<Value>) -> Value {
     let mut value = serde_json::to_value(value).unwrap_or_else(|_| json!({}));
     let object = value
@@ -3157,6 +3505,186 @@ fn coverage_response_value(
     })
 }
 
+fn compact_dead_code_group_value(group: &DeadCodeGroup) -> Value {
+    json!({
+        "groupId": group.group_id,
+        "classification": group.classification,
+        "confidence": group.confidence,
+        "sourceLoc": group.source_loc,
+        "compilerValidatedLoc": group.compiler_validated_loc,
+        "symbolCount": group.symbols.len(),
+        "topSymbols": group.symbols.iter().take(5).map(|symbol| json!({
+            "symbolId": symbol.symbol_id,
+            "name": symbol.name,
+            "kind": symbol.kind,
+            "file": symbol.relative_path,
+            "line": symbol.start_line,
+        })).collect::<Vec<_>>(),
+        "wholeFiles": group.whole_files,
+        "testReferenceCount": group.test_reference_count,
+        "incomingPossibleCount": group.incoming_possible_count,
+        "blockerCount": group.blockers.len(),
+        "blockerKinds": group.blockers.iter().map(|blocker| blocker.kind.as_str()).collect::<BTreeSet<_>>(),
+        "rationale": group.rationale,
+    })
+}
+
+fn safe_validation_candidate(group: &DeadCodeGroup) -> bool {
+    group.blockers.is_empty()
+        && !matches!(
+            group.classification,
+            DeadCodeClassification::DynamicOrExternalRisk
+                | DeadCodeClassification::IntentionalTestSeam
+        )
+}
+
+fn dead_code_next_actions(result: &DeadCodeAnalysis) -> Vec<Value> {
+    let mut actions = Vec::new();
+    if let Some(group) = result.groups.first() {
+        actions.push(graph_action(
+            "explain_removal",
+            "Inspect the largest returned removal group before drawing a conclusion or editing source.",
+            json!({
+                "scope": result.scope,
+                "repo": result.repo,
+                "groupId": group.group_id,
+            }),
+        ));
+    }
+    if let Some(group) = result
+        .groups
+        .iter()
+        .find(|group| safe_validation_candidate(group))
+    {
+        actions.push(graph_action(
+            "validate_removal",
+            "Compiler-check a blocker-free group in a disposable checkout; this does not edit the source repository.",
+            json!({
+                "scope": result.scope,
+                "repo": result.repo,
+                "groupIds": [group.group_id],
+            }),
+        ));
+    }
+    actions.push(graph_action(
+        "estimate_trim",
+        "Summarize repository-wide candidate, review-required, risk-excluded, and optionally compiler-validated LOC.",
+        json!({
+            "scope": result.scope,
+            "repo": result.repo,
+            "validate": false,
+        }),
+    ));
+    actions
+}
+
+fn dead_code_response_value(result: &DeadCodeAnalysis) -> Value {
+    json!({
+        "status": result.status,
+        "scope": result.scope,
+        "repo": result.repo,
+        "rootCount": result.root_count,
+        "rootsTruncated": result.roots_truncated,
+        "rootSample": result.roots.iter().take(20).collect::<Vec<_>>(),
+        "groupCount": result.group_count,
+        "returnedGroupCount": result.groups.len(),
+        "totals": result.totals,
+        "groups": result.groups.iter().map(compact_dead_code_group_value).collect::<Vec<_>>(),
+        "coverage": compact_coverage_value(&result.coverage, false, true),
+        "analysisBlockers": result.analysis_blockers,
+        "truncated": result.truncated,
+        "diagnostic": result.diagnostic,
+        "nextActions": dead_code_next_actions(result),
+    })
+}
+
+fn removal_explanation_response_value(result: &RemovalExplanation) -> Value {
+    let mut actions = Vec::new();
+    if let Some(group) = result.group.as_ref() {
+        if safe_validation_candidate(group) {
+            actions.push(graph_action(
+                "validate_removal",
+                "Compiler-check this blocker-free removal closure in a disposable checkout.",
+                json!({
+                    "scope": result.scope,
+                    "repo": result.repo,
+                    "groupIds": [group.group_id],
+                }),
+            ));
+        }
+    } else {
+        actions.push(graph_action(
+            "analyze_dead_code",
+            "Refresh the group census because group identifiers are tied to the current graph generation.",
+            json!({"scope": result.scope, "repo": result.repo}),
+        ));
+    }
+    json!({
+        "status": result.status,
+        "scope": result.scope,
+        "repo": result.repo,
+        "group": result.group,
+        "coverage": compact_coverage_value(&result.coverage, false, true),
+        "analysisBlockers": result.analysis_blockers,
+        "diagnostic": result.diagnostic,
+        "nextActions": actions,
+    })
+}
+
+fn removal_validation_response_value(result: &RemovalValidation) -> Value {
+    let mut actions = Vec::new();
+    if matches!(result.status.as_str(), "passed" | "partial") {
+        actions.push(graph_action(
+            "estimate_trim",
+            "Recompute aggregate totals and, when desired, validate the next bounded set of blocker-free groups.",
+            json!({
+                "scope": result.scope,
+                "repo": result.repo,
+                "validate": false,
+            }),
+        ));
+    }
+    if let Some(group_id) = result.rejected_group_ids.first().or_else(|| {
+        (result.status == "failed")
+            .then(|| result.group_ids.first())
+            .flatten()
+    }) {
+        actions.push(graph_action(
+            "explain_removal",
+            "Inspect the removal closure and blockers before interpreting compiler diagnostics.",
+            json!({
+                "scope": result.scope,
+                "repo": result.repo,
+                "groupId": group_id,
+            }),
+        ));
+    }
+    let mut value = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("nextActions".to_string(), Value::Array(actions));
+    }
+    value
+}
+
+fn trim_estimate_response_value(result: &TrimEstimate) -> Value {
+    let mut analysis = dead_code_response_value(&result.analysis);
+    if let Some(object) = analysis.as_object_mut() {
+        object.remove("nextActions");
+    }
+    let validation = result
+        .validation
+        .as_ref()
+        .map(removal_validation_response_value);
+    json!({
+        "status": result.validation.as_ref().map(|value| value.status.as_str()).unwrap_or(result.analysis.status.as_str()),
+        "scope": result.analysis.scope,
+        "repo": result.analysis.repo,
+        "analysis": analysis,
+        "validation": validation,
+        "nextActions": dead_code_next_actions(&result.analysis),
+    })
+}
+
 fn round_score(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
 }
@@ -3167,9 +3695,10 @@ fn is_false(value: &bool) -> bool {
 
 fn graph_requires_index(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("relationship graph is stale or incomplete")
+        let message = cause.to_string();
+        message.contains("relationship graph is stale")
+            || message.contains("relationship graph indexing is disabled")
+            || message.contains("relationship overlay is not indexed")
     })
 }
 
@@ -3258,6 +3787,12 @@ fn default_trace_paths() -> usize {
 }
 fn default_min_confidence() -> u64 {
     650
+}
+fn default_dead_code_groups() -> usize {
+    250
+}
+fn default_validation_group_limit() -> usize {
+    25
 }
 fn default_base_ref() -> String {
     "HEAD".to_string()
@@ -3732,6 +4267,69 @@ fn analyze_changes_schema() -> Map<String, Value> {
     }).as_object().cloned().unwrap_or_default()
 }
 
+fn analyze_dead_code_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Perform a read-only Rust reachability census from executable/build roots, public APIs, dynamic registrations, feature gates, and tests. Unreachable cycles are grouped as strongly connected removal units. Results remain advisory until validate_removal passes.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root."),
+            "repo": nullable_string_schema("Repo root or basename; required for multi-repo scopes."),
+            "minConfidence": {"type": "integer", "minimum": 650, "maximum": 1000, "default": 650},
+            "maxGroups": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 250},
+            "includeTests": {"type": "boolean", "default": true},
+            "includeRiskCandidates": {"type": "boolean", "default": true, "description": "Include public API, macro, feature-gated, plugin, serialization, and dynamic-dispatch candidates as blocked review items."}
+        }
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn explain_removal_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Explain one group id returned by analyze_dead_code or estimate_trim. Returns SCC members, exact declaration ranges, test-only reachability, possible incoming edges, risk markers, and coverage blockers.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root."),
+            "repo": nullable_string_schema("Repo root or basename; required for multi-repo scopes."),
+            "groupId": {"type": "string", "minLength": 1},
+            "minConfidence": {"type": "integer", "minimum": 650, "maximum": 1000, "default": 650}
+        },
+        "required": ["groupId"]
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn validate_removal_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Validate selected removal groups without editing the configured repository. The tool copies the working tree into temporary storage, verifies an unchanged compiler baseline, adaptively isolates passing groups when a batch fails, runs cargo check --workspace --locked --offline, and removes the temporary checkout.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root."),
+            "repo": nullable_string_schema("Repo root or basename; required for multi-repo scopes."),
+            "groupIds": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}},
+            "minConfidence": {"type": "integer", "minimum": 650, "maximum": 1000, "default": 650},
+            "allFeatures": {"type": "boolean", "default": false},
+            "includeTests": {"type": "boolean", "default": false, "description": "Also compile test/example/bench targets. Production validation is the default because test-only groups intentionally have test callers that require migration."}
+        },
+        "required": ["groupIds"]
+    }).as_object().cloned().unwrap_or_default()
+}
+
+fn estimate_trim_schema() -> Map<String, Value> {
+    json!({
+        "type": "object",
+        "description": "Return bounded aggregate Rust trim totals. candidateLoc is advisory, cleanCandidateLoc excludes blocked and dynamic/external-risk groups, reviewRequiredLoc needs human review, excludedRiskLoc is not counted as removable, and compilerValidatedLoc is non-zero only when disposable validation passes.",
+        "properties": {
+            "scope": nullable_string_schema("Configured group id or repo root."),
+            "repo": nullable_string_schema("Repo root or basename; required for multi-repo scopes."),
+            "minConfidence": {"type": "integer", "minimum": 650, "maximum": 1000, "default": 650},
+            "maxGroups": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 250},
+            "includeTests": {"type": "boolean", "default": true},
+            "includeRiskCandidates": {"type": "boolean", "default": true},
+            "validate": {"type": "boolean", "default": false, "description": "Compile a bounded set of blocker-free groups in one disposable checkout, adaptively isolating the passing subset when a batch fails."},
+            "validationGroupLimit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+            "allFeatures": {"type": "boolean", "default": false}
+        }
+    }).as_object().cloned().unwrap_or_default()
+}
+
 fn graph_output_schema() -> Map<String, Value> {
     json!({
         "type": "object",
@@ -3880,19 +4478,25 @@ mod tests {
     use super::{
         GraphDetail, INDEX_WORKER_STALE_AFTER, IndexCoordinatorState, OutlineCompactionOptions,
         OutlineDetail, PendingIndexRequest, SERVER_INSTRUCTIONS, SearchMode,
-        analyze_changes_schema, analyze_impact_schema, compact_outline_response,
-        compact_prepare_edit_target_response, compact_search_response_value,
-        compact_symbol_search_response_value, compact_text_search_response_value,
-        coverage_response_value, coverage_schema, default_limit, enforce_loopback_bind,
-        get_file_outline_schema, graph_output_schema, impact_response_value, list_scopes_schema,
-        listen_is_loopback, normalize_extension_filter, parse_search_mode, parse_splitter_kind,
-        prepare_edit_target_schema, search_symbols_schema, search_text_schema, search_tool_success,
-        tool_list, trace_path_schema, trace_response_status,
+        analyze_changes_schema, analyze_dead_code_schema, analyze_impact_schema,
+        compact_outline_response, compact_prepare_edit_target_response,
+        compact_search_response_value, compact_symbol_search_response_value,
+        compact_text_search_response_value, coverage_response_value, coverage_schema,
+        dead_code_response_value, default_limit, enforce_loopback_bind, estimate_trim_schema,
+        explain_removal_schema, get_file_outline_schema, graph_output_schema,
+        impact_response_value, list_scopes_schema, listen_is_loopback, normalize_extension_filter,
+        parse_search_mode, parse_splitter_kind, prepare_edit_target_schema,
+        retryable_background_index_error, search_symbols_schema, search_text_schema,
+        search_tool_success, tool_list, trace_path_schema, trace_response_status,
+        validate_removal_schema,
     };
     use crate::engine::impact::{ImpactEvidence, ImpactNode, ImpactResponse, TracePathResponse};
     use crate::engine::relationships::{RelationKind, RepoRelationshipCoverage};
     use crate::engine::splitter::SplitterKind;
     use crate::engine::symbols::OutlineNode;
+    use crate::engine::trim::{
+        DeadCodeAnalysis, DeadCodeClassification, DeadCodeGroup, TrimTotals,
+    };
     use crate::engine::{
         AnchorQuality, EditResolutionType, EditTargetAnchor, EditTargetReasonCode,
         EditTargetStatus, FileOutlineMatch, FileOutlineResponse, PrepareEditTargetResponse,
@@ -3977,6 +4581,19 @@ mod tests {
     }
 
     #[test]
+    fn background_index_retries_transient_embedding_and_vector_failures() {
+        assert!(retryable_background_index_error(
+            "Ollama embeddings failed: Post http://127.0.0.1/tokenize: EOF"
+        ));
+        assert!(retryable_background_index_error(
+            "Milvus API: error sending request: tcp connect error: Connection refused"
+        ));
+        assert!(!retryable_background_index_error(
+            "Milvus API: schema mismatch"
+        ));
+    }
+
+    #[test]
     fn search_mode_parser_defaults_to_auto() {
         assert!(matches!(parse_search_mode(None).unwrap(), SearchMode::Auto));
         assert!(matches!(
@@ -3997,6 +4614,10 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "trace_path"));
         assert!(tools.iter().any(|tool| tool.name == "analyze_changes"));
         assert!(tools.iter().any(|tool| tool.name == "check_index_coverage"));
+        assert!(tools.iter().any(|tool| tool.name == "analyze_dead_code"));
+        assert!(tools.iter().any(|tool| tool.name == "explain_removal"));
+        assert!(tools.iter().any(|tool| tool.name == "validate_removal"));
+        assert!(tools.iter().any(|tool| tool.name == "estimate_trim"));
         assert!(tools.iter().any(|tool| tool.name == "explain_search"));
     }
 
@@ -4038,6 +4659,10 @@ mod tests {
             "trace_path",
             "analyze_changes",
             "check_index_coverage",
+            "analyze_dead_code",
+            "explain_removal",
+            "validate_removal",
+            "estimate_trim",
         ] {
             let tool = tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = tool.output_schema.as_ref().expect("graph output schema");
@@ -4045,6 +4670,81 @@ mod tests {
             assert!(schema["properties"].get("nextActions").is_some());
         }
         assert_eq!(graph_output_schema()["required"], json!(["status"]));
+    }
+
+    #[test]
+    fn trim_tool_schemas_publish_safe_defaults_and_bounds() {
+        let analyze = Value::Object(analyze_dead_code_schema());
+        let explain = Value::Object(explain_removal_schema());
+        let validate = Value::Object(validate_removal_schema());
+        let estimate = Value::Object(estimate_trim_schema());
+
+        assert_eq!(analyze["properties"]["minConfidence"]["minimum"], 650);
+        assert_eq!(analyze["properties"]["maxGroups"]["maximum"], 2000);
+        assert_eq!(
+            analyze["properties"]["includeRiskCandidates"]["default"],
+            true
+        );
+        assert_eq!(explain["required"], json!(["groupId"]));
+        assert_eq!(validate["required"], json!(["groupIds"]));
+        assert_eq!(validate["properties"]["includeTests"]["default"], false);
+        assert!(
+            validate["description"]
+                .as_str()
+                .unwrap()
+                .contains("without editing")
+        );
+        assert_eq!(estimate["properties"]["validate"]["default"], false);
+        assert_eq!(
+            estimate["properties"]["validationGroupLimit"]["maximum"],
+            100
+        );
+    }
+
+    #[test]
+    fn dead_code_response_is_compact_and_routes_agents_to_explain_and_validate() {
+        let analysis = DeadCodeAnalysis {
+            scope: "workspace".to_string(),
+            repo: "/repo".to_string(),
+            status: "ok".to_string(),
+            coverage: RepoRelationshipCoverage {
+                graph_status: "ready".to_string(),
+                ..RepoRelationshipCoverage::default()
+            },
+            root_count: 1,
+            roots_truncated: false,
+            roots: Vec::new(),
+            group_count: 1,
+            groups: vec![DeadCodeGroup {
+                group_id: "dead_fixture".to_string(),
+                classification: DeadCodeClassification::Unreachable,
+                confidence: 850,
+                symbols: Vec::new(),
+                removal_ranges: Vec::new(),
+                source_loc: 12,
+                compiler_validated_loc: 0,
+                test_reference_count: 0,
+                incoming_possible_count: 0,
+                whole_files: vec!["src/dead.rs".to_string()],
+                blockers: Vec::new(),
+                rationale: vec!["unreachable".to_string()],
+            }],
+            totals: TrimTotals {
+                candidate_loc: 12,
+                clean_candidate_loc: 12,
+                ..TrimTotals::default()
+            },
+            analysis_blockers: Vec::new(),
+            truncated: false,
+            diagnostic: "advisory".to_string(),
+        };
+
+        let value = dead_code_response_value(&analysis);
+        assert_eq!(value["groupCount"], 1);
+        assert_eq!(value["groups"][0]["groupId"], "dead_fixture");
+        assert!(value["groups"][0].get("symbols").is_none());
+        assert_eq!(value["nextActions"][0]["tool"], "explain_removal");
+        assert_eq!(value["nextActions"][1]["tool"], "validate_removal");
     }
 
     fn impact_node(name: &str, role: &str, evidence_count: usize) -> ImpactNode {

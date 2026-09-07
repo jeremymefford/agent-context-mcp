@@ -400,6 +400,10 @@ Current tools:
 - `trace_path`
 - `analyze_changes`
 - `check_index_coverage`
+- `analyze_dead_code`
+- `explain_removal`
+- `validate_removal`
+- `estimate_trim`
 - `explain_search`
 - `clear_index`
 - `get_indexing_status`
@@ -412,7 +416,12 @@ Preferred routing:
 - use `trace_path` for the shortest highest-confidence directed dependency paths; each endpoint accepts either a symbol id or a `file + line` selector
 - use `analyze_changes` for a validated Git `baseRef` (default `HEAD`) versus the current working tree; it includes staged, unstaged, renamed, deleted, and optionally untracked files, but does not compare two historical refs
 - use `check_index_coverage` before treating an empty graph result as “no impact”; it reports readiness, stale files, unsupported files, confidence tiers, unresolved references, and unstable identities
+- use `analyze_dead_code` for a repository-wide Rust reachability census; it separates unreachable, test-only, intentional test seams, legacy-looking code, and public/dynamic/feature-gated risk rather than reporting every uncalled function as safe to delete
+- use `explain_removal` with a returned `groupId` to inspect the strongly connected component, exact declaration/file/wiring/test ranges, confidence, and blockers
+- use `validate_removal` only after inspection; it copies the repository into temporary storage, applies selected ranges there, runs a fixed offline Cargo check, removes the temporary checkout, and never edits the configured source checkout
+- use `estimate_trim` for aggregate `candidateLoc`, `cleanCandidateLoc`, `reviewRequiredLoc`, `excludedRiskLoc`, and optional `compilerValidatedLoc`; clean candidates exclude blocked and dynamic/external-risk groups, while only the compiler-validated count has passed the requested build configuration
 - graph tools return `detail: "compact"` agent-facing responses by default; inspect `status` first and follow executable `nextActions` for `needs_index`, `not_found`, empty, or truncated results; request `detail: "full"` only for complete canonical metadata
+- use `get_indexing_status.searchAvailable` to distinguish a failed refresh from an unavailable search index; a failed refresh retains and reports the measurable last committed lexical coverage when it can still serve queries
 - use `search_code` for broader semantic or hybrid discovery; treat returned snippets as discovery hints, not authoritative reads
 - use `search_text` for exact strings, identifiers, test names, and log lines inside a known repo, known file, or bounded repo-relative tree instead of narrow `rg`
 - use `get_file_outline` once the target file is known and you need structure rather than broad file reads
@@ -445,8 +454,10 @@ forward/reverse frontier lookup plus fuzzy target/evidence discovery and determi
 Worktree overlays compose with the canonical graph and suppress canonical edges
 originating in changed or deleted paths.
 
-Public relationship kinds are `calls`, `imports`, `reexports`, `type_uses`, `implements`, and
-`inherits`. Resolution confidence is fixed: `1000` exact qualified, `950` imported alias, `900`
+Public relationship kinds are `calls`, `imports`, `reexports`, `type_uses`, `value_uses`,
+`implements`, and `inherits`. `value_uses` is intentionally limited to scoped Rust values and
+constant-like identifiers so local-variable traffic does not inflate the graph. Resolution
+confidence is fixed: `1000` exact qualified, `950` imported alias, `900`
 same-module unique, `750` unique compatible repository symbol, `450` ambiguous name/method
 candidate, and `300` lexical fallback. Traversal defaults exclude values below `650`; possible
 candidates remain separately labeled and never become definite dependencies because of fuzzy or
@@ -473,7 +484,26 @@ repository-generation changes, indexing, and `prepare_edit_target` invalidate or
 `check_index_coverage` exposes the same readiness boundary explicitly, distinguishing an empty
 result from insufficient analysis.
 
-All four graph tools return a structured object rather than a bare array. The first field agents
+### Rust trim analysis
+
+Trim analysis starts from executable and build entry points, then models externally public APIs,
+feature-gated declarations, trait implementations, plugin/registry markers, serialization hooks,
+FFI exports, GraphQL-style dynamic registration, and tests as distinct root or risk classes. It
+computes directed production and test reachability and groups mutually dependent unreachable
+declarations with strongly connected components. When every production declaration in a Rust file
+is outside hard-root reachability, the removal closure expands to the complete file and simple
+module declarations, `include!` lines, and one-line reexports. Tests whose resolved production
+dependencies are exclusively inside one removal group are included as dedicated test closure
+ranges.
+
+`candidateLoc` is deliberately not a deletion recommendation. Unresolved and low-confidence
+incoming references, unstable identities, public APIs, external consumers, macros, dynamic
+dispatch, serialization, plugin registration, and feature gates remain explicit blockers.
+`validate_removal` is the safety boundary: it applies selected groups only to a disposable copy and
+runs `cargo check --workspace --locked --offline`, optionally with all features or all targets.
+Failed validation returns compiler diagnostics and contributes zero `compilerValidatedLoc`.
+
+All graph and trim tools return a structured object rather than a bare array. The first field agents
 should inspect is `status`; common values include `ok`, `found`, `not_found`, `no_dependents`,
 `truncated`, `needs_index`, `invalid_base`, `symbol_not_found`, and `unsupported`. Compact nodes use
 the same handoff shape throughout: `symbolId`, `name`, `kind`, `file`, and `line`, plus bounded edge
@@ -581,6 +611,8 @@ repos = [
   "/absolute/path/to/local-repo",
 ]
 ```
+
+`max_concurrent_requests` limits broad code and symbol searches. Exact `search_text`, edit-target preparation, and status probes bypass the broad request/repository queues and share a reserved lexical lane, so saturated discovery work cannot monopolize the entire agent-facing surface.
 
 The legacy shorthand still works:
 

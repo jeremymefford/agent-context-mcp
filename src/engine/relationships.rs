@@ -50,6 +50,7 @@ pub enum RelationKind {
     Imports,
     Reexports,
     TypeUses,
+    ValueUses,
     Implements,
     Inherits,
 }
@@ -61,6 +62,7 @@ impl RelationKind {
             Self::Imports => "imports",
             Self::Reexports => "reexports",
             Self::TypeUses => "type_uses",
+            Self::ValueUses => "value_uses",
             Self::Implements => "implements",
             Self::Inherits => "inherits",
         }
@@ -71,6 +73,7 @@ impl RelationKind {
             "imports" => Self::Imports,
             "reexports" => Self::Reexports,
             "type_uses" => Self::TypeUses,
+            "value_uses" => Self::ValueUses,
             "implements" => Self::Implements,
             "inherits" => Self::Inherits,
             _ => Self::Calls,
@@ -85,6 +88,7 @@ impl RelationKind {
             Self::TypeUses => 3,
             Self::Implements => 4,
             Self::Inherits => 5,
+            Self::ValueUses => 6,
         }
     }
 
@@ -95,6 +99,7 @@ impl RelationKind {
             3 => Self::TypeUses,
             4 => Self::Implements,
             5 => Self::Inherits,
+            6 => Self::ValueUses,
             _ => Self::Calls,
         }
     }
@@ -146,6 +151,20 @@ pub struct ResolvedRelation {
     pub source_role: String,
     pub language: String,
     pub file_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisRelation {
+    pub source_key: String,
+    pub source_path: String,
+    pub target_key: Option<String>,
+    pub target_name: String,
+    pub kind: RelationKind,
+    pub confidence: u64,
+    pub resolution: String,
+    pub start_line: u64,
+    pub source_role: String,
+    pub language: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -783,6 +802,91 @@ impl GraphStore {
         Ok(documents)
     }
 
+    pub fn all_analysis_relations(&self, repo: &str) -> Result<Vec<AnalysisRelation>> {
+        let connection = self.open()?;
+        let mut documents = Vec::new();
+        let resolved_sql = "SELECT e.source_key, e.source_path, e.target_key, gr.target_name,
+                    e.kind, e.confidence, e.resolution, gr.start_line, gr.source_role, e.language
+             FROM graph_edges_v5 e
+             JOIN graph_repositories_v5 rp ON rp.id = e.repo_id
+             JOIN graph_references_v5 gr ON gr.id = e.reference_id
+             WHERE rp.repo = ?1
+             ORDER BY e.source_path, gr.start_line, gr.reference_id, e.confidence DESC";
+        let mut resolved = connection.prepare(resolved_sql)?;
+        let rows = resolved.query_map(params![repo], |row| {
+            Ok(AnalysisRelation {
+                source_key: row.get(0)?,
+                source_path: row.get(1)?,
+                target_key: row.get(2)?,
+                target_name: row.get(3)?,
+                kind: RelationKind::from_code(row.get(4)?),
+                confidence: row.get::<_, i64>(5)? as u64,
+                resolution: resolution_from_code(row.get(6)?).to_string(),
+                start_line: row.get::<_, i64>(7)? as u64,
+                source_role: row.get(8)?,
+                language: row.get(9)?,
+            })
+        })?;
+        documents.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+
+        let unresolved_sql =
+            "SELECT sk.key, fc.relative_path, gr.target_name, gr.target_qualified_name,
+                    gr.kind, gr.start_line, gr.source_role, fc.language
+             FROM graph_references_v5 gr
+             JOIN graph_repositories_v5 rp ON rp.id = gr.repo_id
+             JOIN graph_keys_v5 sk ON sk.id = gr.source_key_id
+             JOIN graph_file_coverage fc ON fc.rowid = gr.file_id
+             WHERE rp.repo = ?1 AND gr.resolved = 0
+             ORDER BY fc.relative_path, gr.start_line, gr.reference_id";
+        let mut unresolved = connection.prepare(unresolved_sql)?;
+        let rows = unresolved.query_map(params![repo], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                RelationKind::from_code(row.get(4)?),
+                row.get::<_, i64>(5)? as u64,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let (
+                source_key,
+                source_path,
+                target_name,
+                target_qualified_name,
+                kind,
+                start_line,
+                source_role,
+                language,
+            ) = row?;
+            if !seen.insert((
+                source_key.clone(),
+                target_name.clone(),
+                target_qualified_name,
+                kind.as_str(),
+            )) {
+                continue;
+            }
+            documents.push(AnalysisRelation {
+                source_key,
+                source_path,
+                target_key: None,
+                target_name,
+                kind,
+                confidence: 0,
+                resolution: "unresolved".to_string(),
+                start_line,
+                source_role,
+                language,
+            });
+        }
+        Ok(documents)
+    }
+
     pub fn relations_for_source_paths(
         &self,
         repo: &str,
@@ -1398,9 +1502,15 @@ fn references_from_node(
                 .map(|(target, alias)| (kind, target, alias))
                 .collect()
         }
-        ("rust", "identifier" | "scoped_identifier") => rust_function_value_argument(node, text)
-            .map(|value| vec![(RelationKind::Calls, value, None)])
-            .unwrap_or_default(),
+        ("rust", "identifier" | "scoped_identifier") => {
+            if let Some(value) = rust_function_value_argument(node, text) {
+                vec![(RelationKind::Calls, value, None)]
+            } else {
+                rust_value_use(node, text)
+                    .map(|value| vec![(RelationKind::ValueUses, value, None)])
+                    .unwrap_or_default()
+            }
+        }
         ("rust", "call_expression") => node
             .child_by_field_name("function")
             .and_then(|child| child.utf8_text(text).ok())
@@ -1421,6 +1531,14 @@ fn references_from_node(
             .child_by_field_name("macro")
             .and_then(|child| child.utf8_text(text).ok())
             .map(|value| vec![(RelationKind::Calls, value.to_string(), None)])
+            .unwrap_or_default(),
+        ("rust", "macro_definition") => raw()
+            .map(|value| {
+                rust_macro_call_targets(&value)
+                    .into_iter()
+                    .map(|target| (RelationKind::Calls, target, None))
+                    .collect()
+            })
             .unwrap_or_default(),
         ("rust", "impl_item") => raw()
             .and_then(|value| parse_rust_impl(&value))
@@ -1500,6 +1618,9 @@ fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
         "all"
             | "and_then"
             | "any"
+            | "delete"
+            | "fallback"
+            | "fallback_service"
             | "binary_search_by"
             | "binary_search_by_key"
             | "filter"
@@ -1509,6 +1630,7 @@ fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
             | "flat_map"
             | "fold"
             | "for_each"
+            | "get"
             | "inspect"
             | "map"
             | "map_err"
@@ -1516,8 +1638,13 @@ fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
             | "map_while"
             | "ok_or_else"
             | "or_else"
+            | "on"
+            | "patch"
             | "position"
+            | "post"
+            | "put"
             | "reduce"
+            | "register"
             | "retain"
             | "retain_mut"
             | "rposition"
@@ -1527,6 +1654,10 @@ fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
             | "sort_by_key"
             | "sort_unstable_by"
             | "sort_unstable_by_key"
+            | "service_fn"
+            | "set_handler"
+            | "spawn"
+            | "spawn_blocking"
             | "take_while"
             | "try_fold"
             | "try_for_each"
@@ -1535,6 +1666,85 @@ fn rust_function_value_argument(node: Node<'_>, text: &[u8]) -> Option<String> {
         return None;
     }
     node.utf8_text(text).ok().map(str::to_string)
+}
+
+fn rust_value_use(node: Node<'_>, text: &[u8]) -> Option<String> {
+    if is_definition_name(node) {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() == "scoped_identifier" {
+        return None;
+    }
+    let mut ancestor = Some(parent);
+    while let Some(current) = ancestor {
+        if current.kind() == "use_declaration" {
+            return None;
+        }
+        ancestor = current.parent();
+    }
+    if (parent.kind() == "call_expression"
+        && parent
+            .child_by_field_name("function")
+            .is_some_and(|child| child.id() == node.id()))
+        || (parent.kind() == "macro_invocation"
+            && parent
+                .child_by_field_name("macro")
+                .is_some_and(|child| child.id() == node.id()))
+    {
+        return None;
+    }
+    let value = node.utf8_text(text).ok()?.trim();
+    let constant_like = value.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    (value.contains("::") || constant_like).then(|| value.to_string())
+}
+
+fn rust_macro_call_targets(value: &str) -> Vec<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut previous_identifier = None::<String>;
+    while index < bytes.len() {
+        if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b':' | b'#'))
+        {
+            index += 1;
+        }
+        let token = &value[start..index];
+        let mut next = index;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        let declaration_keyword = previous_identifier.as_deref().is_some_and(|previous| {
+            matches!(
+                previous,
+                "fn" | "struct" | "enum" | "trait" | "type" | "mod" | "macro_rules"
+            )
+        });
+        if next < bytes.len()
+            && bytes[next] == b'('
+            && !declaration_keyword
+            && !matches!(
+                token,
+                "if" | "while" | "for" | "loop" | "match" | "Some" | "Ok" | "Err"
+            )
+        {
+            output.push(token.trim_start_matches("r#").to_string());
+        }
+        previous_identifier = Some(token.to_string());
+    }
+    output.sort();
+    output.dedup();
+    output
 }
 
 fn parse_rust_impl(value: &str) -> Option<(RelationKind, String, Option<String>)> {
@@ -1879,20 +2089,24 @@ fn path_affinity(source: &str, target: &str) -> usize {
         .count()
 }
 
-fn compatible_symbol(kind: RelationKind, symbol: &IndexedSymbol) -> bool {
+pub(crate) fn compatible_symbol(kind: RelationKind, symbol: &IndexedSymbol) -> bool {
     match kind {
-        RelationKind::Imports | RelationKind::Reexports => true,
+        RelationKind::Imports | RelationKind::Reexports => symbol.kind != "impl",
         RelationKind::Calls => matches!(
             symbol.kind.as_str(),
             "function" | "method" | "constructor" | "macro" | "struct" | "class" | "enum_variant"
         ),
         RelationKind::TypeUses => !matches!(
             symbol.kind.as_str(),
-            "function" | "method" | "constructor" | "macro" | "module"
+            "function" | "method" | "constructor" | "macro" | "module" | "impl"
+        ),
+        RelationKind::ValueUses => !matches!(
+            symbol.kind.as_str(),
+            "impl" | "module" | "trait" | "interface" | "type" | "type_alias"
         ),
         RelationKind::Implements | RelationKind::Inherits => matches!(
             symbol.kind.as_str(),
-            "trait" | "interface" | "class" | "struct" | "type_alias"
+            "trait" | "interface" | "class" | "struct" | "type" | "type_alias"
         ),
     }
 }
@@ -2317,6 +2531,13 @@ mod tests {
             fn live_test_connection() {}
             fn passes_value(value: fn()) { value(); }
             fn not_a_callback() { passes_value(live_test_connection); }
+            fn route_handler() {}
+            fn ui_fallback() {}
+            fn routes() { post(route_handler); Router::new().fallback(ui_fallback); }
+            fn build_notification(_: usize) {}
+            macro_rules! mapping { () => { build_notification(1) } }
+            const LOOKUP_TABLE: &[u8] = &[];
+            fn reads_values() { let _ = LOOKUP_TABLE; let _ = catalog::DEFAULT_VALUE; }
         "#;
         let path = Path::new("src/lib.rs");
         let symbols = extract_symbols("/repo", "src/lib.rs", path, source, "now", "hash").unwrap();
@@ -2335,6 +2556,16 @@ mod tests {
                 && reference.target_name == "live_test_connection"
                 && reference.evidence == "live_test_connection"
         }));
+        for target in ["route_handler", "ui_fallback", "build_notification"] {
+            assert!(extracted.references.iter().any(|reference| {
+                reference.kind == RelationKind::Calls && reference.target_name == target
+            }));
+        }
+        for target in ["LOOKUP_TABLE", "DEFAULT_VALUE"] {
+            assert!(extracted.references.iter().any(|reference| {
+                reference.kind == RelationKind::ValueUses && reference.target_name == target
+            }));
+        }
     }
 
     #[test]
@@ -2496,6 +2727,34 @@ mod tests {
         assert!(
             resolve_reference(&reference, &symbols_by_name(&excessive), &HashMap::new()).is_empty()
         );
+
+        let mut nominal = symbols[0].clone();
+        nominal.symbol_id = "app-use-case-struct".to_string();
+        nominal.logical_key = "app-use-case-struct-key".to_string();
+        nominal.name = "AppUseCase".to_string();
+        nominal.kind = "struct".to_string();
+        nominal.qualified_name = "AppUseCase".to_string();
+        let mut with_impls = vec![nominal.clone()];
+        for index in 0..=MAX_NAME_RESOLUTION_CANDIDATES {
+            let mut implementation = nominal.clone();
+            implementation.symbol_id = format!("app-use-case-impl-{index}");
+            implementation.logical_key = format!("app-use-case-impl-key-{index}");
+            implementation.kind = "impl".to_string();
+            with_impls.push(implementation);
+        }
+        let mut import = reference.clone();
+        import.target_name = "AppUseCase".to_string();
+        import.target_qualified_name = Some("crate::AppUseCase".to_string());
+        import.kind = RelationKind::Imports;
+        let resolved = resolve_reference(&import, &symbols_by_name(&with_impls), &HashMap::new());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].symbol.kind, "struct");
+        assert_eq!(resolved[0].confidence, CONFIDENCE_EXACT_QUALIFIED);
+
+        import.kind = RelationKind::TypeUses;
+        let resolved = resolve_reference(&import, &symbols_by_name(&with_impls), &HashMap::new());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].symbol.kind, "struct");
     }
 
     #[test]
@@ -2666,6 +2925,13 @@ mod tests {
             .relations_to(repo, std::slice::from_ref(&target_key), 650, 100)
             .unwrap();
         assert_eq!(inbound.len(), 1, "repeat call sites must share one edge");
+        let analysis_documents = graph.all_analysis_relations(repo).unwrap();
+        assert_eq!(analysis_documents.len(), 1);
+        assert_eq!(
+            analysis_documents[0].target_key.as_deref(),
+            Some(&*target_key)
+        );
+        assert_eq!(analysis_documents[0].confidence, 750);
         let coverage = graph.coverage_cached(repo).unwrap();
         assert_eq!(coverage.references, 2);
         assert_eq!(coverage.definite, 0);
@@ -2701,6 +2967,12 @@ mod tests {
                 && document.confidence == 0
                 && document.resolution == "unresolved"
         }));
+        let analysis_documents = graph.all_analysis_relations(repo).unwrap();
+        assert_eq!(analysis_documents.len(), 1);
+        assert_eq!(analysis_documents[0].target_name, "target");
+        assert!(analysis_documents[0].target_key.is_none());
+        assert_eq!(analysis_documents[0].confidence, 0);
+        assert_eq!(analysis_documents[0].resolution, "unresolved");
 
         let (updated_caller_symbols, updated_caller_graph) =
             prepare(repo, "src/caller.rs", "pub fn caller() { renamed(); }");
