@@ -154,6 +154,18 @@ impl IndexCoordinatorState {
             .any(|(repo, request)| request.snapshot_queued && !self.recovering.contains(repo))
     }
 
+    fn next_ready_pending_repo(&self, avoid: Option<&str>) -> Option<String> {
+        let mut ready = self
+            .pending
+            .iter()
+            .filter(|(repo, request)| request.snapshot_queued && !self.recovering.contains(*repo));
+        ready
+            .clone()
+            .find(|(repo, _)| avoid != Some(repo.as_str()))
+            .or_else(|| ready.next())
+            .map(|(repo, _)| repo.clone())
+    }
+
     fn unqueued_ready_pending_repos(&self) -> Vec<String> {
         self.pending
             .iter()
@@ -2351,6 +2363,7 @@ impl NativeServer {
     }
 
     async fn run_background_index_worker(&self, generation: u64) {
+        let mut previous_repo = None;
         loop {
             let next = {
                 let mut coordinator = self.index_coordinator.lock().await;
@@ -2360,13 +2373,7 @@ impl NativeServer {
                     );
                     return;
                 }
-                let Some(repo_key) = coordinator
-                    .pending
-                    .iter()
-                    .find(|(repo, request)| {
-                        request.snapshot_queued && !coordinator.recovering.contains(*repo)
-                    })
-                    .map(|(repo, _)| repo.clone())
+                let Some(repo_key) = coordinator.next_ready_pending_repo(previous_repo.as_deref())
                 else {
                     if coordinator.finish_worker(generation) {
                         eprintln!(
@@ -2511,6 +2518,7 @@ impl NativeServer {
             drop(coordinator);
             self.persist_index_queue_or_log("finishing background index work")
                 .await;
+            previous_repo = Some(repo_key);
         }
     }
 
@@ -5779,6 +5787,28 @@ mod tests {
                 worker.last_heartbeat
             )),
             Some((1, now, now))
+        );
+    }
+
+    #[test]
+    fn coordinator_defers_immediate_retry_when_other_work_is_ready() {
+        let mut coordinator = IndexCoordinatorState::default();
+        coordinator
+            .pending
+            .insert("/tmp/a".to_string(), pending_request("/tmp/a"));
+        coordinator
+            .pending
+            .insert("/tmp/b".to_string(), pending_request("/tmp/b"));
+
+        assert_eq!(
+            coordinator.next_ready_pending_repo(Some("/tmp/a")),
+            Some("/tmp/b".to_string())
+        );
+
+        coordinator.pending.remove("/tmp/b");
+        assert_eq!(
+            coordinator.next_ready_pending_repo(Some("/tmp/a")),
+            Some("/tmp/a".to_string())
         );
     }
 

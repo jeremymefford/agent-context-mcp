@@ -12,6 +12,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 pub const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 const VOYAGE_MAX_BATCH_ITEMS: usize = 1000;
+const OLLAMA_MAX_BATCH_ITEMS: usize = 8;
 const MAX_RETRIES: usize = 4;
 
 #[derive(Clone)]
@@ -161,10 +162,7 @@ impl EmbeddingClient {
     }
 
     fn document_batch_limit(&self) -> usize {
-        match self.inner.as_ref() {
-            EmbeddingInner::Voyage(_) => VOYAGE_MAX_BATCH_ITEMS,
-            EmbeddingInner::OpenAi(_) | EmbeddingInner::Ollama(_) => usize::MAX,
-        }
+        document_batch_limit_for_provider(self.provider_name())
     }
 
     async fn embed_document_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -191,6 +189,14 @@ impl EmbeddingClient {
             .into_iter()
             .next()
             .context("embedding provider returned no vector for query")
+    }
+}
+
+fn document_batch_limit_for_provider(provider: &str) -> usize {
+    match provider {
+        "voyage" => VOYAGE_MAX_BATCH_ITEMS,
+        "ollama" => OLLAMA_MAX_BATCH_ITEMS,
+        _ => usize::MAX,
     }
 }
 
@@ -619,7 +625,8 @@ fn known_dimension(provider: &str, model: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        known_dimension, ollama_embed_payload, ollama_runtime_error, ollama_width_fingerprint,
+        OLLAMA_MAX_BATCH_ITEMS, document_batch_limit_for_provider, known_dimension,
+        ollama_embed_payload, ollama_runtime_error, ollama_width_fingerprint,
         qwen3_coding_agent_query, retry_delay, retry_delay_for, truncate_ollama_embeddings,
     };
     use serde_json::json;
@@ -651,6 +658,17 @@ mod tests {
         ));
         assert!(!ollama_runtime_error("invalid dimensions"));
         assert!(retry_delay_for("Ollama embeddings", 0) > retry_delay(0));
+    }
+
+    #[test]
+    fn ollama_document_batches_are_bounded_for_local_runtime_stability() {
+        assert_eq!(document_batch_limit_for_provider("ollama"), 8);
+        assert_eq!(
+            document_batch_limit_for_provider("ollama"),
+            OLLAMA_MAX_BATCH_ITEMS
+        );
+        assert_eq!(document_batch_limit_for_provider("voyage"), 1000);
+        assert_eq!(document_batch_limit_for_provider("openai"), usize::MAX);
     }
 
     #[test]
